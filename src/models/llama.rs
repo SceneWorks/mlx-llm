@@ -153,6 +153,14 @@ impl LlamaModel {
         ContiguousKvCache::new(self.cfg.num_layers)
     }
 
+    /// A fresh single-sequence **paged** KV cache (story 7169) sized for this model, with
+    /// `block_size`-token blocks. A drop-in for [`LlamaModel::new_cache`] behind the
+    /// [`KvCache`] trait; pack concurrency as separate caches over one shared
+    /// [`BlockPool`](crate::primitives::BlockPool).
+    pub fn new_paged_cache(&self, block_size: usize) -> crate::primitives::PagedKvCache {
+        crate::primitives::PagedKvCache::new(self.cfg.num_layers, block_size)
+    }
+
     /// The engine's cached-decode compute dtype (bf16) — used by the batched decode to match the
     /// additive attention mask to the score dtype.
     pub const fn compute_dtype(&self) -> Dtype {
