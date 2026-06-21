@@ -17,6 +17,13 @@ categories = ["science"]
 # Crates.io publish (a later epic-7153 story) will swap this for a registry/patch arrangement;
 # during development it is the fork so the engine actually runs correctly on-device.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "44929a001ab8a8837403a71c65cf064224de0cdc" }
+# The backend-neutral contract this crate implements (epic 7153). Git dep on the published repo
+# during development (crates.io publish coordination is a later story); shares its `CancelFlag`,
+# `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not two.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+# Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
+# inventory so the distributed slice links.
+inventory = "0.3"
 # Error plumbing for the engine surface.
 thiserror = "2"
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.
@@ -25,9 +32,5 @@ serde_json = "1"
 half = "2"
 
 [dev-dependencies]
-# The end-to-end streaming example + real-weights test tokenize/detokenize via the HF tokenizers
-# crate (same Rust core `transformers` wraps). The host-side tokenizer proper lands in core-llm
-# (story 7154); mlx-llm's decode loop itself is token-id based, so this stays a dev-only dep.
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-# config.json parsing in the example.
-serde_json = "1"
+# (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
+# tokenizers dep needed.)
