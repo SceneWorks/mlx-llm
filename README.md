@@ -21,6 +21,11 @@ the same contract.
   **Architecture dispatch** from `config.json` covers Llama / Mistral and Qwen3 (per-head q/k
   RMSNorm); loaded from any Hugging Face snapshot directory.
 - **Quantize-on-load** — group-wise affine Q4/Q8 of the attention/MLP projections.
+- **GGUF conversion** — bring a llama.cpp `*.gguf` and convert it to a loadable MLX snapshot:
+  dequantizes F16/BF16, the legacy `Q*_0/_1`, the `Q2_K…Q6_K` k-quants, and the non-linear
+  `IQ4_NL`/`IQ4_XS`; remaps llama.cpp tensor names + un-permutes q/k RoPE; rebuilds `config.json`;
+  optionally re-quantizes to MLX Q4/Q8. Verified at parity with the HF safetensors load on Llama and
+  Qwen3.
 - **Streaming, cancellable decode loop** — drives any `Decode` model, emitting a `StreamEvent` per
   token, with cooperative mid-stream cancellation.
 - **`core-llm` contract** — `LlamaProvider` implements `core_llm::TextLlm`, renders the model's own
@@ -32,6 +37,13 @@ Stream a completion from a local snapshot (config.json + tokenizer.json + `*.saf
 
 ```sh
 cargo run --release --example generate -- /path/to/Llama-snapshot "Once upon a time" 64
+```
+
+Convert a llama.cpp GGUF to a loadable snapshot (add `--quant q4|q8` to re-quantize, `--tokenizer
+tokenizer.json` to copy a tokenizer in for end-to-end use):
+
+```sh
+cargo run --release --example convert_gguf -- model.gguf /path/to/out --tokenizer tokenizer.json
 ```
 
 ```rust
