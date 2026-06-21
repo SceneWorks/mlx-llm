@@ -210,6 +210,28 @@ impl LlamaModel {
         self.forward_to_last_logits(input_embeds, cache, &cos, &sin, AttnMask::Causal)
     }
 
+    /// Run a forward step over token ids and return logits for **every** position, `[batch, seq,
+    /// vocab]` — the all-position output speculative decoding (story 7171) needs to verify K proposed
+    /// tokens in one pass. `offset` is the position of the first input token (cached positions);
+    /// attention is implicit-causal, so position `i` attends `0..=offset+i`. Single-sequence / uniform
+    /// batch.
+    pub fn decode_logits_all(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> Result<Array> {
+        let embeds = self.embed(input_ids)?;
+        let s = embeds.shape()[1];
+        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        let mut h = embeds;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &cos, &sin, AttnMask::Causal, cache, i)?;
+        }
+        let normed = rms_norm(&h, &self.norm, self.cfg.rms_norm_eps)?;
+        linear(&normed, &self.lm_head, None) // [batch, seq, vocab]
+    }
+
     /// Batched forward over a **left-padded** `[batch, seq]` step with **per-sequence** RoPE
     /// positions and an explicit additive attention mask — the decode primitive the dynamic-batch
     /// scheduler (story 7167) runs each step.

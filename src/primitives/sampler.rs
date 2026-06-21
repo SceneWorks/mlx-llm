@@ -114,6 +114,55 @@ pub fn sample(
         return argmax_device(logits);
     }
 
+    let v = penalized_logits(logits, history, params, allowed)?;
+
+    // Greedy after mask/penalty have been applied to the host logits.
+    if params.temperature <= 0.0 {
+        return Ok(argmax_host(&v));
+    }
+
+    let weights = nucleus_weights(&v, params);
+    let total: f32 = weights.iter().map(|x| x.1).sum();
+    if total <= 0.0 || !total.is_finite() {
+        return Ok(argmax_host(&v)); // everything masked / -inf; deterministic fallback
+    }
+
+    // Categorical inverse-CDF draw over the (unnormalised) weights.
+    let mut target = rng.next_f32() * total;
+    for (i, w) in &weights {
+        target -= *w;
+        if target <= 0.0 {
+            return Ok(*i as i32);
+        }
+    }
+    Ok(weights.last().map(|x| x.0).unwrap_or(0) as i32)
+}
+
+/// The shaped candidate distribution `sample` would draw from for a **stochastic** (`temperature >
+/// 0`) configuration: `(token_id, unnormalised_weight)` after the constraint mask, repetition
+/// penalty, temperature, top-k, and top-p — the distribution speculative decoding (stories 7171 /
+/// 7172) feeds to the backend-neutral acceptance sampler. Empty when everything is masked out.
+pub fn shaped_candidates(
+    logits: &Array,
+    history: &[i32],
+    params: &SamplingParams,
+    allowed: Option<&[bool]>,
+) -> Result<Vec<(i32, f32)>> {
+    let v = penalized_logits(logits, history, params, allowed)?;
+    Ok(nucleus_weights(&v, params)
+        .into_iter()
+        .map(|(i, w)| (i as i32, w))
+        .collect())
+}
+
+/// Pull `logits` to host f32 and apply the constraint mask + repetition penalty (the position-shaping
+/// shared by `sample` and [`shaped_candidates`]).
+fn penalized_logits(
+    logits: &Array,
+    history: &[i32],
+    params: &SamplingParams,
+    allowed: Option<&[bool]>,
+) -> Result<Vec<f32>> {
     let lf = logits.as_dtype(Dtype::Float32)?;
     let mut v: Vec<f32> = lf.as_slice::<f32>().to_vec();
 
@@ -139,15 +188,15 @@ pub fn sample(
             }
         }
     }
+    Ok(v)
+}
 
-    // Greedy after mask/penalty have been applied to the host logits.
-    if params.temperature <= 0.0 {
-        return Ok(argmax_host(&v));
-    }
-
+/// Temperature + top-k + top-p shaping into `(index, unnormalised_weight)` candidates. Assumes
+/// `params.temperature > 0`; returns empty when all logits are masked (`-inf`).
+fn nucleus_weights(v: &[f32], params: &SamplingParams) -> Vec<(usize, f32)> {
     let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
-        return Ok(argmax_host(&v)); // everything masked / -inf; deterministic fallback
+        return Vec::new();
     }
     let inv_t = 1.0 / params.temperature;
     let mut weights: Vec<(usize, f32)> = v
@@ -166,21 +215,7 @@ pub fn sample(
     if params.top_p < 1.0 {
         weights = nucleus_select(&weights, params.top_p);
     }
-
-    let total: f32 = weights.iter().map(|x| x.1).sum();
-    if total <= 0.0 || !total.is_finite() {
-        return Ok(argmax_host(&v));
-    }
-
-    // Categorical inverse-CDF draw over the (unnormalised) weights.
-    let mut target = rng.next_f32() * total;
-    for (i, w) in &weights {
-        target -= *w;
-        if target <= 0.0 {
-            return Ok(*i as i32);
-        }
-    }
-    Ok(weights.last().map(|x| x.0).unwrap_or(0) as i32)
+    weights
 }
 
 /// On-device argmax of a `[vocab]` / `[1, vocab]` logits row. Greedy fast path — avoids pulling
