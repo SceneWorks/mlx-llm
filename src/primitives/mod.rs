@@ -30,5 +30,5 @@ pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
-pub use sampler::{sample, SamplingParams, SplitMix64, TokenRng};
+pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
 pub use weights::Weights;

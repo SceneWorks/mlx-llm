@@ -49,6 +49,11 @@ pub trait KvCache {
     /// must be a subset of `0..batch_size`; an empty cache is a no-op.
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()>;
 
+    /// Drop cached positions past `len`, keeping positions `0..len` along the sequence axis — the
+    /// seam speculative decoding (story 7171) rolls back rejected draft tokens through. `len` must be
+    /// `<= offset()`; `len == offset()` is a no-op and an empty cache ignores it.
+    fn truncate(&mut self, len: i32) -> Result<()>;
+
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
     fn reset(&mut self);
 }
@@ -133,6 +138,23 @@ impl KvCache for ContiguousKvCache {
         for slot in &mut self.layers {
             if let Some((k, v)) = slot.take() {
                 *slot = Some((k.take_axis(&idx, 0)?, v.take_axis(&idx, 0)?));
+            }
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        if len < 0 {
+            return Err(crate::error::Error::Msg(format!("truncate: negative len {len}")));
+        }
+        let idx = Array::from_slice(&(0..len).collect::<Vec<_>>(), &[len]);
+        for slot in &mut self.layers {
+            if let Some((k, v)) = slot.take() {
+                if k.shape()[SEQ_AXIS as usize] <= len {
+                    *slot = Some((k, v)); // already at/under the target length
+                } else {
+                    *slot = Some((k.take_axis(&idx, SEQ_AXIS)?, v.take_axis(&idx, SEQ_AXIS)?));
+                }
             }
         }
         Ok(())
@@ -239,6 +261,22 @@ mod tests {
         cache.retain_sequences(&[0]).unwrap();
         assert_eq!(cache.batch_size(), 0);
         assert!(cache.peek(0).is_none());
+    }
+
+    #[test]
+    fn truncate_slices_sequence_axis() {
+        let mut cache = ContiguousKvCache::new(1);
+        // [1,1,5,1] = values 0..4 along the seq axis.
+        let a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0], &[1, 1, 5, 1]);
+        cache.update(0, &a, &a).unwrap();
+        assert_eq!(cache.offset(), 5);
+        cache.truncate(3).unwrap();
+        assert_eq!(cache.offset(), 3);
+        let (k, _) = cache.peek(0).unwrap();
+        let host = k.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        assert_eq!(host, vec![0.0, 1.0, 2.0]);
+        cache.truncate(10).unwrap(); // no-op past the end
+        assert_eq!(cache.offset(), 3);
     }
 
     #[test]
