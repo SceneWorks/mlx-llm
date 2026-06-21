@@ -5,15 +5,16 @@
 //! streaming decode loop and translating its token events into contract [`StreamEvent`]s (with
 //! incremental detokenization). It registers into [`core_llm::registry`] under the id `mlx-llama`.
 //!
-//! The chat template is the typed [`Llama3Template`] for now; reading a model's own `chat_template`
-//! (minijinja) lands in story 7164 behind the same seam.
+//! The chat template is the model's own `chat_template` from `tokenizer_config.json` (rendered via
+//! `core_llm::JinjaChatTemplate`, story 7164), falling back to the typed [`Llama3Template`] when a
+//! snapshot ships no `tokenizer_config.json`.
 
 use std::path::Path;
 
 use core_llm::{
-    ChatTemplate, Error as CoreError, FinishReason as CoreFinish, Llama3Template, LoadSpec,
-    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
+    ChatTemplate, Error as CoreError, FinishReason as CoreFinish, JinjaChatTemplate, Llama3Template,
+    LoadSpec, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
 use crate::config::LlamaConfig;
@@ -30,7 +31,7 @@ pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
     model: LlamaModel,
     tokenizer: Tokenizer,
-    template: Llama3Template,
+    template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
 }
 
@@ -48,18 +49,34 @@ impl LlamaProvider {
         let model = LlamaModel::from_weights(&weights, "", cfg).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
-        Ok(Self::from_parts(model, tokenizer, stop_tokens))
+        Ok(Self {
+            descriptor: provider_descriptor(),
+            model,
+            tokenizer,
+            template: load_chat_template(dir),
+            stop_tokens,
+        })
     }
 
-    /// Assemble a provider from already-loaded parts (used by tests and converters).
+    /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
+    /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: LlamaModel, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         Self {
             descriptor: provider_descriptor(),
             model,
             tokenizer,
-            template: Llama3Template,
+            template: Box::new(Llama3Template),
             stop_tokens,
         }
+    }
+}
+
+/// Use the model's own Jinja `chat_template` (from `tokenizer_config.json`, story 7164) when
+/// present; otherwise fall back to the typed Llama-3 template.
+fn load_chat_template(dir: &Path) -> Box<dyn ChatTemplate> {
+    match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
+        Ok(t) => Box::new(t),
+        Err(_) => Box::new(Llama3Template),
     }
 }
 
