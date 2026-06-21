@@ -30,6 +30,10 @@ the same contract.
   token, with cooperative mid-stream cancellation.
 - **`core-llm` contract** — `LlamaProvider` implements `core_llm::TextLlm`, renders the model's own
   chat template, and registers as `mlx-llama`.
+- **Text + vision (VLM)** — JoyCaption (`LlavaForConditionalGeneration`): a SigLIP2 vision tower +
+  LLaVA projector + image-token splice in front of the reused Llama decode, served as a multimodal
+  `TextLlm` provider (`mlx-joycaption`, `supports_vision`). Verified token-for-token against the
+  reference engine, including the bicubic resize of non-square images.
 
 ## Example
 

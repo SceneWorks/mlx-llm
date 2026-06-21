@@ -24,7 +24,7 @@ pub mod weights;
 
 pub use attention::{repeat_kv, sdpa, sdpa_causal, AttnMask};
 pub use kv_cache::{ContiguousKvCache, KvCache};
-pub use nn::{embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm};
+pub use nn::{conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm};
 pub use projection::{Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};

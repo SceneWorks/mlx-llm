@@ -6,5 +6,7 @@
 //! mutable state in a forward pass is the KV cache, threaded in as `&mut dyn KvCache`.
 
 pub mod llama;
+pub mod siglip;
 
 pub use llama::LlamaModel;
+pub use siglip::{SiglipVisionConfig, SiglipVisionTower};
