@@ -13,13 +13,14 @@ use std::path::Path;
 
 use core_llm::{
     ChatTemplate, Error as CoreError, FinishReason as CoreFinish, JinjaChatTemplate, Llama3Template,
-    LoadSpec, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
+    LoadSpec, Quantize, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
 use crate::config::LlamaConfig;
 use crate::decode::{generate, FinishReason, GenerationConfig, StreamEvent};
 use crate::models::LlamaModel;
+use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::Weights;
 
@@ -36,26 +37,33 @@ pub struct LlamaProvider {
 }
 
 impl LlamaProvider {
-    /// Load a Llama provider from a snapshot directory (config.json + tokenizer.json + shards).
+    /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
+    /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
+    /// quantizes the projections on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        if spec.quantize.is_some() {
-            return Err(CoreError::Unsupported(
-                "quantize-on-load is not yet implemented (sc-7163)".into(),
-            ));
-        }
         let dir = Path::new(&spec.source);
         let cfg = LlamaConfig::from_dir(dir).map_err(to_core)?;
+        let quant = spec.quantize.map(|q| match q {
+            Quantize::Q4 => QuantSpec::q4(),
+            Quantize::Q8 => QuantSpec::q8(),
+        });
+        let descriptor = descriptor_for(&cfg);
         let weights = Weights::from_dir(dir).map_err(to_core)?;
-        let model = LlamaModel::from_weights(&weights, "", cfg).map_err(to_core)?;
+        let model = LlamaModel::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
         Ok(Self {
-            descriptor: provider_descriptor(),
+            descriptor,
             model,
             tokenizer,
             template: load_chat_template(dir),
             stop_tokens,
         })
+    }
+
+    /// Whether the loaded model's projections are quantized.
+    pub fn is_quantized(&self) -> bool {
+        self.model.is_quantized()
     }
 
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
@@ -163,7 +171,8 @@ impl TextLlm for LlamaProvider {
     }
 }
 
-/// The descriptor for the `mlx-llama` provider (constructible without loading weights).
+/// The descriptor for the `mlx-llama` provider (constructible without loading weights; used for
+/// link-time registration and registry discovery).
 pub fn provider_descriptor() -> TextLlmDescriptor {
     TextLlmDescriptor {
         id: PROVIDER_ID.to_string(),
@@ -179,6 +188,15 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             supported_constraints: Vec::new(),
         },
     }
+}
+
+/// A descriptor reflecting a *loaded* model: family from the dispatched architecture and the context
+/// length from `config.json`. (Quantization state is reported via [`LlamaProvider::is_quantized`].)
+fn descriptor_for(cfg: &LlamaConfig) -> TextLlmDescriptor {
+    let mut d = provider_descriptor();
+    d.family = cfg.architecture.family().to_string();
+    d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    d
 }
 
 /// Read `eos_token_id` (int or array) from `config.json`; falls back to the Llama-3 stop ids.

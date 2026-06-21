@@ -1,12 +1,13 @@
-//! Generic Llama-family decoder.
+//! Generic Llama-family causal decoder (Llama / Mistral / Qwen3).
 //!
-//! Modelled on the working mlx-gen prompt-refine / JoyCaption Llama stacks, rebuilt on this crate's
-//! own [`primitives`](crate::primitives). The forward is `&self`; the KV cache is the only mutable
-//! state, threaded in as `&mut dyn KvCache` so any cache implementation (contiguous today, paged in
-//! P4) works without the decoder changing.
+//! Modelled on the working mlx-gen prompt-refine / JoyCaption Llama stacks, generalized for BYO
+//! architecture dispatch (story 7163): attention optionally applies per-head q/k RMSNorm (Qwen3),
+//! and projections are held behind [`Projection`] so a model can be quantized on load. The forward
+//! is `&self`; the KV cache is the only mutable state, threaded in as `&mut dyn KvCache`.
 //!
 //! Shapes are batch-capable: the batch axis is real throughout (`[batch, seq, …]`), even though the
-//! streaming driver in [`crate::decode`] runs batch-1.
+//! streaming driver in [`crate::decode`] runs batch-1. Note `head_dim` is taken from config and may
+//! differ from `hidden_size / num_heads` (e.g. Qwen3-0.6B: hidden 1024, 16 heads, head_dim 128).
 
 use mlx_rs::ops::add;
 use mlx_rs::{Array, Dtype};
@@ -15,14 +16,15 @@ use crate::config::LlamaConfig;
 use crate::error::Result;
 use crate::primitives::attention::sdpa_causal;
 use crate::primitives::kv_cache::KvCache;
-use crate::primitives::nn::{embed, linear, rms_norm, swiglu};
+use crate::primitives::nn::{embed, linear, rms_norm};
+use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{ContiguousKvCache, Weights};
 
 /// Cached decode runs in bf16 (matching the reference engines).
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
 
-/// A loaded Llama decoder.
+/// A loaded causal decoder.
 #[derive(Debug)]
 pub struct LlamaModel {
     embed_tokens: Array,
@@ -31,14 +33,29 @@ pub struct LlamaModel {
     lm_head: Array,
     rope: Rope,
     cfg: LlamaConfig,
+    quantized: bool,
 }
 
 impl LlamaModel {
-    /// Build from a loaded checkpoint. `prefix` is the weight-key prefix (`""` for a plain
-    /// `LlamaForCausalLM`, e.g. `"language_model"` for a VLM-nested decoder).
+    /// Build from a loaded checkpoint (dense). `prefix` is the weight-key prefix (`""` for a plain
+    /// `*ForCausalLM`, e.g. `"language_model"` for a VLM-nested decoder).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: LlamaConfig) -> Result<Self> {
+        Self::from_weights_with(w, prefix, cfg, None)
+    }
+
+    /// Build from a loaded checkpoint, optionally quantizing the attention/MLP projections on load.
+    /// Embeddings, the LM head, and norms always stay dense.
+    pub fn from_weights_with(
+        w: &Weights,
+        prefix: &str,
+        cfg: LlamaConfig,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
         let p = |suffix: &str| join(prefix, suffix);
         let req_bf16 = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+        let proj = |key: String| -> Result<Projection> {
+            Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
+        };
 
         let embed_tokens = req_bf16(p("model.embed_tokens.weight"))?;
         let norm = req_bf16(p("model.norm.weight"))?;
@@ -48,27 +65,39 @@ impl LlamaModel {
             req_bf16(p("lm_head.weight"))?
         };
 
+        let qk_norm = cfg.has_qk_norm();
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let lp = |suffix: &str| join(prefix, &format!("model.layers.{i}.{suffix}"));
+            let (q_norm, k_norm) = if qk_norm {
+                (
+                    Some(req_bf16(lp("self_attn.q_norm.weight"))?),
+                    Some(req_bf16(lp("self_attn.k_norm.weight"))?),
+                )
+            } else {
+                (None, None)
+            };
             layers.push(LlamaLayer {
                 input_ln: req_bf16(lp("input_layernorm.weight"))?,
                 post_ln: req_bf16(lp("post_attention_layernorm.weight"))?,
                 attn: LlamaAttention {
-                    q_w: req_bf16(lp("self_attn.q_proj.weight"))?,
-                    k_w: req_bf16(lp("self_attn.k_proj.weight"))?,
-                    v_w: req_bf16(lp("self_attn.v_proj.weight"))?,
-                    o_w: req_bf16(lp("self_attn.o_proj.weight"))?,
+                    q: proj(lp("self_attn.q_proj.weight"))?,
+                    k: proj(lp("self_attn.k_proj.weight"))?,
+                    v: proj(lp("self_attn.v_proj.weight"))?,
+                    o: proj(lp("self_attn.o_proj.weight"))?,
+                    q_norm,
+                    k_norm,
                     num_heads: cfg.num_heads,
                     num_kv_heads: cfg.num_kv_heads,
                     head_dim: cfg.head_dim,
                     scale: cfg.attn_scale(),
                     groups: cfg.groups(),
+                    eps: cfg.rms_norm_eps,
                 },
                 mlp: LlamaMlp {
-                    gate_w: req_bf16(lp("mlp.gate_proj.weight"))?,
-                    up_w: req_bf16(lp("mlp.up_proj.weight"))?,
-                    down_w: req_bf16(lp("mlp.down_proj.weight"))?,
+                    gate: proj(lp("mlp.gate_proj.weight"))?,
+                    up: proj(lp("mlp.up_proj.weight"))?,
+                    down: proj(lp("mlp.down_proj.weight"))?,
                 },
                 eps: cfg.rms_norm_eps,
             });
@@ -82,12 +111,18 @@ impl LlamaModel {
             lm_head,
             rope,
             cfg,
+            quantized: quant.is_some(),
         })
     }
 
     /// The model config.
     pub fn config(&self) -> &LlamaConfig {
         &self.cfg
+    }
+
+    /// Whether the projections were quantized on load.
+    pub fn is_quantized(&self) -> bool {
+        self.quantized
     }
 
     /// A fresh contiguous KV cache sized for this model.
@@ -101,8 +136,8 @@ impl LlamaModel {
     }
 
     /// Run a forward step over token ids and return logits for the **last** position only,
-    /// `[batch, vocab]`. `offset` is the position of the first input token (the RoPE offset =
-    /// number of positions already cached).
+    /// `[batch, vocab]`. `offset` is the position of the first input token (number of cached
+    /// positions).
     pub fn decode_logits(
         &self,
         input_ids: &Array,
@@ -113,8 +148,8 @@ impl LlamaModel {
         self.decode_logits_from_embeds(&embeds, cache, offset)
     }
 
-    /// Like [`LlamaModel::decode_logits`] but starting from pre-computed input embeddings — the
-    /// hook the VLM path (story 7157) uses to splice image features before the decoder.
+    /// Like [`LlamaModel::decode_logits`] but from pre-computed input embeddings — the hook the VLM
+    /// path (story 7157) uses to splice image features before the decoder.
     pub fn decode_logits_from_embeds(
         &self,
         input_embeds: &Array,
@@ -130,7 +165,6 @@ impl LlamaModel {
             h = layer.forward(&h, &cos, &sin, cache, i)?;
         }
 
-        // Logits for the last position only (memory-efficient: never materialise full-seq logits).
         let last = s - 1;
         let last_idx = Array::from_slice(&[last], &[1]);
         let last_h = h.take_axis(&last_idx, 1)?.reshape(&[b, self.cfg.hidden_size])?;
@@ -176,18 +210,21 @@ impl LlamaLayer {
     }
 }
 
-/// Grouped-query attention with RoPE.
+/// Grouped-query attention with RoPE and optional per-head q/k RMSNorm (Qwen3).
 #[derive(Debug)]
 struct LlamaAttention {
-    q_w: Array,
-    k_w: Array,
-    v_w: Array,
-    o_w: Array,
+    q: Projection,
+    k: Projection,
+    v: Projection,
+    o: Projection,
+    q_norm: Option<Array>,
+    k_norm: Option<Array>,
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
     scale: f32,
     groups: i32,
+    eps: f32,
 }
 
 impl LlamaAttention {
@@ -203,11 +240,19 @@ impl LlamaAttention {
         let (b, s) = (sh[0], sh[1]);
 
         // Project, then split into heads in [b, s, heads, head_dim] layout.
-        let q = linear(x, &self.q_w, None)?.reshape(&[b, s, self.num_heads, self.head_dim])?;
-        let k = linear(x, &self.k_w, None)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
-        let v = linear(x, &self.v_w, None)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let mut q = self.q.forward(x)?.reshape(&[b, s, self.num_heads, self.head_dim])?;
+        let mut k = self.k.forward(x)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let v = self.v.forward(x)?.reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
 
-        // RoPE on q,k in [b, s, heads, head_dim] (cos/sin broadcast over the head axis).
+        // Qwen3 per-head q/k RMSNorm over the head_dim axis, before RoPE.
+        if let Some(qn) = &self.q_norm {
+            q = rms_norm(&q, qn, self.eps)?;
+        }
+        if let Some(kn) = &self.k_norm {
+            k = rms_norm(&k, kn, self.eps)?;
+        }
+
+        // RoPE on q,k (cos/sin broadcast over the head axis).
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
 
@@ -224,21 +269,24 @@ impl LlamaAttention {
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, self.num_heads * self.head_dim])?;
-        linear(&out, &self.o_w, None)
+        self.o.forward(&out)
     }
 }
 
 /// SwiGLU feed-forward.
 #[derive(Debug)]
 struct LlamaMlp {
-    gate_w: Array,
-    up_w: Array,
-    down_w: Array,
+    gate: Projection,
+    up: Projection,
+    down: Projection,
 }
 
 impl LlamaMlp {
     fn forward(&self, x: &Array) -> Result<Array> {
-        swiglu(x, &self.gate_w, &self.up_w, &self.down_w)
+        let gate = crate::primitives::nn::silu(&self.gate.forward(x)?)?;
+        let up = self.up.forward(x)?;
+        let gated = mlx_rs::ops::multiply(&gate, &up)?;
+        self.down.forward(&gated)
     }
 }
 
