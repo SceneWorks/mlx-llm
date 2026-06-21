@@ -6,10 +6,12 @@
 
 pub mod batch;
 pub mod cancel;
+pub mod prefix;
 pub mod stream;
 
 pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
+pub use prefix::{generate_cached, PrefixCache, PrefixStats};
 pub use stream::{
     generate, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
     GenerationOutput, StreamEvent,
