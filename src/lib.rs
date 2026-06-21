@@ -13,7 +13,9 @@
 //!    drives any [`Decode`](decode::Decode) model, emitting a [`StreamEvent`](decode::StreamEvent)
 //!    per token. This internal streaming API is what the backend-neutral `core-llm` contract
 //!    (story 7154) is extracted from. [`generate_batch`](decode::generate_batch) packs many requests
-//!    into one forward step (story 7167), driven by `core_llm`'s backend-neutral scheduler policy.
+//!    into one forward step (story 7167), driven by `core_llm`'s backend-neutral scheduler policy;
+//!    [`generate_cached`](decode::generate_cached) reuses a shared prompt prefix's KV across requests
+//!    (story 7168), driven by `core_llm`'s backend-neutral prefix-index policy.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
 //!    and registers it (`mlx-llama`), so consumers stream a generation entirely through `core-llm`.
 //!
@@ -43,8 +45,8 @@ pub use core_llm;
 
 pub use config::LlamaConfig;
 pub use decode::{
-    generate, generate_batch, BatchRequest, CancelFlag, FinishReason, GenerationConfig,
-    GenerationOutput, StreamEvent,
+    generate, generate_batch, generate_cached, BatchRequest, CancelFlag, FinishReason,
+    GenerationConfig, GenerationOutput, PrefixCache, PrefixStats, StreamEvent,
 };
 pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};

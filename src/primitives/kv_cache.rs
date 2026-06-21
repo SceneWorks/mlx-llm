@@ -73,6 +73,26 @@ impl ContiguousKvCache {
     pub fn peek(&self, layer: usize) -> Option<&(Array, Array)> {
         self.layers.get(layer).and_then(|s| s.as_ref())
     }
+
+    /// Construct a cache pre-populated with per-layer `(keys, values)` — the seam the prefix cache
+    /// (story 7168) reuses a shared prefix's KV through. Each entry is `[batch, n_kv_heads, seq,
+    /// head_dim]` (keys already-RoPE'd); the cache then reports [`KvCache::offset`] equal to that
+    /// seq length, so a decoder prefills only the suffix at that offset and attends over the seeded
+    /// keys. Layout/length consistency across layers is the caller's responsibility.
+    pub fn seeded(layers: Vec<(Array, Array)>) -> Self {
+        Self {
+            layers: layers.into_iter().map(Some).collect(),
+        }
+    }
+
+    /// Snapshot every layer's cached `(keys, values)` as clones (MLX arrays are refcounted, so this
+    /// shares buffers rather than copying), or `None` if any layer is still empty. The prefix cache
+    /// stores this after a generation so a later shared-prefix request can be [`seeded`] from it.
+    ///
+    /// [`seeded`]: ContiguousKvCache::seeded
+    pub fn export(&self) -> Option<Vec<(Array, Array)>> {
+        self.layers.iter().cloned().collect()
+    }
 }
 
 impl KvCache for ContiguousKvCache {

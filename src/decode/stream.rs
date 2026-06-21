@@ -125,7 +125,7 @@ pub fn generate_with(
     config: &GenerationConfig,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
-    mut constraint: Option<&mut dyn ConstraintMask>,
+    constraint: Option<&mut dyn ConstraintMask>,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
@@ -134,14 +134,46 @@ pub fn generate_with(
         return Err(Error::Msg("generate: empty prompt".into()));
     }
 
-    let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let mut cache = decoder.make_cache();
 
     // Prefill the whole prompt at offset 0; logits are for the last prompt position.
     let prompt = input_ids(prompt_ids);
-    let mut logits = decoder.step(&prompt, cache.as_mut(), 0)?;
+    let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
 
-    let mut history: Vec<i32> = prompt_ids.to_vec();
+    decode_loop(
+        decoder,
+        cache.as_mut(),
+        logits,
+        rng,
+        prompt_ids.to_vec(),
+        config,
+        cancel,
+        on_event,
+        constraint,
+    )
+}
+
+/// The token-by-token decode loop shared by [`generate_with`] and the prefix-cached path
+/// ([`crate::decode::generate_cached`]): given the prefill `logits`, an RNG, the seeded `history`
+/// (the prompt — the repetition-penalty window), and a `cache` already positioned past the prompt,
+/// sample, emit, and step until a stop token, the budget, or a mid-stream cancel.
+///
+/// The two entry points differ only in how the cache + first `logits` are produced (cold prefill vs.
+/// shared-prefix reuse); the loop is identical, so a cached run is token-for-token the same as a cold
+/// one for the same prompt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_loop(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    mut logits: Array,
+    mut rng: SplitMix64,
+    mut history: Vec<i32>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    mut constraint: Option<&mut dyn ConstraintMask>,
+) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
 
@@ -180,7 +212,7 @@ pub fn generate_with(
         // Feed the new token back; its absolute position is the current cache length.
         let offset = cache.offset();
         let tok = input_ids(&[next]);
-        logits = decoder.step(&tok, cache.as_mut(), offset)?;
+        logits = decoder.step(&tok, cache, offset)?;
     }
 
     on_event(StreamEvent::Done {
