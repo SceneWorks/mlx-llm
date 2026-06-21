@@ -1,0 +1,16 @@
+# MLX uses a shared default Metal device/stream that is NOT safe to drive from multiple threads
+# concurrently. cargo's test harness runs tests in parallel by default, which SIGSEGVs once more
+# than one test touches MLX at the same time. Force the libtest harness to a single thread so
+# `cargo test` just works. `force = true` is load-bearing: a plain `[env]` entry only applies when
+# the variable is UNSET, so without it a pre-exported RUST_TEST_THREADS would silently re-enable
+# parallel MLX tests and hit the SIGSEGV. (Matches mlx-gen's .cargo/config.toml.)
+[env]
+RUST_TEST_THREADS = { value = "1", force = true }
+
+# Build MLX at the macOS 26.2 deployment target so the Apple matrix-unit ("NAX") Metal kernels both
+# compile in AND codegen correctly. mlx-sys's build.rs floors the target at macOS 14, which trips
+# MLX's kernel gate and omits the fast NAX kernels; at 26.0 the kernels miscompile 16-bit GEMM/SDPA
+# to garbage. 26.2 is the floor at which the NAX matrix-unit intrinsic is valid and correct. cargo
+# only applies this when MACOSX_DEPLOYMENT_TARGET is unset, so CI (capped at macos-15) can override
+# it to a lower, NAX-disabled-but-correct target. See mlx-gen sc-2772 for the full rationale.
+MACOSX_DEPLOYMENT_TARGET = "26.2"
