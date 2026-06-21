@@ -92,17 +92,40 @@ pub struct GenerationOutput {
     pub finish_reason: FinishReason,
 }
 
+/// A per-step logit constraint (e.g. JSON grammar). Before each token the loop asks for the
+/// [`ConstraintMask::allowed`] mask (passed to the sampler so disallowed ids are forced to `-inf`),
+/// and after a token is chosen it calls [`ConstraintMask::accept`]. The engine owns no grammar
+/// policy — `core_llm::JsonConstraint` is one implementation behind this seam.
+pub trait ConstraintMask {
+    /// The per-vocab allow mask for the current step.
+    fn allowed(&mut self) -> &[bool];
+    /// Advance the constraint after `token` is chosen.
+    fn accept(&mut self, token: i32);
+}
+
 /// Stream tokens from `decoder`, starting from `prompt_ids`, emitting a [`StreamEvent`] per token
-/// through `on_event`.
-///
-/// Returns [`Error::Canceled`] if `cancel` is already set before any inference runs; otherwise runs
-/// to a stop token, the token budget, or a mid-stream cancel, returning the generated tokens.
+/// through `on_event`. Unconstrained convenience wrapper over [`generate_with`].
 pub fn generate(
     decoder: &dyn Decode,
     prompt_ids: &[i32],
     config: &GenerationConfig,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
+) -> Result<GenerationOutput> {
+    generate_with(decoder, prompt_ids, config, cancel, on_event, None)
+}
+
+/// Like [`generate`], with an optional per-step [`ConstraintMask`] (structured-output decoding).
+///
+/// Returns [`Error::Canceled`] if `cancel` is already set before any inference runs; otherwise runs
+/// to a stop token, the token budget, or a mid-stream cancel, returning the generated tokens.
+pub fn generate_with(
+    decoder: &dyn Decode,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    mut constraint: Option<&mut dyn ConstraintMask>,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
@@ -130,11 +153,20 @@ pub fn generate(
             break;
         }
 
-        let next = sample(&logits, &history, &config.sampling, &mut rng, None)?;
+        // Apply the constraint mask (if any) for this step, then sample. The mask borrow is scoped
+        // so the constraint is free to be advanced again below.
+        let next = {
+            let mask = constraint.as_mut().map(|c| c.allowed());
+            sample(&logits, &history, &config.sampling, &mut rng, mask)?
+        };
 
         if config.stop_tokens.contains(&next) {
             finish = FinishReason::StopToken;
             break;
+        }
+
+        if let Some(c) = &mut constraint {
+            c.accept(next);
         }
 
         on_event(StreamEvent::Token { id: next, step });
