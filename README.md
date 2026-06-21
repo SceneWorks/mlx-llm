@@ -17,10 +17,14 @@ the same contract.
   (greedy / temperature / top-p / top-k / repetition-penalty over a pluggable RNG), the RoPE family
   (standard / Qwen3 / Llama-3 scaled), GQA attention helpers, group-wise Q4/Q8 quantization, and a
   safetensors weights loader.
-- **Generic Llama decoder** — `&self` forward + `from_weights`, GQA + SwiGLU + RMSNorm + RoPE,
-  loaded from a Hugging Face snapshot directory.
+- **Generic causal decoder** — `&self` forward + `from_weights`, GQA + SwiGLU + RMSNorm + RoPE.
+  **Architecture dispatch** from `config.json` covers Llama / Mistral and Qwen3 (per-head q/k
+  RMSNorm); loaded from any Hugging Face snapshot directory.
+- **Quantize-on-load** — group-wise affine Q4/Q8 of the attention/MLP projections.
 - **Streaming, cancellable decode loop** — drives any `Decode` model, emitting a `StreamEvent` per
   token, with cooperative mid-stream cancellation.
+- **`core-llm` contract** — `LlamaProvider` implements `core_llm::TextLlm`, renders the model's own
+  chat template, and registers as `mlx-llama`.
 
 ## Example
 

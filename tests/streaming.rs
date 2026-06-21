@@ -29,6 +29,8 @@ fn tiny_config() -> LlamaConfig {
         rope_theta: 10000.0,
         rope_scaling: None,
         tie_word_embeddings: false,
+        architecture: mlx_llm::config::Architecture::Llama,
+        max_position_embeddings: 0,
     }
 }
 

@@ -11,6 +11,60 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::primitives::Rope;
 
+/// The decoder architecture, dispatched from `config.json` (`architectures` / `model_type`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Architecture {
+    /// Llama family (also Mistral — same decoder shape: no q/k norm, no QKV bias).
+    Llama,
+    /// Qwen3 family: adds per-head q/k RMSNorm in attention.
+    Qwen3,
+}
+
+impl Architecture {
+    /// Determine the architecture from a parsed `config.json`. A config with no `architectures` /
+    /// `model_type` (e.g. a minimal synthetic config) defaults to [`Architecture::Llama`]; a config
+    /// that names an unrecognized architecture is rejected.
+    pub fn from_config(v: &Value) -> Result<Self> {
+        let arch = v
+            .get("architectures")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|s| s.as_str());
+        let model_type = v.get("model_type").and_then(|s| s.as_str());
+        let hay = format!(
+            "{} {}",
+            arch.unwrap_or("").to_lowercase(),
+            model_type.unwrap_or("").to_lowercase()
+        );
+        if hay.contains("qwen3") {
+            Ok(Architecture::Qwen3)
+        } else if hay.contains("llama")
+            || hay.contains("mistral")
+            || (arch.is_none() && model_type.is_none())
+        {
+            // Llama/Mistral share the decoder shape; a minimal config (no arch fields) defaults here.
+            Ok(Architecture::Llama)
+        } else {
+            Err(Error::Unsupported(format!(
+                "unsupported architecture (architectures={arch:?}, model_type={model_type:?})"
+            )))
+        }
+    }
+
+    /// The model-family tag (`"llama"` / `"qwen3"`).
+    pub fn family(self) -> &'static str {
+        match self {
+            Architecture::Llama => "llama",
+            Architecture::Qwen3 => "qwen3",
+        }
+    }
+
+    /// Whether attention applies per-head q/k RMSNorm (Qwen3).
+    pub fn has_qk_norm(self) -> bool {
+        matches!(self, Architecture::Qwen3)
+    }
+}
+
 /// `rope_scaling` parameters for the Llama-3 NTK-by-parts schedule.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RopeScaling {
@@ -49,6 +103,10 @@ pub struct LlamaConfig {
     pub rope_scaling: Option<RopeScaling>,
     /// Whether `lm_head` is tied to the input embeddings.
     pub tie_word_embeddings: bool,
+    /// The decoder architecture (drives q/k norm and the family tag).
+    pub architecture: Architecture,
+    /// Max context length (`max_position_embeddings`); `0` if unspecified.
+    pub max_position_embeddings: i32,
 }
 
 impl LlamaConfig {
@@ -80,6 +138,8 @@ impl LlamaConfig {
             .get("tie_word_embeddings")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
+        let architecture = Architecture::from_config(v)?;
+        let max_position_embeddings = int("max_position_embeddings").unwrap_or(0);
 
         let rope_scaling = v.get("rope_scaling").and_then(|rs| {
             // Only the "llama3" schedule is parsed; absent / other types fall back to standard RoPE.
@@ -113,7 +173,14 @@ impl LlamaConfig {
             rope_theta,
             rope_scaling,
             tie_word_embeddings,
+            architecture,
+            max_position_embeddings,
         })
+    }
+
+    /// Whether attention applies per-head q/k RMSNorm (Qwen3).
+    pub fn has_qk_norm(&self) -> bool {
+        self.architecture.has_qk_norm()
     }
 
     /// Read and parse `config.json` from a snapshot directory (or a file path).
@@ -203,5 +270,42 @@ mod tests {
     fn missing_required_field_errors() {
         let v = json!({ "hidden_size": 64 });
         assert!(matches!(LlamaConfig::from_json(&v), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn architecture_dispatch() {
+        let qwen3 = json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" });
+        assert_eq!(Architecture::from_config(&qwen3).unwrap(), Architecture::Qwen3);
+
+        let llama = json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" });
+        assert_eq!(Architecture::from_config(&llama).unwrap(), Architecture::Llama);
+
+        let mistral = json!({ "architectures": ["MistralForCausalLM"] });
+        assert_eq!(Architecture::from_config(&mistral).unwrap(), Architecture::Llama);
+
+        // Minimal config (no arch fields) defaults to Llama.
+        let minimal = json!({ "hidden_size": 8 });
+        assert_eq!(Architecture::from_config(&minimal).unwrap(), Architecture::Llama);
+
+        // A named-but-unsupported arch is rejected.
+        let unknown = json!({ "architectures": ["MambaForCausalLM"], "model_type": "mamba" });
+        assert!(matches!(Architecture::from_config(&unknown), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn qwen3_config_has_qk_norm_and_explicit_head_dim() {
+        let v = json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 28,
+            "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+            "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "tie_word_embeddings": true, "max_position_embeddings": 40960
+        });
+        let cfg = LlamaConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Qwen3);
+        assert!(cfg.has_qk_norm());
+        assert_eq!(cfg.head_dim, 128); // explicit, != 1024/16
+        assert_eq!(cfg.max_position_embeddings, 40960);
+        assert!(cfg.rope_scaling.is_none());
     }
 }
