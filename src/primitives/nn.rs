@@ -5,10 +5,22 @@
 //! (no bias on Llama/Qwen; bias is optional for e.g. SigLIP). These wrap MLX ops so the decoders
 //! read cleanly and so a single place documents the layout contract.
 
-use mlx_rs::ops::{add, matmul};
+use mlx_rs::ops::{add, conv2d as conv2d_op, matmul};
 use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
+
+/// 2-D convolution over NHWC `x` with an mlx `[out, kH, kW, in]` weight (+ optional bias), square
+/// `stride`/`padding`, no dilation, groups = 1 — the patch-embedding conv the SigLIP vision tower
+/// uses (story 7157). HF stores the conv weight `[out, in, kH, kW]`; transpose to `[out, kH, kW, in]`
+/// before calling.
+pub fn conv2d(x: &Array, weight: &Array, bias: Option<&Array>, stride: i32, padding: i32) -> Result<Array> {
+    let y = conv2d_op(x, weight, (stride, stride), (padding, padding), (1, 1), 1)?;
+    match bias {
+        Some(b) => Ok(add(&y, b)?),
+        None => Ok(y),
+    }
+}
 
 /// `x @ weight.t() (+ bias)`. `weight` is `[out, in]` (HF layout); `x` is `[..., in]`.
 pub fn linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {

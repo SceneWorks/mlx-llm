@@ -21,6 +21,10 @@
 //! `{config.json, model.safetensors}` snapshot the loader consumes (story 7165), optionally
 //! re-quantizing to MLX Q4/Q8.
 //!
+//! [`joycaption`] is the **text + vision** path (story 7157): a SigLIP vision tower
+//! ([`models::SiglipVisionTower`]) + LLaVA projector + image splice in front of the reused
+//! [`LlamaModel`] decode, served as a multimodal [`core_llm::TextLlm`] provider (`mlx-joycaption`).
+//!
 //! MLX's default Metal device is single-threaded; engine instances hold MLX `Array`s and are
 //! therefore neither `Send` nor `Sync`. Drive one engine from one thread (or behind a mutex).
 
@@ -28,6 +32,8 @@ pub mod config;
 pub mod decode;
 pub mod error;
 pub mod gguf;
+pub mod image;
+pub mod joycaption;
 pub mod models;
 pub mod primitives;
 pub mod provider;
@@ -41,5 +47,6 @@ pub use decode::{
     GenerationOutput, StreamEvent,
 };
 pub use error::{Error, Result};
+pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::LlamaModel;
 pub use provider::LlamaProvider;
