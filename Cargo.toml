@@ -1,0 +1,10 @@
+[package]
+name = "mlx-llm"
+version = "0.0.0"
+edition = "2021"
+description = "Reserved — on-device text + vision LLM serving engine for Apple MLX (placeholder; work in progress)."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/mlx-llm"
+readme = "README.md"
+
+[dependencies]
