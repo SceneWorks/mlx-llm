@@ -194,7 +194,7 @@ pub fn generate_with(
 }
 
 /// A non-reproducible seed for `GenerationConfig::seed == None`.
-fn default_seed() -> u64 {
+pub(crate) fn default_seed() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

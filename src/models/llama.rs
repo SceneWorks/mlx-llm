@@ -14,7 +14,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::config::LlamaConfig;
 use crate::error::Result;
-use crate::primitives::attention::sdpa_causal;
+use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, linear, rms_norm};
 use crate::primitives::projection::{Projection, QuantSpec};
@@ -130,6 +130,22 @@ impl LlamaModel {
         ContiguousKvCache::new(self.cfg.num_layers)
     }
 
+    /// The engine's cached-decode compute dtype (bf16) — used by the batched decode to match the
+    /// additive attention mask to the score dtype.
+    pub const fn compute_dtype(&self) -> Dtype {
+        COMPUTE_DTYPE
+    }
+
+    /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
+    /// (row-major flat `positions`, length `rows * cols`) — the **per-sequence** position tables the
+    /// batched decode (story 7167) feeds [`LlamaModel::decode_logits_masked`]. Each is
+    /// `[rows, cols, head_dim]` in the compute dtype.
+    pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<(Array, Array)> {
+        let (cos, sin) = self.rope.cos_sin_at(positions, COMPUTE_DTYPE)?; // [1, rows*cols, head_dim]
+        let hd = self.rope.dim();
+        Ok((cos.reshape(&[rows, cols, hd])?, sin.reshape(&[rows, cols, hd])?))
+    }
+
     /// Embed token ids `[batch, seq]` → `[batch, seq, hidden]` (bf16).
     pub fn embed(&self, input_ids: &Array) -> Result<Array> {
         embed(&self.embed_tokens, input_ids)
@@ -156,13 +172,51 @@ impl LlamaModel {
         cache: &mut dyn KvCache,
         offset: i32,
     ) -> Result<Array> {
+        let s = input_embeds.shape()[1];
+        // Single-sequence / uniform batch: positions [offset, offset+s) shared across the batch,
+        // implicit bottom-right causal mask. cos/sin `[1, s, head_dim]` broadcast over the batch.
+        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        self.forward_to_last_logits(input_embeds, cache, &cos, &sin, AttnMask::Causal)
+    }
+
+    /// Batched forward over a **left-padded** `[batch, seq]` step with **per-sequence** RoPE
+    /// positions and an explicit additive attention mask — the decode primitive the dynamic-batch
+    /// scheduler (story 7167) runs each step.
+    ///
+    /// `input_ids` is `[batch, seq]`; `cos`/`sin` are `[batch, seq, head_dim]` (per-row positions,
+    /// e.g. from [`Rope::cos_sin_at`] reshaped); `mask` is an additive `[batch, 1, seq, k_total]`
+    /// score mask (`0` keep, `-inf` block) covering left-padding + causality. Returns logits for the
+    /// **last column** `[batch, vocab]` — left-padding right-aligns every row's last real token to
+    /// that column, so one slice serves the whole batch.
+    pub fn decode_logits_masked(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        cos: &Array,
+        sin: &Array,
+        mask: &Array,
+    ) -> Result<Array> {
+        let embeds = self.embed(input_ids)?;
+        self.forward_to_last_logits(&embeds, cache, cos, sin, AttnMask::Additive(mask))
+    }
+
+    /// Run the decoder stack over `input_embeds` with the given RoPE tables and attention mask, and
+    /// project the **last column** to logits `[batch, vocab]`. The shared core of the single and
+    /// batched forwards: they differ only in how `cos`/`sin` and `mask` are built.
+    fn forward_to_last_logits(
+        &self,
+        input_embeds: &Array,
+        cache: &mut dyn KvCache,
+        cos: &Array,
+        sin: &Array,
+        mask: AttnMask<'_>,
+    ) -> Result<Array> {
         let sh = input_embeds.shape();
         let (b, s) = (sh[0], sh[1]);
-        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
 
         let mut h = input_embeds.clone();
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &cos, &sin, cache, i)?;
+            h = layer.forward(&h, cos, sin, mask, cache, i)?;
         }
 
         let last = s - 1;
@@ -200,11 +254,12 @@ impl LlamaLayer {
         x: &Array,
         cos: &Array,
         sin: &Array,
+        mask: AttnMask<'_>,
         cache: &mut dyn KvCache,
         layer_idx: usize,
     ) -> Result<Array> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
-        let h = add(x, &self.attn.forward(&normed, cos, sin, cache, layer_idx)?)?;
+        let h = add(x, &self.attn.forward(&normed, cos, sin, mask, cache, layer_idx)?)?;
         let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
         Ok(add(&h, &self.mlp.forward(&normed2)?)?)
     }
@@ -233,6 +288,7 @@ impl LlamaAttention {
         x: &Array,
         cos: &Array,
         sin: &Array,
+        mask: AttnMask<'_>,
         cache: &mut dyn KvCache,
         layer_idx: usize,
     ) -> Result<Array> {
@@ -265,7 +321,7 @@ impl LlamaAttention {
         let k_all = crate::primitives::repeat_kv(&k_all, self.groups)?;
         let v_all = crate::primitives::repeat_kv(&v_all, self.groups)?;
 
-        let out = sdpa_causal(&q, &k_all, &v_all, self.scale)?; // [b, heads, s, head_dim]
+        let out = sdpa(&q, &k_all, &v_all, self.scale, mask)?; // [b, heads, s, head_dim]
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, self.num_heads * self.head_dim])?;

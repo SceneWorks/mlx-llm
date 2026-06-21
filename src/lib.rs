@@ -12,7 +12,8 @@
 //! 3. [`decode`] — the streaming, cancellable decode loop ([`generate`](decode::generate)) that
 //!    drives any [`Decode`](decode::Decode) model, emitting a [`StreamEvent`](decode::StreamEvent)
 //!    per token. This internal streaming API is what the backend-neutral `core-llm` contract
-//!    (story 7154) is extracted from.
+//!    (story 7154) is extracted from. [`generate_batch`](decode::generate_batch) packs many requests
+//!    into one forward step (story 7167), driven by `core_llm`'s backend-neutral scheduler policy.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
 //!    and registers it (`mlx-llama`), so consumers stream a generation entirely through `core-llm`.
 //!
@@ -30,7 +31,10 @@ pub mod provider;
 pub use core_llm;
 
 pub use config::LlamaConfig;
-pub use decode::{generate, CancelFlag, FinishReason, GenerationConfig, GenerationOutput, StreamEvent};
+pub use decode::{
+    generate, generate_batch, BatchRequest, CancelFlag, FinishReason, GenerationConfig,
+    GenerationOutput, StreamEvent,
+};
 pub use error::{Error, Result};
 pub use models::LlamaModel;
 pub use provider::LlamaProvider;
