@@ -9,16 +9,18 @@
 //! `core_llm::JinjaChatTemplate`, story 7164), falling back to the typed [`Llama3Template`] when a
 //! snapshot ships no `tokenizer_config.json`.
 
+use std::cell::OnceCell;
 use std::path::Path;
 
 use core_llm::{
-    ChatTemplate, Error as CoreError, FinishReason as CoreFinish, JinjaChatTemplate, Llama3Template,
-    LoadSpec, Quantize, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
+    ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError, FinishReason as CoreFinish,
+    JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec, Quantize, Result as CoreResult,
+    Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
+    TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
 use crate::config::LlamaConfig;
-use crate::decode::{generate, FinishReason, GenerationConfig, StreamEvent};
+use crate::decode::{generate_with, ConstraintMask, FinishReason, GenerationConfig, StreamEvent};
 use crate::models::LlamaModel;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -34,6 +36,9 @@ pub struct LlamaProvider {
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
+    /// Cached per-vocab decode table for constrained decoding — built once (it decodes the whole
+    /// vocabulary) on the first JSON-constrained request, then reused.
+    constraint_table: OnceCell<ConstraintDecodeTable>,
 }
 
 impl LlamaProvider {
@@ -58,6 +63,7 @@ impl LlamaProvider {
             tokenizer,
             template: load_chat_template(dir),
             stop_tokens,
+            constraint_table: OnceCell::new(),
         })
     }
 
@@ -75,7 +81,20 @@ impl LlamaProvider {
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
+            constraint_table: OnceCell::new(),
         }
+    }
+}
+
+/// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
+struct JsonMask<'a>(JsonConstraint<'a>);
+
+impl ConstraintMask for JsonMask<'_> {
+    fn allowed(&mut self) -> &[bool] {
+        self.0.allowed()
+    }
+    fn accept(&mut self, token: i32) {
+        self.0.accept(token as u32);
     }
 }
 
@@ -127,6 +146,20 @@ impl TextLlm for LlamaProvider {
             stop_tokens: self.stop_tokens.clone(),
         };
 
+        // Structured-output constraint (story 7166): build a JSON mask over the cached decode table.
+        let mut json_mask = match req.constraint {
+            Some(Constraint::Json) => {
+                let table = self
+                    .constraint_table
+                    .get_or_init(|| self.tokenizer.constraint_decode_table());
+                Some(JsonMask(JsonConstraint::new(
+                    table,
+                    self.stop_tokens.iter().map(|&i| i as u32),
+                )))
+            }
+            None => None,
+        };
+
         // Drive the internal loop; translate token-id events to contract text-delta events via
         // incremental detokenization (re-decode the running sequence, emit the new suffix).
         let tokenizer = &self.tokenizer;
@@ -149,7 +182,11 @@ impl TextLlm for LlamaProvider {
                     }
                 }
             };
-            generate(&self.model, &prompt_ids, &config, &req.cancel, &mut sink).map_err(to_core)?
+            let constraint = json_mask
+                .as_mut()
+                .map(|m| m as &mut dyn ConstraintMask);
+            generate_with(&self.model, &prompt_ids, &config, &req.cancel, &mut sink, constraint)
+                .map_err(to_core)?
         };
 
         let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
@@ -184,8 +221,8 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             // Text-only today; the VLM path (sc-7157) flips this on for a vision provider.
             supports_vision: false,
-            // Constrained decoding wiring lands in sc-7166.
-            supported_constraints: Vec::new(),
+            // JSON-constrained decoding (sc-7166).
+            supported_constraints: vec![Constraint::Json],
         },
     }
 }

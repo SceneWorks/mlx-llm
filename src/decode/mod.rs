@@ -8,4 +8,7 @@ pub mod cancel;
 pub mod stream;
 
 pub use cancel::CancelFlag;
-pub use stream::{generate, Decode, FinishReason, GenerationConfig, GenerationOutput, StreamEvent};
+pub use stream::{
+    generate, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
+    GenerationOutput, StreamEvent,
+};
