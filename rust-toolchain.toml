@@ -1,0 +1,7 @@
+# Pin the toolchain so a `stable` bump can't redden an untouched build — a clean build compiles MLX
+# from source, which is expensive. Matches mlx-gen so both crates compile with the same toolchain
+# (load-bearing once mlx-gen consumes mlx-llm and shares one mlx-rs build).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

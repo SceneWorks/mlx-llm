@@ -2,9 +2,27 @@
 name = "mlx-llm"
 version = "0.0.0"
 edition = "2021"
-description = "Reserved — on-device text + vision LLM serving engine for Apple MLX (placeholder; work in progress)."
+description = "On-device text + vision LLM serving engine for Apple MLX (work in progress)."
 license = "Apache-2.0"
 repository = "https://github.com/SceneWorks/mlx-llm"
 readme = "README.md"
+keywords = ["mlx", "apple-silicon", "llm", "inference", "serving"]
+categories = ["science"]
 
 [dependencies]
+# mlx-rs is pinned to the pmetal fork by commit SHA — the SAME pin mlx-gen uses, so the two
+# build ONE mlx-rs and share a single `Array` type (the inversion: mlx-gen will consume mlx-llm).
+# `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX core 0.31.2 (faster Metal kernels +
+# the command-buffer-recoverable patch). Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
+# Crates.io publish (a later epic-7153 story) will swap this for a registry/patch arrangement;
+# during development it is the fork so the engine actually runs correctly on-device.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "44929a001ab8a8837403a71c65cf064224de0cdc" }
+# Error plumbing for the engine surface.
+thiserror = "2"
+# config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.
+serde_json = "1"
+# half-precision scalar helpers for host-side dtype handling.
+half = "2"
+
+[dev-dependencies]
+# Deterministic small-tensor parity fixtures use only mlx-rs; no extra dev deps yet.
