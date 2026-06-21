@@ -17,12 +17,17 @@
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
 //!    and registers it (`mlx-llama`), so consumers stream a generation entirely through `core-llm`.
 //!
+//! [`gguf`] is a side door into step 2: it converts a llama.cpp `*.gguf` (incl. k-quants) into the
+//! `{config.json, model.safetensors}` snapshot the loader consumes (story 7165), optionally
+//! re-quantizing to MLX Q4/Q8.
+//!
 //! MLX's default Metal device is single-threaded; engine instances hold MLX `Array`s and are
 //! therefore neither `Send` nor `Sync`. Drive one engine from one thread (or behind a mutex).
 
 pub mod config;
 pub mod decode;
 pub mod error;
+pub mod gguf;
 pub mod models;
 pub mod primitives;
 pub mod provider;

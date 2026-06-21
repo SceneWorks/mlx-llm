@@ -31,6 +31,7 @@ fn tiny_config() -> LlamaConfig {
         tie_word_embeddings: false,
         architecture: mlx_llm::config::Architecture::Llama,
         max_position_embeddings: 0,
+        quantization: None,
     }
 }
 

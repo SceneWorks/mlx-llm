@@ -54,6 +54,25 @@ impl Projection {
         }
     }
 
+    /// Load from **already-quantized** parts stored in a snapshot (the packed `weight`, per-group
+    /// `scales`/`biases`) — the read side of the GGUF converter's optional MLX requant. No
+    /// quantization happens here; the parts are used as-is.
+    pub fn from_quantized(
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        spec: QuantSpec,
+    ) -> Self {
+        Projection::Quantized(QuantizedLinear {
+            weight,
+            scales,
+            biases,
+            group_size: spec.group_size,
+            bits: spec.bits,
+            bias: None,
+        })
+    }
+
     /// `x @ weightᵀ`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         match self {

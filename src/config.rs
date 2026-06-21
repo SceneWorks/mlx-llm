@@ -9,7 +9,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::primitives::Rope;
+use crate::primitives::{QuantSpec, Rope};
 
 /// The decoder architecture, dispatched from `config.json` (`architectures` / `model_type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +107,10 @@ pub struct LlamaConfig {
     pub architecture: Architecture,
     /// Max context length (`max_position_embeddings`); `0` if unspecified.
     pub max_position_embeddings: i32,
+    /// Present when the snapshot stores **pre-quantized** projections (a `quantization` block in
+    /// `config.json`, e.g. from the GGUF converter): the group size / bit width the stored
+    /// `weight`/`scales`/`biases` tensors were packed with. `None` ⇒ a dense snapshot.
+    pub quantization: Option<QuantSpec>,
 }
 
 impl LlamaConfig {
@@ -140,6 +144,13 @@ impl LlamaConfig {
             .unwrap_or(false);
         let architecture = Architecture::from_config(v)?;
         let max_position_embeddings = int("max_position_embeddings").unwrap_or(0);
+
+        // A `quantization` block marks a pre-quantized snapshot (the GGUF converter writes it).
+        let quantization = v.get("quantization").and_then(|q| {
+            let group_size = q.get("group_size").and_then(|x| x.as_i64())? as i32;
+            let bits = q.get("bits").and_then(|x| x.as_i64())? as i32;
+            Some(QuantSpec { group_size, bits })
+        });
 
         let rope_scaling = v.get("rope_scaling").and_then(|rs| {
             // Only the "llama3" schedule is parsed; absent / other types fall back to standard RoPE.
@@ -175,6 +186,7 @@ impl LlamaConfig {
             tie_word_embeddings,
             architecture,
             max_position_embeddings,
+            quantization,
         })
     }
 
@@ -290,6 +302,24 @@ mod tests {
         // A named-but-unsupported arch is rejected.
         let unknown = json!({ "architectures": ["MambaForCausalLM"], "model_type": "mamba" });
         assert!(matches!(Architecture::from_config(&unknown), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn parses_quantization_block() {
+        let v = json!({
+            "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "vocab_size": 32,
+            "quantization": { "group_size": 64, "bits": 4 }
+        });
+        let cfg = LlamaConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.quantization, Some(QuantSpec { group_size: 64, bits: 4 }));
+
+        // Absent block ⇒ dense snapshot.
+        let dense = json!({
+            "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "vocab_size": 32
+        });
+        assert_eq!(LlamaConfig::from_json(&dense).unwrap().quantization, None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use mlx_rs::ops::add;
 use mlx_rs::{Array, Dtype};
 
 use crate::config::LlamaConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, linear, rms_norm};
@@ -53,8 +53,30 @@ impl LlamaModel {
     ) -> Result<Self> {
         let p = |suffix: &str| join(prefix, suffix);
         let req_bf16 = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+        // A snapshot that stores pre-quantized projections (the GGUF converter's MLX-requant output)
+        // is loaded from its packed `weight`/`scales`/`biases` as-is; the group size / bits come from
+        // the config's `quantization` block. Otherwise the dense weight is loaded (and quantized on
+        // the fly if a load-time `quant` was requested).
+        let stored_quant = cfg.quantization;
         let proj = |key: String| -> Result<Projection> {
-            Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
+            let base = key.strip_suffix(".weight").unwrap_or(&key);
+            let scales_key = format!("{base}.scales");
+            if w.contains(&scales_key) {
+                let spec = stored_quant.ok_or_else(|| {
+                    Error::Config(format!(
+                        "snapshot stores quantized tensor `{scales_key}` but config.json has no \
+                         `quantization` block"
+                    ))
+                })?;
+                Ok(Projection::from_quantized(
+                    w.require(&key)?.clone(),
+                    w.require(&scales_key)?.clone(),
+                    w.require(&format!("{base}.biases"))?.clone(),
+                    spec,
+                ))
+            } else {
+                Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
+            }
         };
 
         let embed_tokens = req_bf16(p("model.embed_tokens.weight"))?;
@@ -104,6 +126,7 @@ impl LlamaModel {
         }
 
         let rope = cfg.build_rope();
+        let quantized = quant.is_some() || cfg.quantization.is_some();
         Ok(Self {
             embed_tokens,
             layers,
@@ -111,7 +134,7 @@ impl LlamaModel {
             lm_head,
             rope,
             cfg,
-            quantized: quant.is_some(),
+            quantized,
         })
     }
 
