@@ -42,6 +42,13 @@ pub trait KvCache {
     /// Number of decoder layers this cache holds slots for.
     fn num_layers(&self) -> usize;
 
+    /// Compact the batch to keep only the rows in `keep` (indices into the current batch axis),
+    /// in the given order — the seam the dynamic-batch scheduler (story 7167) retires a finished
+    /// sequence through, so the next step runs a smaller batch. A contiguous cache gathers the kept
+    /// rows along the batch axis; the paged cache (7169) frees the dropped sequences' pages. `keep`
+    /// must be a subset of `0..batch_size`; an empty cache is a no-op.
+    fn retain_sequences(&mut self, keep: &[i32]) -> Result<()>;
+
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
     fn reset(&mut self);
 }
@@ -99,6 +106,16 @@ impl KvCache for ContiguousKvCache {
 
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+        let idx = Array::from_slice(keep, &[keep.len() as i32]);
+        for slot in &mut self.layers {
+            if let Some((k, v)) = slot.take() {
+                *slot = Some((k.take_axis(&idx, 0)?, v.take_axis(&idx, 0)?));
+            }
+        }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -171,6 +188,37 @@ mod tests {
         let (ka, _) = cache.update(0, &b, &b).unwrap();
         let host = ka.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
         assert_eq!(host, vec![0.0, 1.0, 2.0, 3.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn retain_sequences_compacts_batch_rows() {
+        // Batch of 3 rows; drop the middle one, keep [0, 2] in order.
+        let mut cache = ContiguousKvCache::new(1);
+        // Distinct per-row values so we can verify the right rows survive: row r filled with r.
+        let row = |r: f32| vec![r; 2]; // [1, hkv=2, s=1, hd=1] flattened (hd=1) => 2 values/row
+        let mut data = Vec::new();
+        for r in 0..3 {
+            data.extend(row(r as f32));
+        }
+        let k = Array::from_slice(&data, &[3, 2, 1, 1]);
+        cache.update(0, &k, &k).unwrap();
+        assert_eq!(cache.batch_size(), 3);
+
+        cache.retain_sequences(&[0, 2]).unwrap();
+        assert_eq!(cache.batch_size(), 2);
+        assert_eq!(cache.offset(), 1);
+        let (ka, _) = cache.peek(0).unwrap();
+        let host = ka.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        // Kept rows 0 and 2 (each 2 heads * 1 * 1 = 2 values): all 0.0 then all 2.0.
+        assert_eq!(host, vec![0.0, 0.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn retain_sequences_on_empty_cache_is_noop() {
+        let mut cache = ContiguousKvCache::new(2);
+        cache.retain_sequences(&[0]).unwrap();
+        assert_eq!(cache.batch_size(), 0);
+        assert!(cache.peek(0).is_none());
     }
 
     #[test]

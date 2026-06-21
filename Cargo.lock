@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#62c875827feca147e8d85fe6746ca16b688c1403"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#cc3a0263c7504053ca0ed9b0226c893f16a5fc4c"
 dependencies = [
  "inventory",
  "minijinja",
@@ -148,7 +148,7 @@ dependencies = [
 [[package]]
 name = "core-llm-testkit"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#62c875827feca147e8d85fe6746ca16b688c1403"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#cc3a0263c7504053ca0ed9b0226c893f16a5fc4c"
 dependencies = [
  "core-llm",
 ]
