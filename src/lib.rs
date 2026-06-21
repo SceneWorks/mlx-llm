@@ -45,8 +45,8 @@ pub use core_llm;
 
 pub use config::LlamaConfig;
 pub use decode::{
-    generate, generate_batch, generate_cached, BatchRequest, CancelFlag, FinishReason,
-    GenerationConfig, GenerationOutput, PrefixCache, PrefixStats, StreamEvent,
+    generate, generate_batch, generate_cached, generate_with_cache, BatchRequest, CancelFlag,
+    FinishReason, GenerationConfig, GenerationOutput, PrefixCache, PrefixStats, StreamEvent,
 };
 pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};

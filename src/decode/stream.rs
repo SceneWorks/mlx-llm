@@ -154,6 +154,53 @@ pub fn generate_with(
     )
 }
 
+/// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
+/// (e.g. a [`PagedKvCache`](crate::primitives::PagedKvCache) seeded with shared blocks). Prefills
+/// only `prompt_ids[cache.offset()..]` at that offset, then decodes. The cache is borrowed (not
+/// consumed) so the caller can inspect or seed siblings from it afterward.
+///
+/// `cache.offset()` must be `< prompt_ids.len()` (there must be at least one token to prefill).
+/// Returns [`Error::Canceled`] on an already-set cancel.
+pub fn generate_with_cache(
+    decoder: &dyn Decode,
+    prompt_ids: &[i32],
+    cache: &mut dyn KvCache,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Result<GenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled); // typed pre-inference cancel
+    }
+    if prompt_ids.is_empty() {
+        return Err(Error::Msg("generate_with_cache: empty prompt".into()));
+    }
+    let offset = cache.offset() as usize;
+    if offset >= prompt_ids.len() {
+        return Err(Error::Msg(format!(
+            "generate_with_cache: cache offset {offset} leaves no prompt suffix to prefill \
+             (prompt len {})",
+            prompt_ids.len()
+        )));
+    }
+
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let suffix = input_ids(&prompt_ids[offset..]);
+    let logits = decoder.step(&suffix, cache, offset as i32)?;
+
+    decode_loop(
+        decoder,
+        cache,
+        logits,
+        rng,
+        prompt_ids.to_vec(),
+        config,
+        cancel,
+        on_event,
+        None,
+    )
+}
+
 /// The token-by-token decode loop shared by [`generate_with`] and the prefix-cached path
 /// ([`crate::decode::generate_cached`]): given the prefill `logits`, an RNG, the seeded `history`
 /// (the prompt — the repetition-penalty window), and a `cache` already positioned past the prompt,

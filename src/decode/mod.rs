@@ -13,6 +13,6 @@ pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use prefix::{generate_cached, PrefixCache, PrefixStats};
 pub use stream::{
-    generate, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    GenerationOutput, StreamEvent,
+    generate, generate_with, generate_with_cache, ConstraintMask, Decode, FinishReason,
+    GenerationConfig, GenerationOutput, StreamEvent,
 };
