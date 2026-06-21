@@ -34,3 +34,6 @@ half = "2"
 [dev-dependencies]
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
 # tokenizers dep needed.)
+# The contract conformance suite (story 7201): run the registered LlamaProvider through the
+# backend-neutral checks. Same git source as the core-llm dep so cargo unifies on one core-llm.
+core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }

@@ -135,12 +135,20 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#418d0849abc67f91395cec318ed2e9881922df36"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#7e2e50ce8d0f734ee1d671e7d3d54b1adb329bee"
 dependencies = [
  "inventory",
  "serde_json",
  "thiserror",
  "tokenizers",
+]
+
+[[package]]
+name = "core-llm-testkit"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#7e2e50ce8d0f734ee1d671e7d3d54b1adb329bee"
+dependencies = [
+ "core-llm",
 ]
 
 [[package]]
@@ -501,6 +509,7 @@ name = "mlx-llm"
 version = "0.0.0"
 dependencies = [
  "core-llm",
+ "core-llm-testkit",
  "half",
  "inventory",
  "pmetal-mlx-rs",
