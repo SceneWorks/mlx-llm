@@ -133,6 +133,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-llm"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#418d0849abc67f91395cec318ed2e9881922df36"
+dependencies = [
+ "inventory",
+ "serde_json",
+ "thiserror",
+ "tokenizers",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -373,6 +384,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,11 +500,12 @@ dependencies = [
 name = "mlx-llm"
 version = "0.0.0"
 dependencies = [
+ "core-llm",
  "half",
+ "inventory",
  "pmetal-mlx-rs",
  "serde_json",
  "thiserror",
- "tokenizers",
 ]
 
 [[package]]

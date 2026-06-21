@@ -10,13 +10,16 @@
 //! Asserts the engine loads the snapshot and streams non-empty text, that greedy decoding is
 //! reproducible, and that a mid-stream cancel stops promptly with a partial result.
 
-use tokenizers::Tokenizer;
+use core_llm::{
+    load_textllm, LoadSpec, Message, Sampling, StreamEvent as CoreEvent, TextLlmRequest, Tokenizer,
+};
 
 use mlx_llm::config::LlamaConfig;
 use mlx_llm::decode::{generate, CancelFlag, FinishReason, GenerationConfig, StreamEvent};
 use mlx_llm::models::LlamaModel;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
+use mlx_llm::provider::PROVIDER_ID;
 
 fn model_dir() -> Option<String> {
     std::env::var("MLX_LLM_TEST_MODEL").ok()
@@ -34,9 +37,8 @@ fn streams_text_from_snapshot() {
     let prompt_ids: Vec<i32> = tok
         .encode("The capital of France is", true)
         .unwrap()
-        .get_ids()
-        .iter()
-        .map(|&id| id as i32)
+        .into_iter()
+        .map(|id| id as i32)
         .collect();
 
     let config = GenerationConfig {
@@ -74,9 +76,8 @@ fn mid_stream_cancel_on_real_model() {
     let prompt_ids: Vec<i32> = tok
         .encode("Write a long story about a robot:", true)
         .unwrap()
-        .get_ids()
-        .iter()
-        .map(|&id| id as i32)
+        .into_iter()
+        .map(|id| id as i32)
         .collect();
 
     let cancel = CancelFlag::new();
@@ -104,4 +105,39 @@ fn mid_stream_cancel_on_real_model() {
 
     assert_eq!(out.finish_reason, FinishReason::Cancelled);
     assert!(out.tokens.len() <= 6, "cancel should stop promptly");
+}
+
+#[test]
+#[ignore = "needs a real Llama snapshot via MLX_LLM_TEST_MODEL"]
+fn round_trips_a_generation_through_the_core_llm_contract() {
+    // The full contract path: load via the registry by id, then stream through `core_llm::TextLlm`.
+    let dir = model_dir().expect("set MLX_LLM_TEST_MODEL");
+    let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(&dir)).unwrap();
+    assert_eq!(provider.descriptor().id, PROVIDER_ID);
+
+    let req = TextLlmRequest {
+        messages: vec![Message::user("Name three primary colors.")],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 24,
+        seed: Some(0),
+        ..Default::default()
+    };
+
+    let mut streamed = String::new();
+    let mut token_events = 0usize;
+    let out = provider
+        .generate(&req, &mut |ev| {
+            if let CoreEvent::Token { text, .. } = ev {
+                token_events += 1;
+                streamed.push_str(&text);
+            }
+        })
+        .unwrap();
+
+    println!("\n=== contract output ===\n{}\n=======================", out.text);
+    assert!(token_events > 0, "expected streamed tokens");
+    assert!(!out.text.trim().is_empty(), "expected non-empty output");
+    assert!(out.usage.generated_tokens > 0);
+    assert!(out.usage.prompt_tokens > 0);
+    assert_eq!(streamed, out.text, "streamed deltas must reconstruct the output");
 }
