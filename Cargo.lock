@@ -135,9 +135,11 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#7e2e50ce8d0f734ee1d671e7d3d54b1adb329bee"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#9d97f1ea64bf265f18fe86c6ccdabddee9343541"
 dependencies = [
  "inventory",
+ "minijinja",
+ "minijinja-contrib",
  "serde_json",
  "thiserror",
  "tokenizers",
@@ -146,7 +148,7 @@ dependencies = [
 [[package]]
 name = "core-llm-testkit"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#7e2e50ce8d0f734ee1d671e7d3d54b1adb329bee"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#9d97f1ea64bf265f18fe86c6ccdabddee9343541"
 dependencies = [
  "core-llm",
 ]
@@ -485,6 +487,32 @@ name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+
+[[package]]
+name = "memo-map"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
+
+[[package]]
+name = "minijinja"
+version = "2.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
+dependencies = [
+ "memo-map",
+ "serde",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85342f6fac0be8ccd5bd00d9066be538f34f393f577b75d81b17c8398a6b43bb"
+dependencies = [
+ "minijinja",
+ "serde",
+]
 
 [[package]]
 name = "minimal-lexical"
