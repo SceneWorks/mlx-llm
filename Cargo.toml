@@ -25,4 +25,9 @@ serde_json = "1"
 half = "2"
 
 [dev-dependencies]
-# Deterministic small-tensor parity fixtures use only mlx-rs; no extra dev deps yet.
+# The end-to-end streaming example + real-weights test tokenize/detokenize via the HF tokenizers
+# crate (same Rust core `transformers` wraps). The host-side tokenizer proper lands in core-llm
+# (story 7154); mlx-llm's decode loop itself is token-id based, so this stays a dev-only dep.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# config.json parsing in the example.
+serde_json = "1"
