@@ -113,7 +113,6 @@ impl LlamaModel {
                     num_kv_heads: cfg.num_kv_heads,
                     head_dim: cfg.head_dim,
                     scale: cfg.attn_scale(),
-                    groups: cfg.groups(),
                     eps: cfg.rms_norm_eps,
                 },
                 mlp: LlamaMlp {
@@ -331,7 +330,6 @@ struct LlamaAttention {
     num_kv_heads: i32,
     head_dim: i32,
     scale: f32,
-    groups: i32,
     eps: f32,
 }
 
@@ -370,9 +368,12 @@ impl LlamaAttention {
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
+        // MLX's fused SDPA does grouped-query attention natively — it derives
+        // `gqa_factor = q_heads / kv_heads` and reads K/V by head stride — so we hand it the
+        // GQA-shaped cache K/V directly instead of materializing a full-head-count copy with
+        // `repeat_kv` every step (which allocated+wrote a `groups`× larger K/V tensor MLX would
+        // never need). MHA (kv_heads == heads) is unchanged. [sc-7307]
         let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
-        let k_all = crate::primitives::repeat_kv(&k_all, self.groups)?;
-        let v_all = crate::primitives::repeat_kv(&v_all, self.groups)?;
 
         let out = sdpa(&q, &k_all, &v_all, self.scale, mask)?; // [b, heads, s, head_dim]
         let out = out
