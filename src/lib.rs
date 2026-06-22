@@ -17,7 +17,9 @@
 //!    [`generate_cached`](decode::generate_cached) reuses a shared prompt prefix's KV across requests
 //!    (story 7168), driven by `core_llm`'s backend-neutral prefix-index policy;
 //!    [`generate_prompt_lookup`](decode::generate_prompt_lookup) is n-gram speculative decoding
-//!    (story 7171), driven by `core_llm`'s backend-neutral proposer + acceptance sampler.
+//!    (story 7171) and [`generate_draft_speculative`](decode::generate_draft_speculative) is
+//!    draft-model speculative decoding (story 7172), both driven by `core_llm`'s backend-neutral
+//!    proposer + distribution-preserving acceptance sampler.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
 //!    and registers it (`mlx-llama`), so consumers stream a generation entirely through `core-llm`.
 //!
@@ -47,9 +49,9 @@ pub use core_llm;
 
 pub use config::LlamaConfig;
 pub use decode::{
-    generate, generate_batch, generate_cached, generate_prompt_lookup, generate_with_cache,
-    BatchRequest, CancelFlag, FinishReason, GenerationConfig, GenerationOutput, PrefixCache,
-    PrefixStats, SpeculativeConfig, SpeculativeStats, StreamEvent,
+    generate, generate_batch, generate_cached, generate_draft_speculative, generate_prompt_lookup,
+    generate_with_cache, BatchRequest, CancelFlag, FinishReason, GenerationConfig, GenerationOutput,
+    PrefixCache, PrefixStats, SpeculativeConfig, SpeculativeStats, StreamEvent,
 };
 pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
