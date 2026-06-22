@@ -149,6 +149,15 @@ pub struct PagedKvCache {
     tail_v: Vec<Option<Array>>,
     /// Tokens in the tail (same across layers); authoritative after a full step (all layers updated).
     tail_len: usize,
+    /// Per-layer cached concat of **all frozen blocks** (`concat(block_ids' k/v[layer])`), maintained
+    /// incrementally so the per-step [`PagedKvCache::gather`] is a 2-array concat (`frozen + tail`)
+    /// instead of an O(blocks) concat. The per-step gather was ~85% of the decode step before this
+    /// (sc-7325). `Some` ⟺ current for `block_ids`; `None` means "rebuild on next use" (empty, freshly
+    /// seeded, or invalidated by truncate/reset). It duplicates the frozen KV (a contiguous copy
+    /// alongside the block tensors) — the throughput-for-memory tradeoff the gather-free paged kernel
+    /// (sc-7301) would avoid.
+    frozen_k: Vec<Option<Array>>,
+    frozen_v: Vec<Option<Array>>,
 }
 
 impl PagedKvCache {
@@ -168,6 +177,8 @@ impl PagedKvCache {
             tail_k: vec![None; num_layers],
             tail_v: vec![None; num_layers],
             tail_len: 0,
+            frozen_k: vec![None; num_layers],
+            frozen_v: vec![None; num_layers],
         }
     }
 
@@ -246,6 +257,11 @@ impl PagedKvCache {
                 let tv = self.tail_v[l].take().expect("tail present at freeze");
                 let (hk, rk) = split_seq(&tk, bs)?;
                 let (hv, rv) = split_seq(&tv, bs)?;
+                // Maintain the frozen-blocks concat: ensure it reflects the prior blocks, then append
+                // this newly frozen block (a 2-array concat) so gather never re-concats every block.
+                self.ensure_frozen(l)?;
+                self.frozen_k[l] = Some(append_seq(self.frozen_k[l].take(), &hk)?);
+                self.frozen_v[l] = Some(append_seq(self.frozen_v[l].take(), &hv)?);
                 bk.push(hk);
                 bv.push(hv);
                 self.tail_k[l] = keep_nonempty(rk);
@@ -259,26 +275,43 @@ impl PagedKvCache {
     }
 
     /// Gather `layer`'s full keys/values — `concat(frozen blocks, tail)` — into one contiguous
-    /// `[1, n_kv_heads, len, head_dim]` pair to attend over.
-    fn gather(&self, layer: usize) -> Result<(Array, Array)> {
-        let pool = self.pool.borrow();
-        let mut ks: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).k[layer]).collect();
-        let mut vs: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).v[layer]).collect();
-        if let Some(t) = &self.tail_k[layer] {
-            ks.push(t);
-        }
-        if let Some(t) = &self.tail_v[layer] {
-            vs.push(t);
-        }
-        let k = match ks.as_slice() {
-            [single] => (*single).clone(),
-            many => concatenate_axis(many, SEQ_AXIS)?,
-        };
-        let v = match vs.as_slice() {
-            [single] => (*single).clone(),
-            many => concatenate_axis(many, SEQ_AXIS)?,
-        };
+    /// `[1, n_kv_heads, len, head_dim]` pair to attend over. The frozen-blocks half is the cached
+    /// [`frozen_k`]/[`frozen_v`] concat (built/maintained incrementally), so this is a **2-array**
+    /// concat per step, not an O(blocks) one (sc-7325).
+    ///
+    /// [`frozen_k`]: PagedKvCache::frozen_k
+    /// [`frozen_v`]: PagedKvCache::frozen_v
+    fn gather(&mut self, layer: usize) -> Result<(Array, Array)> {
+        self.ensure_frozen(layer)?;
+        let k = combine_seq(self.frozen_k[layer].as_ref(), self.tail_k[layer].as_ref())?;
+        let v = combine_seq(self.frozen_v[layer].as_ref(), self.tail_v[layer].as_ref())?;
         Ok((k, v))
+    }
+
+    /// Materialize `layer`'s frozen-blocks concat from the block table when it is missing (a freshly
+    /// [`new_seeded`](PagedKvCache::new_seeded) prefix, or after a `truncate`/`reset` invalidation).
+    /// A no-op once cached or when there are no frozen blocks. This is the only O(blocks) concat, and
+    /// it runs at most once per invalidation — the steady state appends one block at a time.
+    fn ensure_frozen(&mut self, layer: usize) -> Result<()> {
+        if self.frozen_k[layer].is_some() || self.block_ids.is_empty() {
+            return Ok(());
+        }
+        let pool = self.pool.borrow();
+        let ks: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).k[layer]).collect();
+        let vs: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).v[layer]).collect();
+        self.frozen_k[layer] = Some(concat_or_clone(&ks)?);
+        self.frozen_v[layer] = Some(concat_or_clone(&vs)?);
+        Ok(())
+    }
+
+    /// Invalidate every layer's cached frozen-blocks concat (after the block table changes in a way
+    /// that is not a simple append — `truncate`/`reset`). The next [`gather`](PagedKvCache::gather)
+    /// rebuilds it from the current blocks.
+    fn invalidate_frozen(&mut self) {
+        for l in 0..self.num_layers {
+            self.frozen_k[l] = None;
+            self.frozen_v[l] = None;
+        }
     }
 }
 
@@ -386,6 +419,8 @@ impl KvCache for PagedKvCache {
             }
         }
         self.block_ids.truncate(keep_full);
+        // The block table changed by more than an append; rebuild the frozen concat on next gather.
+        self.invalidate_frozen();
         Ok(())
     }
 
@@ -400,6 +435,7 @@ impl KvCache for PagedKvCache {
         self.tail_k = vec![None; self.num_layers];
         self.tail_v = vec![None; self.num_layers];
         self.tail_len = 0;
+        self.invalidate_frozen();
     }
 }
 
@@ -435,6 +471,34 @@ fn keep_nonempty(a: Array) -> Option<Array> {
         None
     } else {
         Some(a)
+    }
+}
+
+/// Concatenate one-or-more arrays along the sequence axis, cloning (no copy — MLX is refcounted) when
+/// there is a single one.
+fn concat_or_clone(parts: &[&Array]) -> Result<Array> {
+    Ok(match parts {
+        [single] => (*single).clone(),
+        many => concatenate_axis(many, SEQ_AXIS)?,
+    })
+}
+
+/// Append `new` to `base` along the sequence axis (`base` absent ⇒ just `new`).
+fn append_seq(base: Option<Array>, new: &Array) -> Result<Array> {
+    Ok(match base {
+        Some(f) => concatenate_axis(&[&f, new], SEQ_AXIS)?,
+        None => new.clone(),
+    })
+}
+
+/// Join the frozen-blocks concat and the partial tail into the full sequence (`[1, n_kv_heads, len,
+/// head_dim]`). At least one side is present whenever a sequence holds any tokens.
+fn combine_seq(frozen: Option<&Array>, tail: Option<&Array>) -> Result<Array> {
+    match (frozen, tail) {
+        (Some(f), Some(t)) => Ok(concatenate_axis(&[f, t], SEQ_AXIS)?),
+        (Some(f), None) => Ok(f.clone()),
+        (None, Some(t)) => Ok(t.clone()),
+        (None, None) => Err(Error::Msg("gather on an empty paged cache".into())),
     }
 }
 
@@ -501,6 +565,37 @@ mod tests {
             off += (step * 6) as f32;
         }
         assert_eq!(paged.offset(), contig.offset());
+    }
+
+    #[test]
+    fn seeded_prefix_then_freeze_matches_contiguous() {
+        use crate::primitives::ContiguousKvCache;
+        // Sequence A: 4 tokens => 2 frozen blocks (block_size 2), 2 layers, distinct per-layer values.
+        let pool = BlockPool::new(2);
+        let mut a = PagedKvCache::with_pool(pool.clone(), 2);
+        for layer in 0..2 {
+            let k = seq(1, 4, 1, layer as f32 * 100.0);
+            a.update(layer, &k, &k).unwrap();
+        }
+        let shared = a.shareable_prefix_blocks(4);
+        assert_eq!(shared.len(), 2);
+
+        // Seed B from A's two prefix blocks, then decode a 3-token suffix per layer — crossing a block
+        // boundary so a new block freezes while the seeded blocks' frozen concat is still unbuilt
+        // (the ensure_frozen-inside-freeze path). Must equal a contiguous cache holding prefix+suffix.
+        let mut b = PagedKvCache::new_seeded(pool.clone(), 2, &shared);
+        let mut contig = ContiguousKvCache::new(2);
+        for layer in 0..2 {
+            let prefix = seq(1, 4, 1, layer as f32 * 100.0); // identical to A's stored values
+            let suffix = seq(1, 3, 1, layer as f32 * 100.0 + 4.0);
+            contig.update(layer, &prefix, &prefix).unwrap();
+            let (ck, cv) = contig.update(layer, &suffix, &suffix).unwrap();
+            let (bk, bv) = b.update(layer, &suffix, &suffix).unwrap();
+            assert_eq!(host(&bk), host(&ck), "layer {layer}: seeded prefix + frozen suffix keys");
+            assert_eq!(host(&bv), host(&cv), "layer {layer}: seeded prefix + frozen suffix values");
+        }
+        assert_eq!(b.offset(), 7, "4 seeded + 3 suffix");
+        assert_eq!(b.block_ids.len(), 3, "2 seeded + 1 newly frozen block");
     }
 
     #[test]
