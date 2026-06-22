@@ -15,8 +15,8 @@ use std::path::Path;
 use core_llm::{
     ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError, FinishReason as CoreFinish,
     JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec, Quantize, Result as CoreResult,
-    Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
+    Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
 use crate::config::LlamaConfig;
@@ -160,8 +160,23 @@ impl TextLlm for LlamaProvider {
             None => None,
         };
 
+        // Request `stop` strings (story 7349): a backend-neutral matcher over the decoded text.
+        // Matching is in the detokenization seam below (not the token-id loop) because a stop string
+        // need not align to a token boundary. When no stops are requested the matcher is a
+        // transparent pass-through, so streaming output stays byte-identical to before.
+        let mut stop_matcher = StopMatcher::new(req.stop.iter().cloned());
+        let stop_active = !stop_matcher.is_empty();
+        // A single-threaded latch the detok sink trips on a stop hit; the decode loop reads it after
+        // each token via `should_stop` and halts with `FinishReason::Stopped`.
+        let halt = std::cell::Cell::new(false);
+        // The emitted text, accumulated as the matcher releases it — the truncated result when stop
+        // strings are active (the no-stop path keeps decoding all tokens, exactly as before).
+        let mut streamed = String::new();
+        let mut last_emit: Option<(u32, usize)> = None; // (id, index) of the last emitted token
+
         // Drive the internal loop; translate token-id events to contract text-delta events via
-        // incremental detokenization (re-decode the running sequence, emit the new suffix).
+        // incremental detokenization (re-decode the running sequence, emit the new suffix), feeding
+        // each delta through the stop matcher so a stop string is trimmed and halts generation.
         let tokenizer = &self.tokenizer;
         let out = {
             let mut acc: Vec<u32> = Vec::new();
@@ -173,11 +188,19 @@ impl TextLlm for LlamaProvider {
                         if text.len() > shown {
                             let delta = text[shown..].to_string();
                             shown = text.len();
-                            on_event(CoreEvent::Token {
-                                id: id as u32,
-                                text: delta,
-                                index: step,
-                            });
+                            let chunk = stop_matcher.push(&delta);
+                            if !chunk.emit.is_empty() {
+                                streamed.push_str(&chunk.emit);
+                                last_emit = Some((id as u32, step));
+                                on_event(CoreEvent::Token {
+                                    id: id as u32,
+                                    text: chunk.emit,
+                                    index: step,
+                                });
+                            }
+                            if chunk.stop {
+                                halt.set(true);
+                            }
                         }
                     }
                 }
@@ -185,12 +208,39 @@ impl TextLlm for LlamaProvider {
             let constraint = json_mask
                 .as_mut()
                 .map(|m| m as &mut dyn ConstraintMask);
-            generate_with(&self.model, &prompt_ids, &config, &req.cancel, &mut sink, constraint)
-                .map_err(to_core)?
+            let should_stop = || halt.get();
+            generate_with(
+                &self.model,
+                &prompt_ids,
+                &config,
+                &req.cancel,
+                &mut sink,
+                constraint,
+                stop_active.then_some(&should_stop as &dyn Fn() -> bool),
+            )
+            .map_err(to_core)?
         };
 
-        let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
-        let text = tokenizer.decode(&gen_u32, true)?;
+        // If generation ended for any reason other than a stop string, flush the matcher's
+        // held-back tail (a partial stop-prefix that never completed) — it is real output that must
+        // still be streamed and returned.
+        if stop_active && !halt.get() {
+            let tail = stop_matcher.flush();
+            if !tail.is_empty() {
+                let (id, index) = last_emit.unwrap_or((0, out.tokens.len().saturating_sub(1)));
+                streamed.push_str(&tail);
+                on_event(CoreEvent::Token { id, text: tail, index });
+            }
+        }
+
+        // With stop strings active the result is the trimmed streamed text; otherwise keep the
+        // existing decode-the-tokens path (byte-identical to before this change).
+        let text = if stop_active {
+            streamed
+        } else {
+            let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
+            tokenizer.decode(&gen_u32, true)?
+        };
         let finish = map_finish(out.finish_reason);
         let usage = Usage {
             prompt_tokens: prompt_len as u32,
@@ -271,7 +321,9 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
 
 fn map_finish(f: FinishReason) -> CoreFinish {
     match f {
-        FinishReason::StopToken => CoreFinish::Stop,
+        // An EOS *id* and a host stop condition (a request `stop` string) are both `Stop` per the
+        // contract / OpenAI semantics.
+        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
         FinishReason::MaxTokens => CoreFinish::Length,
         FinishReason::Cancelled => CoreFinish::Cancelled,
     }
