@@ -9,7 +9,7 @@
 //! streaming driver in [`crate::decode`] runs batch-1. Note `head_dim` is taken from config and may
 //! differ from `hidden_size / num_heads` (e.g. Qwen3-0.6B: hidden 1024, 16 heads, head_dim 128).
 
-use mlx_rs::ops::add;
+use mlx_rs::ops::{add, concatenate_axis};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::LlamaConfig;
@@ -19,7 +19,7 @@ use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, linear, rms_norm};
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::{ContiguousKvCache, Weights};
+use crate::primitives::{ContiguousKvCache, PagedKvCache, Weights};
 
 /// Cached decode runs in bf16 (matching the reference engines).
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
@@ -252,6 +252,52 @@ impl LlamaModel {
         self.forward_to_last_logits(&embeds, cache, cos, sin, AttnMask::Additive(mask))
     }
 
+    /// Throughput-mode batched decode forward for iteration-level continuous batching (story 7281):
+    /// batched embed / projections / MLP / lm_head over a `[batch, seq]` step, but attention is
+    /// **per-sequence** — each row attends only its own sequence's real KV in `caches[i]` (a
+    /// [`PagedKvCache`]), gathered to its true length with no padding mask. `positions` are the
+    /// per-row absolute RoPE positions (row-major, length `batch * seq`; ragged across rows by
+    /// construction, since each sequence sits at its own cache offset). Returns the **last column**
+    /// logits `[batch, vocab]`.
+    ///
+    /// Unlike [`LlamaModel::decode_logits`] run per row, the **batched** projections here are not
+    /// bit-identical to the batch-1 logits: MLX's batched matmul is not row-invariant, so a row
+    /// tracks its batch-1 run only to sub-ULP (the documented Throughput-mode tradeoff — it buys the
+    /// weight-read amortization that scales throughput with occupancy). The bit-exact continuous path
+    /// runs each sequence through [`LlamaModel::decode_logits`] on its own cache instead.
+    pub fn decode_logits_per_seq(
+        &self,
+        input_ids: &Array,
+        caches: &mut [&mut PagedKvCache],
+        positions: &[i32],
+    ) -> Result<Array> {
+        let sh = input_ids.shape();
+        let (b, s) = (sh[0], sh[1]);
+        if caches.len() != b as usize {
+            return Err(Error::Msg(format!(
+                "decode_logits_per_seq: {} caches for a batch of {b}",
+                caches.len()
+            )));
+        }
+        if positions.len() != (b * s) as usize {
+            return Err(Error::Msg(format!(
+                "decode_logits_per_seq: {} positions for a {b}x{s} step",
+                positions.len()
+            )));
+        }
+        let (cos, sin) = self.rope_tables(positions, b, s)?;
+        let mut h = self.embed(input_ids)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward_per_seq(&h, &cos, &sin, caches, i)?;
+        }
+        let last = s - 1;
+        let last_idx = Array::from_slice(&[last], &[1]);
+        let last_h = h.take_axis(&last_idx, 1)?.reshape(&[b, self.cfg.hidden_size])?;
+        let normed = rms_norm(&last_h, &self.norm, self.cfg.rms_norm_eps)?;
+        let logits = linear(&normed, &self.lm_head, None)?;
+        Ok(logits.reshape(&[b, self.cfg.vocab_size])?)
+    }
+
     /// Run the decoder stack over `input_embeds` with the given RoPE tables and attention mask, and
     /// project the **last column** to logits `[batch, vocab]`. The shared core of the single and
     /// batched forwards: they differ only in how `cos`/`sin` and `mask` are built.
@@ -315,6 +361,22 @@ impl LlamaLayer {
         let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
         Ok(add(&h, &self.mlp.forward(&normed2)?)?)
     }
+
+    /// Per-sequence attention variant of [`LlamaLayer::forward`]: the MLP and norms are batched as
+    /// usual, but attention runs row-by-row over each sequence's own paged cache (story 7281).
+    fn forward_per_seq(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        caches: &mut [&mut PagedKvCache],
+        layer_idx: usize,
+    ) -> Result<Array> {
+        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let h = add(x, &self.attn.forward_per_seq(&normed, cos, sin, caches, layer_idx)?)?;
+        let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
+        Ok(add(&h, &self.mlp.forward(&normed2)?)?)
+    }
 }
 
 /// Grouped-query attention with RoPE and optional per-head q/k RMSNorm (Qwen3).
@@ -334,15 +396,12 @@ struct LlamaAttention {
 }
 
 impl LlamaAttention {
-    fn forward(
-        &self,
-        x: &Array,
-        cos: &Array,
-        sin: &Array,
-        mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
-    ) -> Result<Array> {
+    /// Project `x` `[b, s, hidden]` into attention-layout `(q, k, v)` — `q` `[b, heads, s, head_dim]`,
+    /// `k`/`v` `[b, kv_heads, s, head_dim]` — applying the qkv projections, optional Qwen3 per-head
+    /// q/k RMSNorm, RoPE, and the transpose into the head-major layout. The shared front half of both
+    /// the masked (batched) and per-sequence attention paths; nothing here touches the cache or
+    /// attends, so the two paths differ only in how they gather K/V and call SDPA.
+    fn project(&self, x: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array, Array)> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
 
@@ -359,14 +418,34 @@ impl LlamaAttention {
             k = rms_norm(&k, kn, self.eps)?;
         }
 
-        // RoPE on q,k (cos/sin broadcast over the head axis).
-        let q = apply_rope(&q, cos, sin)?;
-        let k = apply_rope(&k, cos, sin)?;
-
-        // -> [b, heads, s, head_dim] for attention + caching.
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
+        // RoPE on q,k (cos/sin broadcast over the head axis), then -> [b, heads, s, head_dim].
+        let q = apply_rope(&q, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
+        let k = apply_rope(&k, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        Ok((q, k, v))
+    }
+
+    /// Project the attended output `[b, heads, s, head_dim]` back to `[b, s, hidden]` through `o`.
+    /// The shared back half of both attention paths.
+    fn output(&self, attn: &Array) -> Result<Array> {
+        let sh = attn.shape(); // [b, heads, s, head_dim]
+        let (b, s) = (sh[0], sh[2]);
+        let merged = attn
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, s, self.num_heads * self.head_dim])?;
+        self.o.forward(&merged)
+    }
+
+    fn forward(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        mask: AttnMask<'_>,
+        cache: &mut dyn KvCache,
+        layer_idx: usize,
+    ) -> Result<Array> {
+        let (q, k, v) = self.project(x, cos, sin)?;
 
         // MLX's fused SDPA does grouped-query attention natively — it derives
         // `gqa_factor = q_heads / kv_heads` and reads K/V by head stride — so we hand it the
@@ -376,11 +455,43 @@ impl LlamaAttention {
         let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
 
         let out = sdpa(&q, &k_all, &v_all, self.scale, mask)?; // [b, heads, s, head_dim]
-        let out = out
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, s, self.num_heads * self.head_dim])?;
-        self.o.forward(&out)
+        self.output(&out)
     }
+
+    /// Per-sequence attention (story 7281): the projection is **batched** over all rows, but each
+    /// row then attends only its own sequence's real KV in `caches[i]`, gathered to its true length
+    /// and run through a stock causal SDPA — i.e. byte-identically to that sequence's batch-1
+    /// attention, with no padding mask and no cross-row mixing. `caches.len()` must equal the batch.
+    ///
+    /// Attention is the only step that loops; the projections, MLP, and lm_head around it stay
+    /// batched, which is where the throughput comes from. (The matmul batching is also why the
+    /// surrounding logits only *track* batch-1 to sub-ULP — see [`LlamaModel::decode_logits_per_seq`].)
+    fn forward_per_seq(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        caches: &mut [&mut PagedKvCache],
+        layer_idx: usize,
+    ) -> Result<Array> {
+        let (q, k, v) = self.project(x, cos, sin)?; // [b,H,s,hd], [b,kvh,s,hd], [b,kvh,s,hd]
+        let mut outs = Vec::with_capacity(caches.len());
+        for (i, cache) in caches.iter_mut().enumerate() {
+            let i = i as i32;
+            let (qi, ki, vi) = (row_axis0(&q, i)?, row_axis0(&k, i)?, row_axis0(&v, i)?);
+            let (k_all, v_all) = cache.update(layer_idx, &ki, &vi)?; // gather this seq's real KV
+            outs.push(sdpa(&qi, &k_all, &v_all, self.scale, AttnMask::Causal)?); // [1,H,s,hd]
+        }
+        let refs: Vec<&Array> = outs.iter().collect();
+        let out = concatenate_axis(&refs, 0)?; // [b, heads, s, head_dim]
+        self.output(&out)
+    }
+}
+
+/// Slice row `i` off the batch axis, keeping the axis (`[1, …]`).
+fn row_axis0(a: &Array, i: i32) -> Result<Array> {
+    let idx = Array::from_slice(&[i], &[1]);
+    Ok(a.take_axis(&idx, 0)?)
 }
 
 /// SwiGLU feed-forward.

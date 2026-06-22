@@ -49,9 +49,10 @@ pub use core_llm;
 
 pub use config::LlamaConfig;
 pub use decode::{
-    generate, generate_batch, generate_cached, generate_draft_speculative, generate_prompt_lookup,
-    generate_with_cache, BatchRequest, CancelFlag, FinishReason, GenerationConfig, GenerationOutput,
-    PrefixCache, PrefixStats, SpeculativeConfig, SpeculativeStats, StreamEvent,
+    generate, generate_batch, generate_cached, generate_continuous, generate_draft_speculative,
+    generate_prompt_lookup, generate_with_cache, BatchExactness, BatchRequest, CancelFlag,
+    ContinuousConfig, FinishReason, GenerationConfig, GenerationOutput, PrefixCache, PrefixStats,
+    SpeculativeConfig, SpeculativeStats, StreamEvent,
 };
 pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
