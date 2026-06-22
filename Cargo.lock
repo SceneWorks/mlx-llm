@@ -546,6 +546,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-llm-server"
+version = "0.0.0"
+dependencies = [
+ "mlx-llm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-macros"
 version = "0.25.3"
 source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"

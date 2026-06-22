@@ -1,0 +1,22 @@
+[package]
+name = "mlx-llm-server"
+version = "0.0.0"
+edition = "2021"
+description = "Example OpenAI-compatible HTTP server (chat completions + SSE) on the mlx-llm engine."
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/mlx-llm"
+publish = false
+
+[[bin]]
+name = "mlx-llm-server"
+path = "src/main.rs"
+
+[dependencies]
+# The engine + the backend-neutral contract it re-exports (`mlx_llm::core_llm`). The server speaks
+# only the `core_llm::TextLlm` contract + `core_llm::load_textllm` routing, so it is backend-agnostic
+# (it would serve a candle-llm provider unchanged); it depends on `mlx-llm` only to link the provider
+# registration in. Linking `mlx-llm` builds MLX — the server is Apple-Silicon-only, like the engine.
+mlx-llm = { path = ".." }
+# JSON request/response (OpenAI wire format). Derive keeps the request/response types readable.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
