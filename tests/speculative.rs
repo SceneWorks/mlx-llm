@@ -20,9 +20,11 @@ use core_llm::Tokenizer;
 
 use mlx_llm::config::LlamaConfig;
 use mlx_llm::decode::{
-    generate, generate_prompt_lookup, CancelFlag, GenerationConfig, SpeculativeConfig,
+    generate, generate_draft_speculative, generate_prompt_lookup, CancelFlag, GenerationConfig,
+    SpeculativeConfig,
 };
 use mlx_llm::models::LlamaModel;
+use mlx_llm::primitives::projection::QuantSpec;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 
@@ -112,6 +114,112 @@ fn run_suite(fx: Fixture) {
     let b = generate_prompt_lookup(&fx.model, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap().0;
     assert_eq!(a.tokens, b.tokens, "stochastic speculative must be deterministic for a fixed seed");
     assert!(!a.tokens.is_empty());
+}
+
+/// Load a dense **target** and a Q4-quantized **draft** from the same snapshot — vocab-compatible by
+/// construction, with the Q4 draft a faster, lossy approximation that yields genuine partial
+/// acceptance.
+fn load_draft_target(env: &str) -> Option<(LlamaModel, LlamaModel, Tokenizer)> {
+    let dir = std::env::var(env).ok()?;
+    let w = Weights::from_dir(&dir).unwrap();
+    let target = LlamaModel::from_weights(&w, "", LlamaConfig::from_dir(&dir).unwrap()).unwrap();
+    let draft =
+        LlamaModel::from_weights_with(&w, "", LlamaConfig::from_dir(&dir).unwrap(), Some(QuantSpec::q4()))
+            .unwrap();
+    let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
+    Some((target, draft, tok))
+}
+
+fn run_draft_suite(target: LlamaModel, draft: LlamaModel, tok: Tokenizer) {
+    // ---- Exactness gate: num_draft = 0 ⇒ identical to non-speculative target decoding. ----
+    let no_draft = SpeculativeConfig { max_ngram: 3, num_draft: 0 };
+    for text in ["The capital of France is", "Q: What is 2+2? A:"] {
+        let p = encode(&tok, text);
+        let cfg = greedy_config(28);
+        let base = generate(&target, &p, &cfg, &CancelFlag::new(), &mut |_| {}).unwrap().tokens;
+        let (out, stats) =
+            generate_draft_speculative(&target, &draft, &p, &cfg, &no_draft, &CancelFlag::new(), &mut |_| {})
+                .unwrap();
+        assert_eq!(out.tokens, base, "num_draft=0 draft-spec must equal non-speculative for '{text}'");
+        assert_eq!(stats.accepted, 0);
+    }
+
+    // ---- Draft-model greedy: tracks non-spec + measured latency win from accepted drafts. ----
+    let spec = SpeculativeConfig::default();
+    let p = encode(&tok, "Once upon a time in a small village there lived a curious");
+    let cfg = greedy_config(48);
+    let base = generate(&target, &p, &cfg, &CancelFlag::new(), &mut |_| {}).unwrap().tokens;
+    let (out, stats) =
+        generate_draft_speculative(&target, &draft, &p, &cfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap();
+    let n = out.tokens.len();
+    let cp = common_prefix(&out.tokens, &base);
+    println!(
+        "draft-model: {n} tokens in {} target forwards ({:.2} tok/forward); {}/{} drafts accepted (Q4 draft); \
+         tracks dense for {cp}/{} tokens",
+        stats.forwards,
+        n as f64 / stats.forwards as f64,
+        stats.accepted,
+        stats.proposed,
+        base.len(),
+    );
+    assert!(stats.accepted > 0, "the Q4 draft should agree with the dense target on some tokens");
+    assert!(stats.forwards < n + 1, "accepted drafts must reduce target forwards below token count");
+    assert!(cp >= 1, "draft-spec output must track non-speculative (diverges only on bf16 near-ties)");
+
+    // ---- Stochastic: deterministic for a fixed seed, valid output. ----
+    let scfg = GenerationConfig {
+        max_new_tokens: 24,
+        sampling: SamplingParams { temperature: 0.8, top_p: 0.95, ..Default::default() },
+        seed: Some(11),
+        stop_tokens: Vec::new(),
+    };
+    let p = encode(&tok, "Describe the morning sky:");
+    let a = generate_draft_speculative(&target, &draft, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap().0;
+    let b = generate_draft_speculative(&target, &draft, &p, &scfg, &spec, &CancelFlag::new(), &mut |_| {}).unwrap().0;
+    assert_eq!(a.tokens, b.tokens, "stochastic draft-spec must be deterministic for a fixed seed");
+    assert!(!a.tokens.is_empty());
+}
+
+#[test]
+#[ignore = "needs a real snapshot via MLX_LLM_TEST_MODEL"]
+fn draft_speculative_llama() {
+    let Some((target, draft, tok)) = load_draft_target("MLX_LLM_TEST_MODEL") else {
+        eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        return;
+    };
+    run_draft_suite(target, draft, tok);
+}
+
+#[test]
+#[ignore = "needs a real snapshot via MLX_LLM_QWEN3_MODEL"]
+fn draft_speculative_qwen3() {
+    let Some((target, draft, tok)) = load_draft_target("MLX_LLM_QWEN3_MODEL") else {
+        eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        return;
+    };
+    run_draft_suite(target, draft, tok);
+}
+
+/// Two models with different vocabularies (SmolLM2 vs Qwen3) must be rejected as a draft/target pair.
+#[test]
+#[ignore = "needs both MLX_LLM_TEST_MODEL and MLX_LLM_QWEN3_MODEL"]
+fn draft_speculative_rejects_vocab_mismatch() {
+    let (Some(a), Some(b)) = (load_from("MLX_LLM_TEST_MODEL"), load_from("MLX_LLM_QWEN3_MODEL")) else {
+        eprintln!("skip: set both MLX_LLM_TEST_MODEL and MLX_LLM_QWEN3_MODEL");
+        return;
+    };
+    assert_ne!(a.model.config().vocab_size, b.model.config().vocab_size);
+    let p = encode(&a.tok, "Hello");
+    let err = generate_draft_speculative(
+        &a.model,
+        &b.model,
+        &p,
+        &greedy_config(8),
+        &SpeculativeConfig::default(),
+        &CancelFlag::new(),
+        &mut |_| {},
+    );
+    assert!(err.is_err(), "mismatched vocab must error");
 }
 
 #[test]

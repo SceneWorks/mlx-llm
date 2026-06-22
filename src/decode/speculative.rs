@@ -142,7 +142,7 @@ pub fn generate_prompt_lookup(
         let (committed, accepted) = if greedy {
             decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
         } else {
-            decide_stochastic(&logits_all, &drafts, &history, config, &mut rng)?
+            decide_stochastic(&logits_all, &drafts, &point_mass_dists(&drafts), &history, config, &mut rng)?
         };
         stats.accepted += accepted;
 
@@ -150,6 +150,138 @@ pub fn generate_prompt_lookup(
         cache.truncate(base_offset + 1 + accepted as i32)?;
 
         // Commit, honoring stop tokens and the budget; `cur` advances to the last committed token.
+        for &t in &committed {
+            if config.stop_tokens.contains(&t) {
+                finish = FinishReason::StopToken;
+                break 'outer;
+            }
+            on_event(StreamEvent::Token { id: t, step: generated.len() });
+            generated.push(t);
+            history.push(t);
+            cur = t;
+            if generated.len() >= config.max_new_tokens {
+                finish = FinishReason::MaxTokens;
+                break 'outer;
+            }
+        }
+    }
+
+    on_event(StreamEvent::Done { reason: finish, generated: generated.len() });
+    Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats))
+}
+
+/// Generate from `prompt_ids` with **draft-model** speculative decoding: the small `draft` model
+/// proposes tokens which the big `target` verifies in one forward (epic 7153, story 7172). Shares the
+/// verify / accept / KV-rollback machinery with [`generate_prompt_lookup`]; only the proposer differs
+/// (a draft model with its own distribution `q`, rather than n-gram copies). Returns the output and
+/// [`SpeculativeStats`].
+///
+/// `draft` and `target` must be vocab-compatible (same `vocab_size`); otherwise returns an error.
+/// Output is distribution-preserving w.r.t. the target's verify forward — token-for-token identical to
+/// non-speculative with `num_draft = 0` (the exactness gate); see the module-level kernel caveat for
+/// the multi-token verify.
+pub fn generate_draft_speculative(
+    target: &LlamaModel,
+    draft: &LlamaModel,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    spec: &SpeculativeConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+) -> Result<(GenerationOutput, SpeculativeStats)> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    if prompt_ids.is_empty() {
+        return Err(Error::Msg("generate_draft_speculative: empty prompt".into()));
+    }
+    if target.config().vocab_size != draft.config().vocab_size {
+        return Err(Error::Msg(format!(
+            "draft/target vocab mismatch: draft {} vs target {}",
+            draft.config().vocab_size,
+            target.config().vocab_size
+        )));
+    }
+
+    let mut stats = SpeculativeStats::default();
+    let mut generated: Vec<i32> = Vec::new();
+    let mut finish = FinishReason::MaxTokens;
+
+    if config.max_new_tokens == 0 {
+        on_event(StreamEvent::Done { reason: finish, generated: 0 });
+        return Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats));
+    }
+
+    let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let mut target_cache = target.new_cache();
+    let mut draft_cache = draft.new_cache();
+    let greedy = config.sampling.temperature <= 0.0;
+
+    // ---- Prefill both models; first token from the target's last-position logits. ----
+    let logits_last = target.decode_logits(&input_ids(prompt_ids), &mut target_cache, 0)?;
+    draft.decode_logits(&input_ids(prompt_ids), &mut draft_cache, 0)?;
+    stats.forwards += 1;
+    let mut history: Vec<i32> = prompt_ids.to_vec();
+
+    let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
+    if config.stop_tokens.contains(&first) {
+        finish = FinishReason::StopToken;
+        on_event(StreamEvent::Done { reason: finish, generated: 0 });
+        return Ok((GenerationOutput { tokens: generated, finish_reason: finish }, stats));
+    }
+    on_event(StreamEvent::Token { id: first, step: 0 });
+    generated.push(first);
+    history.push(first);
+    let mut cur = first;
+
+    'outer: while generated.len() < config.max_new_tokens {
+        if cancel.is_cancelled() {
+            finish = FinishReason::Cancelled;
+            break;
+        }
+        let remaining = config.max_new_tokens - generated.len();
+        let k = spec.num_draft.min(remaining.saturating_sub(1));
+        let base_target = target_cache.offset();
+        let base_draft = draft_cache.offset();
+
+        // ---- Draft proposes K tokens; feed [cur, d₁…dₖ] so the draft cache stays target-synced. ----
+        let mut drafts: Vec<i32> = Vec::with_capacity(k);
+        let mut draft_dists: Vec<Vec<(i32, f32)>> = Vec::with_capacity(k);
+        let mut draft_hist = history.clone();
+        let mut feed = cur;
+        for step in 0..=k {
+            let off = draft_cache.offset();
+            let dl = draft.decode_logits(&input_ids(&[feed]), &mut draft_cache, off)?;
+            if step < k {
+                if !greedy {
+                    draft_dists.push(shaped_candidates(&dl, &draft_hist, &config.sampling, None)?);
+                }
+                let d = sample(&dl, &draft_hist, &config.sampling, &mut rng, None)?;
+                drafts.push(d);
+                draft_hist.push(d);
+                feed = d;
+            }
+        }
+        stats.proposed += drafts.len();
+
+        // ---- Target verifies [cur, drafts…] in one forward. ----
+        let mut verify = Vec::with_capacity(1 + drafts.len());
+        verify.push(cur);
+        verify.extend_from_slice(&drafts);
+        let logits_all = target.decode_logits_all(&input_ids(&verify), &mut target_cache, base_target)?;
+        stats.forwards += 1;
+
+        let (committed, accepted) = if greedy {
+            decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
+        } else {
+            decide_stochastic(&logits_all, &drafts, &draft_dists, &history, config, &mut rng)?
+        };
+        stats.accepted += accepted;
+
+        // Roll both caches back to keep `cur` + the accepted drafts.
+        target_cache.truncate(base_target + 1 + accepted as i32)?;
+        draft_cache.truncate(base_draft + 1 + accepted as i32)?;
+
         for &t in &committed {
             if config.stop_tokens.contains(&t) {
                 finish = FinishReason::StopToken;
@@ -197,11 +329,14 @@ fn decide_greedy(
     Ok((committed, accepted))
 }
 
-/// Stochastic acceptance: per-position rejection sampling against the target's shaped distribution
-/// (point-mass draft), distribution-preserving. Returns `(committed tokens, accepted draft count)`.
+/// Stochastic acceptance: per-position rejection sampling against the target's shaped distribution,
+/// distribution-preserving. `draft_dists[i]` is the proposal distribution `q` the draft sampled
+/// `drafts[i]` from — a point mass `[(drafts[i], 1.0)]` for prompt-lookup, the draft model's shaped
+/// distribution for draft-model speculation. Returns `(committed tokens, accepted draft count)`.
 fn decide_stochastic(
     logits_all: &Array,
     drafts: &[i32],
+    draft_dists: &[Vec<(i32, f32)>],
     history: &[i32],
     config: &GenerationConfig,
     rng: &mut SplitMix64,
@@ -215,7 +350,7 @@ fn decide_stochastic(
         let row = logits_row(logits_all, i as i32)?;
         let target = shaped_candidates(&row, &hist_i, &config.sampling, None)?;
         let (u_a, u_r) = (rng.next_f32(), rng.next_f32());
-        match accept_token(&target, &[(d, 1.0)], d, u_a, u_r) {
+        match accept_token(&target, &draft_dists[i], d, u_a, u_r) {
             Acceptance::Accepted(t) => {
                 committed.push(t);
                 accepted += 1;
@@ -235,6 +370,12 @@ fn decide_stochastic(
         committed.push(sample_weighted(&target, rng.next_f32(), 0));
     }
     Ok((committed, accepted))
+}
+
+/// Point-mass proposal distributions for prompt-lookup drafts (each draft was "sampled" with
+/// probability 1).
+fn point_mass_dists(drafts: &[i32]) -> Vec<Vec<(i32, f32)>> {
+    drafts.iter().map(|&d| vec![(d, 1.0)]).collect()
 }
 
 /// Extract position `i`'s logits row `[batch, vocab]` from an all-positions `[batch, seq, vocab]`.
