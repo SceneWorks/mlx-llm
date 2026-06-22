@@ -7,8 +7,8 @@
 //!    [`Rope`](primitives::Rope) family, GQA attention helpers, quantization, the `nn` leaves,
 //!    and a safetensors [`Weights`](primitives::Weights) loader. These own MLX `Array`s directly
 //!    and deliberately depend on nothing from the gen-ai side.
-//! 2. [`config`] + [`models`] — model configuration ([`LlamaConfig`](config::LlamaConfig)) and the
-//!    generic Llama decoder ([`LlamaModel`](models::LlamaModel)), `&self` forward + `from_weights`.
+//! 2. [`config`] + [`models`] — model configuration ([`ModelConfig`](config::ModelConfig)) and the
+//!    generic Llama decoder ([`CausalLm`](models::CausalLm)), `&self` forward + `from_weights`.
 //! 3. [`decode`] — the streaming, cancellable decode loop ([`generate`](decode::generate)) that
 //!    drives any [`Decode`](decode::Decode) model, emitting a [`StreamEvent`](decode::StreamEvent)
 //!    per token. This internal streaming API is what the backend-neutral `core-llm` contract
@@ -29,7 +29,7 @@
 //!
 //! [`joycaption`] is the **text + vision** path (story 7157): a SigLIP vision tower
 //! ([`models::SiglipVisionTower`]) + LLaVA projector + image splice in front of the reused
-//! [`LlamaModel`] decode, served as a multimodal [`core_llm::TextLlm`] provider (`mlx-joycaption`).
+//! [`CausalLm`] decode, served as a multimodal [`core_llm::TextLlm`] provider (`mlx-joycaption`).
 //!
 //! MLX's default Metal device is single-threaded; engine instances hold MLX `Array`s and are
 //! therefore neither `Send` nor `Sync`. Drive one engine from one thread (or behind a mutex).
@@ -47,7 +47,7 @@ pub mod provider;
 // Re-export the contract crate so consumers can reach it as `mlx_llm::core_llm::…`.
 pub use core_llm;
 
-pub use config::LlamaConfig;
+pub use config::ModelConfig;
 pub use decode::{
     generate, generate_batch, generate_cached, generate_continuous, generate_draft_speculative,
     generate_prompt_lookup, generate_with_cache, BatchExactness, BatchRequest, CancelFlag,
@@ -56,5 +56,5 @@ pub use decode::{
 };
 pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
-pub use models::LlamaModel;
+pub use models::CausalLm;
 pub use provider::LlamaProvider;

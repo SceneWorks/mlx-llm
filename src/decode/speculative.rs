@@ -30,7 +30,7 @@ use core_llm::speculative::{accept_greedy_run, accept_token, ngram_propose, samp
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, FinishReason, GenerationConfig, GenerationOutput, StreamEvent};
 use crate::error::{Error, Result};
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::sampler::{sample, shaped_candidates, SplitMix64, TokenRng};
@@ -71,7 +71,7 @@ pub struct SpeculativeStats {
 ///
 /// Returns [`Error::Canceled`] if `cancel` is already set before any inference.
 pub fn generate_prompt_lookup(
-    model: &LlamaModel,
+    model: &CausalLm,
     prompt_ids: &[i32],
     config: &GenerationConfig,
     spec: &SpeculativeConfig,
@@ -181,8 +181,8 @@ pub fn generate_prompt_lookup(
 /// non-speculative with `num_draft = 0` (the exactness gate); see the module-level kernel caveat for
 /// the multi-token verify.
 pub fn generate_draft_speculative(
-    target: &LlamaModel,
-    draft: &LlamaModel,
+    target: &CausalLm,
+    draft: &CausalLm,
     prompt_ids: &[i32],
     config: &GenerationConfig,
     spec: &SpeculativeConfig,

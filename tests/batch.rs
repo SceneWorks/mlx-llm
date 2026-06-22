@@ -27,26 +27,26 @@
 
 use core_llm::Tokenizer;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{
     generate, generate_batch, generate_continuous, BatchExactness, BatchRequest, CancelFlag,
     ContinuousConfig, FinishReason, GenerationConfig,
 };
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::provider::eos_token_ids;
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
     stop: Vec<i32>,
 }
 
 fn load() -> Option<Fixture> {
     let dir = std::env::var("MLX_LLM_TEST_MODEL").ok()?;
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
-    let model = LlamaModel::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
+    let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     let stop = eos_token_ids(std::path::Path::new(&dir));
     Some(Fixture { model, tok, stop })

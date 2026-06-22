@@ -80,7 +80,7 @@ pub struct RopeScaling {
 
 /// Configuration for a Llama-family decoder.
 #[derive(Clone, Debug, PartialEq)]
-pub struct LlamaConfig {
+pub struct ModelConfig {
     /// Model/residual width.
     pub hidden_size: i32,
     /// MLP inner width.
@@ -113,7 +113,7 @@ pub struct LlamaConfig {
     pub quantization: Option<QuantSpec>,
 }
 
-impl LlamaConfig {
+impl ModelConfig {
     /// Parse from an already-decoded `config.json` value.
     pub fn from_json(v: &Value) -> Result<Self> {
         let int = |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
@@ -255,7 +255,7 @@ mod tests {
                 "original_max_position_embeddings": 8192
             }
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.hidden_size, 4096);
         assert_eq!(cfg.head_dim, 128); // 4096/32
         assert_eq!(cfg.num_kv_heads, 8);
@@ -272,7 +272,7 @@ mod tests {
             "num_attention_heads": 4,
             "vocab_size": 32
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.head_dim, 16); // 64/4
         assert_eq!(cfg.num_kv_heads, 4); // defaults to num_heads (MHA)
         assert!(cfg.rope_scaling.is_none());
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn missing_required_field_errors() {
         let v = json!({ "hidden_size": 64 });
-        assert!(matches!(LlamaConfig::from_json(&v), Err(Error::Config(_))));
+        assert!(matches!(ModelConfig::from_json(&v), Err(Error::Config(_))));
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
             "num_attention_heads": 4, "vocab_size": 32,
             "quantization": { "group_size": 64, "bits": 4 }
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.quantization, Some(QuantSpec { group_size: 64, bits: 4 }));
 
         // Absent block ⇒ dense snapshot.
@@ -319,7 +319,7 @@ mod tests {
             "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
             "num_attention_heads": 4, "vocab_size": 32
         });
-        assert_eq!(LlamaConfig::from_json(&dense).unwrap().quantization, None);
+        assert_eq!(ModelConfig::from_json(&dense).unwrap().quantization, None);
     }
 
     #[test]
@@ -331,7 +331,7 @@ mod tests {
             "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
             "tie_word_embeddings": true, "max_position_embeddings": 40960
         });
-        let cfg = LlamaConfig::from_json(&v).unwrap();
+        let cfg = ModelConfig::from_json(&v).unwrap();
         assert_eq!(cfg.architecture, Architecture::Qwen3);
         assert!(cfg.has_qk_norm());
         assert_eq!(cfg.head_dim, 128); // explicit, != 1024/16

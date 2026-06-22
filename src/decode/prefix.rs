@@ -27,7 +27,7 @@ use crate::decode::stream::{
     decode_loop, default_seed, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::error::Result;
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::{ContiguousKvCache, SEQ_AXIS};
 use crate::primitives::sampler::SplitMix64;
@@ -142,7 +142,7 @@ impl PrefixCache {
 /// Returns [`Error::Canceled`](crate::error::Error::Canceled) if `cancel` is already set before any
 /// inference.
 pub fn generate_cached(
-    model: &LlamaModel,
+    model: &CausalLm,
     prompt_ids: &[i32],
     config: &GenerationConfig,
     cancel: &CancelFlag,

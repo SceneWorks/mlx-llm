@@ -18,21 +18,21 @@
 
 use core_llm::Tokenizer;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, generate_cached, CancelFlag, GenerationConfig, PrefixCache};
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
 }
 
 fn load_from(env: &str) -> Option<Fixture> {
     let dir = std::env::var(env).ok()?;
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
-    let model = LlamaModel::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
+    let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some(Fixture { model, tok })
 }

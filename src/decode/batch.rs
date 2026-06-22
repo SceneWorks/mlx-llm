@@ -34,7 +34,7 @@ use core_llm::FinishReason as CoreFinish;
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, Decode, FinishReason, GenerationOutput, StreamEvent};
 use crate::error::{Error, Result};
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 
 /// The pad token id stuffed into the left-pad region. Any in-vocabulary id works — the attention
@@ -86,7 +86,7 @@ enum LaneStep {
 /// stops promptly, and any still-running rows finish [`FinishReason::Cancelled`] with their partial
 /// output.
 pub fn generate_batch(
-    model: &LlamaModel,
+    model: &CausalLm,
     requests: &[BatchRequest],
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(usize, StreamEvent),

@@ -8,5 +8,5 @@
 pub mod llama;
 pub mod siglip;
 
-pub use llama::LlamaModel;
+pub use llama::CausalLm;
 pub use siglip::{SiglipVisionConfig, SiglipVisionTower};

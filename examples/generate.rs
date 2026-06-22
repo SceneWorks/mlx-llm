@@ -16,9 +16,9 @@ use std::path::Path;
 
 use core_llm::Tokenizer;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, CancelFlag, GenerationConfig, StreamEvent};
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::provider::eos_token_ids;
@@ -40,10 +40,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let dir = Path::new(&dir);
     eprintln!("loading config + weights from {} …", dir.display());
-    let cfg = LlamaConfig::from_dir(dir)?;
+    let cfg = ModelConfig::from_dir(dir)?;
     let stop_tokens = eos_token_ids(dir);
     let weights = Weights::from_dir(dir)?;
-    let model = LlamaModel::from_weights(&weights, "", cfg)?;
+    let model = CausalLm::from_weights(&weights, "", cfg)?;
 
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
     let prompt_ids: Vec<i32> = tokenizer

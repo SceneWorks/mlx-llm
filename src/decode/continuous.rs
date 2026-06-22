@@ -19,7 +19,7 @@
 //! - [`BatchExactness::Exact`] runs each sequence as its own batch-1 forward: **byte-identical** to
 //!   running that request alone, but no throughput scaling.
 //! - [`BatchExactness::Throughput`] batches the projections / MLP / lm_head and runs only attention
-//!   per-sequence ([`LlamaModel::decode_logits_per_seq`]): throughput scales with occupancy, at the
+//!   per-sequence ([`CausalLm::decode_logits_per_seq`]): throughput scales with occupancy, at the
 //!   cost of sub-ULP divergence (a row *tracks* its batch-1 run, like `generate_batch`).
 //!
 //! Both modes get iteration-level admission (admit-on-retire) and per-sequence paged attention (no
@@ -39,7 +39,7 @@ use crate::decode::batch::BatchRequest;
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, FinishReason, GenerationOutput, StreamEvent};
 use crate::error::{Error, Result};
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::input_ids;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
@@ -115,7 +115,7 @@ enum LaneStep {
 /// [`FinishReason::Cancelled`] with whatever partial output it had, and each request emits exactly
 /// one terminal [`StreamEvent::Done`].
 pub fn generate_continuous(
-    model: &LlamaModel,
+    model: &CausalLm,
     requests: &[BatchRequest],
     config: &ContinuousConfig,
     cancel: &CancelFlag,
@@ -233,7 +233,7 @@ pub fn generate_continuous(
 /// scheduler already holds its final state.
 #[allow(clippy::too_many_arguments)]
 fn admit_lane(
-    model: &LlamaModel,
+    model: &CausalLm,
     pool: &Rc<RefCell<BlockPool>>,
     num_layers: usize,
     requests: &[BatchRequest],
@@ -272,7 +272,7 @@ fn admit_lane(
 /// One decode step's logits, one `[1, vocab]` per live lane (in lane order). `Exact` builds each
 /// sequence's own batch-1 forward and evaluates them together (a single device round-trip for the
 /// step); `Throughput` runs one batched forward with per-sequence attention and splits the rows.
-fn step_logits(model: &LlamaModel, lanes: &mut [Lane], exactness: BatchExactness) -> Result<Vec<Array>> {
+fn step_logits(model: &CausalLm, lanes: &mut [Lane], exactness: BatchExactness) -> Result<Vec<Array>> {
     match exactness {
         BatchExactness::Exact => {
             let mut logits = Vec::with_capacity(lanes.len());
