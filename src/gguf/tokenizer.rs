@@ -7,17 +7,21 @@
 //! `core_llm::Tokenizer::from_file("tokenizer.json")` (a `tokenizers`-crate model), so this module is
 //! the encoder from the former to the latter.
 //!
-//! ## Scope: byte-level BPE (`tokenizer.ggml.model == "gpt2"`)
+//! ## Byte-level BPE (`tokenizer.ggml.model == "gpt2"`)
 //! Covers the GPT-2 byte-level BPE family — SmolLM2, Qwen, Llama-3, and friends. The vocabulary,
 //! merges, and added/special tokens come straight from the metadata; the `normalizer` /
 //! `pre_tokenizer` / `decoder` come from a small per-`tokenizer.ggml.pre` template table (these
 //! differ materially between families — e.g. Qwen2's NFC + split regex vs SmolLM2's digit split), so
 //! the reconstructed tokenizer matches the source's tokenization, not just its vocab.
 //!
-//! The SentencePiece/Unigram `llama` model is **not** reconstructed: GGUF does not carry the
-//! precompiled normalizer charsmap a faithful SPM `tokenizer.json` needs, so a reconstruction would
-//! silently mis-tokenize. That case is reported as [`TokenizerOutcome::Unsupported`] (convert with
-//! `--tokenizer`), not guessed at.
+//! ## SentencePiece BPE (`tokenizer.ggml.model == "llama"`/`spm`)
+//! The Llama-2 / Mistral family (story 7334). Despite the SentencePiece origin, HF's *fast*
+//! tokenizer for these is a **BPE** model with `byte_fallback`, a `Prepend("▁") + Replace(" "→"▁")`
+//! normalizer (no precompiled charsmap — that only applies to T5/XLNet-style SPM), and a
+//! `Replace/ByteFallback/Fuse/Strip` decoder. A modern `convert_hf_to_gguf.py` GGUF already carries
+//! `tokenizer.ggml.merges` (copied from the HF tokenizer), so reconstruction is **byte-exact**; if a
+//! GGUF lacks merges, they are derived from `tokenizer.ggml.scores` via HF's `SentencePieceExtractor`
+//! algorithm (same merge set, occasionally a different tie order — flagged as derived).
 
 use serde_json::{json, Map, Value};
 
@@ -28,6 +32,9 @@ use crate::gguf::reader::GgufFile;
 const TOKEN_TYPE_UNKNOWN: i64 = 2;
 const TOKEN_TYPE_CONTROL: i64 = 3;
 const TOKEN_TYPE_USER_DEFINED: i64 = 4;
+
+/// The SentencePiece space marker (`▁`, U+2581) used by the SPM normalizer/decoder.
+const SPM_SPACE: &str = "\u{2581}";
 
 /// What [`reconstruct`] could do with a GGUF's tokenizer metadata.
 pub enum TokenizerOutcome {
@@ -58,12 +65,13 @@ pub fn reconstruct(g: &GgufFile) -> Result<TokenizerOutcome> {
     };
     match model {
         // GPT-2 byte-level BPE (SmolLM2 / Qwen / Llama-3 / …).
-        "gpt2" | "bpe" => reconstruct_bpe(g),
-        // SentencePiece / Unigram — GGUF lacks the precompiled normalizer charsmap; don't guess.
-        "llama" | "spm" | "t5" | "unigram" => Ok(TokenizerOutcome::Unsupported(format!(
-            "GGUF tokenizer model {model:?} is SentencePiece/Unigram, which cannot be faithfully \
-             reconstructed from GGUF metadata alone (the precompiled normalizer is not stored); \
-             pass --tokenizer <tokenizer.json> from the source model"
+        "gpt2" | "bpe" => reconstruct_byte_level_bpe(g),
+        // SentencePiece BPE (Llama-2 / Mistral / …) — HF's fast tokenizer is byte_fallback BPE.
+        "llama" | "spm" => reconstruct_spm(g),
+        // Unigram/T5-style SPM genuinely needs the precompiled normalizer charsmap (not in GGUF).
+        "t5" | "unigram" => Ok(TokenizerOutcome::Unsupported(format!(
+            "GGUF tokenizer model {model:?} is a Unigram/T5-style SentencePiece tokenizer whose \
+             precompiled normalizer is not stored in GGUF; pass --tokenizer <tokenizer.json>"
         ))),
         other => Ok(TokenizerOutcome::Unsupported(format!(
             "unrecognized GGUF tokenizer model {other:?}; pass --tokenizer <tokenizer.json>"
@@ -71,54 +79,149 @@ pub fn reconstruct(g: &GgufFile) -> Result<TokenizerOutcome> {
     }
 }
 
-/// Build a byte-level BPE `tokenizer.json` from the GGUF metadata.
-fn reconstruct_bpe(g: &GgufFile) -> Result<TokenizerOutcome> {
+/// Build a byte-level BPE `tokenizer.json` from the GGUF metadata (gpt2 family).
+fn reconstruct_byte_level_bpe(g: &GgufFile) -> Result<TokenizerOutcome> {
     let Some(tokens) = str_array(g, "tokenizer.ggml.tokens") else {
-        return Ok(TokenizerOutcome::Unsupported(
-            "GGUF has tokenizer.ggml.model but no tokenizer.ggml.tokens".into(),
-        ));
+        return Ok(unsupported("GGUF has tokenizer.ggml.model but no tokenizer.ggml.tokens"));
     };
     let Some(merges) = str_array(g, "tokenizer.ggml.merges") else {
-        return Ok(TokenizerOutcome::Unsupported(
-            "GGUF byte-level BPE tokenizer has no tokenizer.ggml.merges".into(),
-        ));
+        return Ok(unsupported("GGUF byte-level BPE tokenizer has no tokenizer.ggml.merges"));
     };
     let token_types = i64_array(g, "tokenizer.ggml.token_type");
     let pre = g.meta_str("tokenizer.ggml.pre").unwrap_or("default");
 
-    // model.vocab: every token by its id. The GGUF token list has no duplicate strings (verified on
-    // the SmolLM2/Qwen vocabs, including reserved/unused slots), so a flat map is exact and lossless.
+    let vocab = match build_vocab(&tokens) {
+        Ok(v) => v,
+        Err(e) => return Ok(TokenizerOutcome::Unsupported(e)),
+    };
+    let merge_pairs = match parse_merges(&merges) {
+        Ok(m) => m,
+        Err(e) => return Ok(TokenizerOutcome::Unsupported(e)),
+    };
+    let added = build_added_tokens(&tokens, &token_types);
+    let (normalizer, pre_tokenizer, post_processor, decoder) = bpe_components(pre);
+
+    let model = json!({
+        "type": "BPE",
+        "dropout": Value::Null,
+        "unk_token": Value::Null,
+        "continuing_subword_prefix": Value::Null,
+        "end_of_word_suffix": Value::Null,
+        "fuse_unk": false,
+        "byte_fallback": false,
+        "ignore_merges": false,
+        "vocab": Value::Object(vocab),
+        "merges": Value::Array(merge_pairs),
+    });
+    let tokenizer_json = assemble(added, normalizer, pre_tokenizer, post_processor, decoder, model);
+    let tokenizer_config_json = build_tokenizer_config(g, &tokens);
+
+    Ok(TokenizerOutcome::Reconstructed(Box::new(ReconstructedTokenizer {
+        tokenizer_json,
+        tokenizer_config_json,
+        kind: format!("gpt2 byte-level BPE (pre={pre})"),
+    })))
+}
+
+/// Build a SentencePiece BPE `tokenizer.json` (Llama-2 / Mistral family) from the GGUF metadata.
+fn reconstruct_spm(g: &GgufFile) -> Result<TokenizerOutcome> {
+    let Some(tokens) = str_array(g, "tokenizer.ggml.tokens") else {
+        return Ok(unsupported("GGUF has tokenizer.ggml.model but no tokenizer.ggml.tokens"));
+    };
+    let token_types = i64_array(g, "tokenizer.ggml.token_type");
+
+    let vocab = match build_vocab(&tokens) {
+        Ok(v) => v,
+        Err(e) => return Ok(TokenizerOutcome::Unsupported(e)),
+    };
+
+    // Merges: prefer the GGUF's own list (copied verbatim from the HF tokenizer ⇒ byte-exact). If a
+    // GGUF omits them, derive from the per-token scores via HF's `SentencePieceExtractor` (same merge
+    // set; tie order can differ slightly — hence "derived").
+    let (merge_pairs, merge_source) = if let Some(merges) = str_array(g, "tokenizer.ggml.merges") {
+        match parse_merges(&merges) {
+            Ok(m) => (m, "merges"),
+            Err(e) => return Ok(TokenizerOutcome::Unsupported(e)),
+        }
+    } else {
+        let Some(scores) = f32_array(g, "tokenizer.ggml.scores") else {
+            return Ok(unsupported(
+                "GGUF SentencePiece tokenizer has neither tokenizer.ggml.merges nor \
+                 tokenizer.ggml.scores — cannot reconstruct BPE merges",
+            ));
+        };
+        (derive_merges_from_scores(&tokens, &scores), "derived")
+    };
+
+    let added = build_added_tokens(&tokens, &token_types);
+    // unk_token: the SPM `<unk>` piece, needed by `fuse_unk` + `byte_fallback`.
+    let unk = g
+        .meta_u64("tokenizer.ggml.unknown_token_id")
+        .and_then(|id| tokens.get(id as usize).copied());
+    // SPM prepends a `▁` to the start of the text unless add_space_prefix is explicitly false.
+    let add_space_prefix = g
+        .meta("tokenizer.ggml.add_space_prefix")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let (normalizer, decoder) = spm_components(add_space_prefix);
+    let model = json!({
+        "type": "BPE",
+        "dropout": Value::Null,
+        "unk_token": unk.map(Value::from).unwrap_or(Value::Null),
+        "continuing_subword_prefix": Value::Null,
+        "end_of_word_suffix": Value::Null,
+        "fuse_unk": true,
+        "byte_fallback": true,
+        "vocab": Value::Object(vocab),
+        "merges": Value::Array(merge_pairs),
+    });
+    // pre_tokenizer / post_processor are null: the engine encodes with add_special=false and renders
+    // BOS via the chat template, so HF's TemplateProcessing(BOS) is not needed for the engine path.
+    let tokenizer_json = assemble(added, normalizer, Value::Null, Value::Null, decoder, model);
+    let tokenizer_config_json = build_tokenizer_config(g, &tokens);
+
+    Ok(TokenizerOutcome::Reconstructed(Box::new(ReconstructedTokenizer {
+        tokenizer_json,
+        tokenizer_config_json,
+        kind: format!("llama SentencePiece BPE (merges={merge_source})"),
+    })))
+}
+
+/// `model.vocab`: every token by its id. The GGUF token list has no duplicate strings (verified on
+/// the SmolLM2/Qwen/Llama vocabs, including reserved slots and byte-fallback tokens), so a flat map
+/// is exact and lossless; a duplicate would silently collapse two ids, so it's rejected.
+fn build_vocab(tokens: &[&str]) -> std::result::Result<Map<String, Value>, String> {
     let mut vocab = Map::with_capacity(tokens.len());
     for (id, tok) in tokens.iter().enumerate() {
         if vocab.insert((*tok).to_string(), json!(id)).is_some() {
-            return Ok(TokenizerOutcome::Unsupported(format!(
-                "duplicate token {tok:?} in GGUF vocab — cannot build a 1:1 BPE vocab"
-            )));
+            return Err(format!("duplicate token {tok:?} in GGUF vocab — cannot build a 1:1 vocab"));
         }
     }
+    Ok(vocab)
+}
 
-    // model.merges: each GGUF merge is "<left> <right>"; byte-level encoding never puts a literal
-    // space inside a piece, so splitting on the first space recovers the pair exactly.
-    let mut merge_pairs = Vec::with_capacity(merges.len());
-    for m in &merges {
-        match m.split_once(' ') {
-            Some((a, b)) => merge_pairs.push(json!([a, b])),
-            None => {
-                return Ok(TokenizerOutcome::Unsupported(format!(
-                    "malformed GGUF merge {m:?} (no space separator)"
-                )))
-            }
-        }
-    }
+/// `model.merges`: each GGUF merge is `"<left> <right>"`; neither byte-level nor SPM pieces contain a
+/// literal space (space is encoded as `Ġ`/`▁`), so splitting on the first space recovers the pair.
+fn parse_merges(merges: &[&str]) -> std::result::Result<Vec<Value>, String> {
+    merges
+        .iter()
+        .map(|m| {
+            m.split_once(' ')
+                .map(|(a, b)| json!([a, b]))
+                .ok_or_else(|| format!("malformed GGUF merge {m:?} (no space separator)"))
+        })
+        .collect()
+}
 
-    // added_tokens: control / user-defined / unknown tokens become added tokens (matched atomically,
-    // ahead of BPE). `special` follows HF: control & unknown are special; user-defined are not (e.g.
-    // Qwen's `<think>`/`<tool_call>` are non-special added tokens).
+/// `added_tokens`: control / user-defined / unknown tokens become added tokens (matched atomically,
+/// ahead of BPE). `special` follows HF: control & unknown are special; user-defined are not (e.g.
+/// Qwen's `<think>`/`<tool_call>`). Byte-fallback (`BYTE`) and normal tokens stay in the plain vocab.
+fn build_added_tokens(tokens: &[&str], token_types: &Option<Vec<i64>>) -> Vec<Value> {
     let mut added = Vec::new();
-    if let Some(types) = &token_types {
+    if let Some(types) = token_types {
         for (id, tok) in tokens.iter().enumerate() {
-            let ty = types.get(id).copied().unwrap_or(0);
-            let special = match ty {
+            let special = match types.get(id).copied().unwrap_or(0) {
                 TOKEN_TYPE_CONTROL | TOKEN_TYPE_UNKNOWN => true,
                 TOKEN_TYPE_USER_DEFINED => false,
                 _ => continue,
@@ -134,23 +237,19 @@ fn reconstruct_bpe(g: &GgufFile) -> Result<TokenizerOutcome> {
             }));
         }
     }
+    added
+}
 
-    let (normalizer, pre_tokenizer, post_processor, decoder) = bpe_components(pre);
-
-    let model = json!({
-        "type": "BPE",
-        "dropout": Value::Null,
-        "unk_token": Value::Null,
-        "continuing_subword_prefix": Value::Null,
-        "end_of_word_suffix": Value::Null,
-        "fuse_unk": false,
-        "byte_fallback": false,
-        "ignore_merges": false,
-        "vocab": Value::Object(vocab),
-        "merges": Value::Array(merge_pairs),
-    });
-
-    let tokenizer_json = json!({
+/// Assemble the top-level `tokenizer.json` document from its parts.
+fn assemble(
+    added: Vec<Value>,
+    normalizer: Value,
+    pre_tokenizer: Value,
+    post_processor: Value,
+    decoder: Value,
+    model: Value,
+) -> Value {
+    json!({
         "version": "1.0",
         "truncation": Value::Null,
         "padding": Value::Null,
@@ -160,15 +259,62 @@ fn reconstruct_bpe(g: &GgufFile) -> Result<TokenizerOutcome> {
         "post_processor": post_processor,
         "decoder": decoder,
         "model": model,
+    })
+}
+
+/// Shorthand for a non-fatal "couldn't reconstruct" outcome.
+fn unsupported(reason: &str) -> TokenizerOutcome {
+    TokenizerOutcome::Unsupported(reason.to_string())
+}
+
+/// `(normalizer, decoder)` for the SentencePiece BPE family — taken verbatim from a Llama-2/Mistral
+/// `tokenizer.json`. The normalizer turns spaces into `▁` (and prepends one if `add_space_prefix`);
+/// the decoder reverses it, with `ByteFallback`+`Fuse` reassembling `<0xNN>` byte tokens.
+fn spm_components(add_space_prefix: bool) -> (Value, Value) {
+    let mut normalizers = Vec::new();
+    if add_space_prefix {
+        normalizers.push(json!({ "type": "Prepend", "prepend": SPM_SPACE }));
+    }
+    normalizers.push(json!({ "type": "Replace", "pattern": { "String": " " }, "content": SPM_SPACE }));
+    let normalizer = json!({ "type": "Sequence", "normalizers": normalizers });
+    let decoder = json!({
+        "type": "Sequence",
+        "decoders": [
+            { "type": "Replace", "pattern": { "String": SPM_SPACE }, "content": " " },
+            { "type": "ByteFallback" },
+            { "type": "Fuse" },
+            { "type": "Strip", "content": " ", "start": 1, "stop": 0 }
+        ]
     });
+    (normalizer, decoder)
+}
 
-    let tokenizer_config_json = build_tokenizer_config(g, &tokens);
-
-    Ok(TokenizerOutcome::Reconstructed(Box::new(ReconstructedTokenizer {
-        tokenizer_json,
-        tokenizer_config_json,
-        kind: format!("gpt2 byte-level BPE (pre={pre})"),
-    })))
+/// Derive BPE merges from per-token scores when a GGUF omits `tokenizer.ggml.merges`, porting HF's
+/// `SentencePieceExtractor.extract(vocab_scores)`: for each piece, every split into two in-vocab
+/// pieces is a candidate merge (local-sorted by the halves' ids); all candidates are then globally
+/// stable-sorted by the produced piece's score, descending. Yields the same merge *set* HF would; the
+/// tie order can differ from a GGUF's stored list (which is why stored merges are preferred).
+fn derive_merges_from_scores(tokens: &[&str], scores: &[f32]) -> Vec<Value> {
+    use std::collections::HashMap;
+    let vocab: HashMap<&str, usize> = tokens.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+    // (score, left, right) — score drives the global order, ties keep insertion order.
+    let mut merges: Vec<(f32, &str, &str)> = Vec::new();
+    for (id, piece) in tokens.iter().enumerate() {
+        let score = scores.get(id).copied().unwrap_or(0.0);
+        let mut local: Vec<(usize, usize, &str, &str)> = Vec::new();
+        // Split at each internal char boundary; both halves must be in the vocab.
+        for (b, _) in piece.char_indices().skip(1) {
+            let (l, r) = piece.split_at(b);
+            if let (Some(&il), Some(&ir)) = (vocab.get(l), vocab.get(r)) {
+                local.push((il, ir, l, r));
+            }
+        }
+        local.sort_by_key(|&(il, ir, _, _)| (il, ir));
+        merges.extend(local.into_iter().map(|(_, _, l, r)| (score, l, r)));
+    }
+    // Stable sort by score descending (matches HF's `reverse=True` stable sort).
+    merges.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    merges.into_iter().map(|(_, l, r)| json!([l, r])).collect()
 }
 
 /// The Qwen2 pre-tokenizer split regex (verbatim from a Qwen `tokenizer.json`).
@@ -279,6 +425,12 @@ fn i64_array(g: &GgufFile, key: &str) -> Option<Vec<i64>> {
     arr.iter().map(|v| v.as_i64()).collect()
 }
 
+/// Read a GGUF metadata array of floats as `f32` (e.g. `tokenizer.ggml.scores`).
+fn f32_array(g: &GgufFile, key: &str) -> Option<Vec<f32>> {
+    let arr = g.meta(key)?.as_array()?;
+    arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +488,16 @@ mod tests {
             }
             self
         }
+        fn f32_array(mut self, k: &str, vals: &[f32]) -> Self {
+            self.key(k);
+            self.meta.extend_from_slice(&9u32.to_le_bytes()); // T_ARRAY
+            self.meta.extend_from_slice(&6u32.to_le_bytes()); // elem T_FLOAT32
+            self.meta.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+            for v in vals {
+                self.meta.extend_from_slice(&v.to_le_bytes());
+            }
+            self
+        }
         fn build(self) -> GgufFile {
             let mut b = Vec::new();
             b.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
@@ -368,12 +530,87 @@ mod tests {
     }
 
     #[test]
-    fn spm_model_is_reported_unsupported_not_guessed() {
-        let g = Builder::new().string("tokenizer.ggml.model", "llama").build();
+    fn unigram_t5_model_is_reported_unsupported_not_guessed() {
+        // Unigram/T5-style SPM genuinely needs the precompiled charsmap (not in GGUF) — don't guess.
+        let g = Builder::new().string("tokenizer.ggml.model", "t5").build();
         match reconstruct(&g).unwrap() {
-            TokenizerOutcome::Unsupported(reason) => assert!(reason.contains("SentencePiece")),
+            TokenizerOutcome::Unsupported(reason) => assert!(reason.contains("Unigram")),
             other => panic!("expected Unsupported, got {}", outcome_name(&other)),
         }
+    }
+
+    #[test]
+    fn spm_reconstructs_byte_fallback_bpe_from_merges() {
+        // Llama-style SPM: <unk>(unknown), <s>/</s>(control), normal pieces, a byte token, + merges.
+        let g = Builder::new()
+            .string("tokenizer.ggml.model", "llama")
+            .str_array(
+                "tokenizer.ggml.tokens",
+                &["<unk>", "<s>", "</s>", "\u{2581}", "h", "i", "\u{2581}h", "<0x0A>"],
+            )
+            .i32_array("tokenizer.ggml.token_type", &[2, 3, 3, 1, 1, 1, 1, 6])
+            .str_array("tokenizer.ggml.merges", &["\u{2581} h"])
+            .u32("tokenizer.ggml.unknown_token_id", 0)
+            .u32("tokenizer.ggml.bos_token_id", 1)
+            .u32("tokenizer.ggml.eos_token_id", 2)
+            .build();
+        let t = reconstructed(&g);
+        let tj = &t.tokenizer_json;
+        assert!(t.kind.contains("merges=merges"));
+
+        // BPE model with SPM flags: byte_fallback + fuse_unk + unk_token.
+        assert_eq!(tj["model"]["type"], "BPE");
+        assert_eq!(tj["model"]["byte_fallback"], true);
+        assert_eq!(tj["model"]["fuse_unk"], true);
+        assert_eq!(tj["model"]["unk_token"], "<unk>");
+        assert_eq!(tj["model"]["merges"], serde_json::json!([["\u{2581}", "h"]]));
+
+        // The byte token stays in the plain vocab (byte_fallback handles it), NOT added_tokens.
+        assert_eq!(tj["model"]["vocab"]["<0x0A>"], 7);
+        let added = tj["added_tokens"].as_array().unwrap();
+        assert_eq!(added.len(), 3, "only <unk>/<s>/</s> are added tokens");
+        assert!(added.iter().all(|a| a["content"] != "<0x0A>"));
+
+        // SPM normalizer (Prepend ▁ + Replace space→▁) and ByteFallback decoder.
+        assert_eq!(tj["normalizer"]["normalizers"][0]["type"], "Prepend");
+        assert_eq!(tj["normalizer"]["normalizers"][0]["prepend"], "\u{2581}");
+        let decoders = tj["decoder"]["decoders"].as_array().unwrap();
+        assert!(decoders.iter().any(|d| d["type"] == "ByteFallback"));
+        assert!(tj["pre_tokenizer"].is_null());
+
+        // tokenizer_config carries the eos string (id 2 -> "</s>") + unk.
+        assert_eq!(t.tokenizer_config_json["eos_token"], "</s>");
+        assert_eq!(t.tokenizer_config_json["unk_token"], "<unk>");
+    }
+
+    #[test]
+    fn spm_derives_merges_from_scores_when_absent() {
+        // No `tokenizer.ggml.merges` -> derive from scores. Hand vocab where the merges are
+        // determinable: scores descending so "ab" (-4) and "bc" (-5) precede "abc"'s two splits (-6).
+        let g = Builder::new()
+            .string("tokenizer.ggml.model", "llama")
+            .str_array("tokenizer.ggml.tokens", &["<unk>", "a", "b", "c", "ab", "bc", "abc"])
+            .i32_array("tokenizer.ggml.token_type", &[2, 1, 1, 1, 1, 1, 1])
+            .f32_array("tokenizer.ggml.scores", &[0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0])
+            .u32("tokenizer.ggml.unknown_token_id", 0)
+            .build();
+        let t = reconstructed(&g);
+        assert!(t.kind.contains("merges=derived"));
+        // Global stable sort by score desc; "abc"'s splits local-sorted by (left_id,right_id):
+        // ("a"=1,"bc"=5) before ("ab"=4,"c"=3).
+        assert_eq!(
+            t.tokenizer_json["model"]["merges"],
+            serde_json::json!([["a", "b"], ["b", "c"], ["a", "bc"], ["ab", "c"]])
+        );
+    }
+
+    #[test]
+    fn spm_without_merges_or_scores_is_unsupported() {
+        let g = Builder::new()
+            .string("tokenizer.ggml.model", "llama")
+            .str_array("tokenizer.ggml.tokens", &["<unk>", "a", "b"])
+            .build();
+        assert!(matches!(reconstruct(&g).unwrap(), TokenizerOutcome::Unsupported(_)));
     }
 
     #[test]
