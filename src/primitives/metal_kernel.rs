@@ -35,9 +35,22 @@ impl MetalKernel {
     /// are addressable in the source by their names; the single output by its name. `source` is the
     /// kernel **body** (MLX wraps it in the function signature).
     pub fn new(name: &str, input_names: &[&str], output_names: &[&str], source: &str) -> Result<Self> {
+        Self::new_with_header(name, input_names, output_names, "", source)
+    }
+
+    /// Like [`new`](Self::new) but with a file-scope `header` (e.g. `#include <metal_simdgroup>`)
+    /// emitted before the generated function signature — needed for kernels using simd-reduction
+    /// intrinsics (`simd_sum`/`simd_max`).
+    pub fn new_with_header(
+        name: &str,
+        input_names: &[&str],
+        output_names: &[&str],
+        header: &str,
+        source: &str,
+    ) -> Result<Self> {
         let c_name = cstr(name)?;
         let c_source = cstr(source)?;
-        let c_header = cstr("")?;
+        let c_header = cstr(header)?;
         let inputs = VectorString::new(input_names)?;
         let outputs = VectorString::new(output_names)?;
         // ensure_row_contiguous = true (we pass plain contiguous arrays); atomic_outputs = false.
