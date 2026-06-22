@@ -27,9 +27,12 @@
 //! differing-length sequences are handled bit-exactly.
 //!
 //! Block id lifetimes — allocation, recycling, and the copy-on-write reference counts — are the
-//! backend-neutral [`core_llm::paging::BlockAllocator`] policy; this module adds only the per-id MLX
-//! tensor storage and the gather. The pool is `Rc<RefCell<…>>`-shared and single-threaded,
-//! consistent with the engine's MLX device (instances are neither `Send` nor `Sync`).
+//! backend-neutral [`core_llm::paging::BlockAllocator`] policy; this module adds the per-id MLX tensor
+//! storage and the gather. Each sequence's frozen KV is held **once**, contiguously, in its own
+//! `frozen_k`/`frozen_v` (the gather source); a pool block carries its own copy of the bytes only when
+//! that block is offered for copy-on-write sharing, so an unshared sequence keeps ~1× the KV with no
+//! duplicate alongside the contiguous store (sc-7363). The pool is `Rc<RefCell<…>>`-shared and
+//! single-threaded, consistent with the engine's MLX device (instances are neither `Send` nor `Sync`).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -42,14 +45,23 @@ use core_llm::paging::BlockAllocator;
 use crate::error::{Error, Result};
 use crate::primitives::kv_cache::{KvCache, SEQ_AXIS};
 
-/// One physical block: per-layer keys and values for a contiguous run of up to `block_size` token
-/// positions of a single sequence. Frozen blocks are exactly `block_size` long and never mutated
-/// (which is what makes copy-on-write sharing free).
+/// One physical block: per-layer keys and values for a contiguous run of exactly `block_size` token
+/// positions of a single sequence. Frozen blocks are never mutated (which is what makes copy-on-write
+/// sharing free).
+///
+/// A block's bytes are **lazily materialized**: by default a block carries no tensors (`k`/`v` empty)
+/// because the sole copy of its keys/values lives in the owning sequence's contiguous
+/// [`frozen_k`](PagedKvCache::frozen_k)/[`frozen_v`](PagedKvCache::frozen_v) (sc-7363 — this is what
+/// makes the cache memory-neutral: no per-block copy alongside the contiguous one). The tensors are
+/// filled in only when the block is offered for copy-on-write sharing
+/// ([`PagedKvCache::shareable_prefix_blocks`]), so a *shared* prefix has one pool-resident copy that
+/// seeded siblings read, while *unshared* blocks cost nothing beyond their owner's `frozen_k`.
 #[derive(Debug)]
 struct PhysBlock {
-    /// Per layer, `[1, n_kv_heads, block_size, head_dim]` (keys already-RoPE'd).
+    /// Per layer, `[1, n_kv_heads, block_size, head_dim]` (keys already-RoPE'd). Empty ⟺ not yet
+    /// materialized (bytes live in the owner's `frozen_k`).
     k: Vec<Array>,
-    /// Per layer, `[1, n_kv_heads, block_size, head_dim]`.
+    /// Per layer, `[1, n_kv_heads, block_size, head_dim]`. Empty ⟺ not yet materialized.
     v: Vec<Array>,
 }
 
@@ -101,17 +113,33 @@ impl BlockPool {
         self.live_blocks() * self.block_size
     }
 
-    /// Allocate a fresh block holding `k`/`v` (per layer), refcount 1, returning its id. The
-    /// allocator reuses a freed id when available.
-    fn alloc(&mut self, k: Vec<Array>, v: Vec<Array>) -> usize {
+    /// Allocate a fresh **unmaterialized** block (refcount 1), returning its id — the block carries no
+    /// tensors yet; its keys/values live in the owner's `frozen_k` until the block is offered for
+    /// sharing (sc-7363). The allocator reuses a freed id when available.
+    fn alloc_empty(&mut self) -> usize {
         let id = self.alloc.alloc();
-        let block = Some(PhysBlock { k, v });
+        let block = Some(PhysBlock { k: Vec::new(), v: Vec::new() });
         if id == self.blocks.len() {
             self.blocks.push(block);
         } else {
             self.blocks[id] = block; // recycled id: overwrite the freed slot
         }
         id
+    }
+
+    /// Whether block `id` already holds its tensors (has been materialized for sharing).
+    fn is_materialized(&self, id: usize) -> bool {
+        !self.block(id).k.is_empty()
+    }
+
+    /// Fill block `id` with its per-layer `k`/`v` so it can be read by a seeded sibling (copy-on-write
+    /// sharing). Idempotent — a no-op once materialized.
+    fn materialize(&mut self, id: usize, k: Vec<Array>, v: Vec<Array>) {
+        let block = self.blocks[id].as_mut().expect("live block");
+        if block.k.is_empty() {
+            block.k = k;
+            block.v = v;
+        }
     }
 
     /// Add a reference to `id` (a sequence adopting a shared block).
@@ -149,13 +177,17 @@ pub struct PagedKvCache {
     tail_v: Vec<Option<Array>>,
     /// Tokens in the tail (same across layers); authoritative after a full step (all layers updated).
     tail_len: usize,
-    /// Per-layer cached concat of **all frozen blocks** (`concat(block_ids' k/v[layer])`), maintained
-    /// incrementally so the per-step [`PagedKvCache::gather`] is a 2-array concat (`frozen + tail`)
-    /// instead of an O(blocks) concat. The per-step gather was ~85% of the decode step before this
-    /// (sc-7325). `Some` ⟺ current for `block_ids`; `None` means "rebuild on next use" (empty, freshly
-    /// seeded, or invalidated by truncate/reset). It duplicates the frozen KV (a contiguous copy
-    /// alongside the block tensors) — the throughput-for-memory tradeoff the gather-free paged kernel
-    /// (sc-7301) would avoid.
+    /// Per-layer contiguous concat of **all frozen blocks** — the sequence's *primary* frozen KV
+    /// storage. Maintained incrementally (append one block per freeze) so the per-step
+    /// [`PagedKvCache::gather`] is a 2-array concat (`frozen + tail`), not an O(blocks) one; the
+    /// per-step gather was ~85% of the decode step before this (sc-7325).
+    ///
+    /// sc-7363: this is the **sole** copy of the frozen KV — the pool blocks are unmaterialized
+    /// (byte-less) unless shared — so the cache is memory-neutral (~1× the KV, no duplicate alongside
+    /// the block tensors). `Some` ⟺ current for `block_ids`; `None` means "build on next use" (empty
+    /// or freshly seeded). Append (freeze) and slice (truncate) keep it valid, so it is rebuilt from
+    /// the pool only once, for a freshly [`new_seeded`](PagedKvCache::new_seeded) prefix — whose blocks
+    /// are always materialized.
     frozen_k: Vec<Option<Array>>,
     frozen_v: Vec<Option<Array>>,
 }
@@ -210,9 +242,36 @@ impl PagedKvCache {
     /// The frozen block ids covering this sequence's first `tokens` positions — the shareable prefix
     /// for [`PagedKvCache::new_seeded`]. Rounded **down** to a whole number of blocks (a partial
     /// block is private and not shareable).
-    pub fn shareable_prefix_blocks(&self, tokens: usize) -> Vec<usize> {
-        let n = tokens / self.block_size;
-        self.block_ids[..n.min(self.block_ids.len())].to_vec()
+    ///
+    /// sc-7363: this **materializes** the offered blocks' tensors into the pool (sliced out of this
+    /// sequence's contiguous `frozen_k`), since unshared blocks carry no pool bytes. A seeded sibling
+    /// then reads those pool-resident copies; the cost is one pool copy of the *shared* prefix (paid
+    /// once, here), not a per-block copy for every sequence.
+    pub fn shareable_prefix_blocks(&mut self, tokens: usize) -> Result<Vec<usize>> {
+        let n = (tokens / self.block_size).min(self.block_ids.len());
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let bs = self.block_size as i32;
+        for l in 0..self.num_layers {
+            self.ensure_frozen(l)?;
+        }
+        for b in 0..n {
+            let id = self.block_ids[b];
+            if self.pool.borrow().is_materialized(id) {
+                continue;
+            }
+            let mut ks = Vec::with_capacity(self.num_layers);
+            let mut vs = Vec::with_capacity(self.num_layers);
+            for l in 0..self.num_layers {
+                let fk = self.frozen_k[l].as_ref().expect("frozen present after ensure_frozen");
+                let fv = self.frozen_v[l].as_ref().expect("frozen present after ensure_frozen");
+                ks.push(seq_range(fk, b as i32 * bs, bs)?);
+                vs.push(seq_range(fv, b as i32 * bs, bs)?);
+            }
+            self.pool.borrow_mut().materialize(id, ks, vs);
+        }
+        Ok(self.block_ids[..n].to_vec())
     }
 
     /// Number of frozen (full) blocks this sequence holds.
@@ -246,31 +305,37 @@ impl PagedKvCache {
 
     /// Freeze whole blocks off the front of every layer's tail until the tail is under `block_size`.
     /// Called once per step (after the last layer appended), so all layers carry the same tokens.
+    ///
+    /// All blocks that become full in this call are appended to the contiguous `frozen_k` in a **single
+    /// 2-array concat** (not one per block). This matters for a bulk update — a long prompt prefill, or
+    /// the bounded benchmark's grown caches, where many blocks freeze at once: a per-block loop would
+    /// leave `frozen_k` an O(blocks)-deep *lazy* concat chain that the next gather re-evaluates from the
+    /// root (since unshared block bytes are not separately retained, sc-7363), spiking decode at high
+    /// occupancy. One concat keeps `frozen_k` shallow regardless of how many tokens arrive per step.
     fn freeze_full_blocks(&mut self, new_tokens: usize) -> Result<()> {
         self.tail_len += new_tokens;
-        let bs = self.block_size as i32;
-        while self.tail_len >= self.block_size {
-            let mut bk = Vec::with_capacity(self.num_layers);
-            let mut bv = Vec::with_capacity(self.num_layers);
-            for l in 0..self.num_layers {
-                let tk = self.tail_k[l].take().expect("tail present at freeze");
-                let tv = self.tail_v[l].take().expect("tail present at freeze");
-                let (hk, rk) = split_seq(&tk, bs)?;
-                let (hv, rv) = split_seq(&tv, bs)?;
-                // Maintain the frozen-blocks concat: ensure it reflects the prior blocks, then append
-                // this newly frozen block (a 2-array concat) so gather never re-concats every block.
-                self.ensure_frozen(l)?;
-                self.frozen_k[l] = Some(append_seq(self.frozen_k[l].take(), &hk)?);
-                self.frozen_v[l] = Some(append_seq(self.frozen_v[l].take(), &hv)?);
-                bk.push(hk);
-                bv.push(hv);
-                self.tail_k[l] = keep_nonempty(rk);
-                self.tail_v[l] = keep_nonempty(rv);
-            }
-            let id = self.pool.borrow_mut().alloc(bk, bv);
-            self.block_ids.push(id);
-            self.tail_len -= self.block_size;
+        if self.tail_len < self.block_size {
+            return Ok(());
         }
+        let n_full = self.tail_len / self.block_size;
+        let frozen = (n_full * self.block_size) as i32;
+        for l in 0..self.num_layers {
+            let tk = self.tail_k[l].take().expect("tail present at freeze");
+            let tv = self.tail_v[l].take().expect("tail present at freeze");
+            let (hk, rk) = split_seq(&tk, frozen)?; // all newly-full blocks at once
+            let (hv, rv) = split_seq(&tv, frozen)?;
+            self.ensure_frozen(l)?;
+            self.frozen_k[l] = Some(append_seq(self.frozen_k[l].take(), &hk)?);
+            self.frozen_v[l] = Some(append_seq(self.frozen_v[l].take(), &hv)?);
+            self.tail_k[l] = keep_nonempty(rk);
+            self.tail_v[l] = keep_nonempty(rv);
+        }
+        // One empty pool slot per frozen block (bytes live in `frozen_k`; materialized only if shared).
+        for _ in 0..n_full {
+            let id = self.pool.borrow_mut().alloc_empty();
+            self.block_ids.push(id);
+        }
+        self.tail_len -= n_full * self.block_size;
         Ok(())
     }
 
@@ -288,30 +353,25 @@ impl PagedKvCache {
         Ok((k, v))
     }
 
-    /// Materialize `layer`'s frozen-blocks concat from the block table when it is missing (a freshly
-    /// [`new_seeded`](PagedKvCache::new_seeded) prefix, or after a `truncate`/`reset` invalidation).
-    /// A no-op once cached or when there are no frozen blocks. This is the only O(blocks) concat, and
-    /// it runs at most once per invalidation — the steady state appends one block at a time.
+    /// Build `layer`'s frozen-blocks concat from the block table when it is missing — reached only for
+    /// a freshly [`new_seeded`](PagedKvCache::new_seeded) prefix, whose blocks are always materialized
+    /// (the seeding sequence filled them via [`shareable_prefix_blocks`](PagedKvCache::shareable_prefix_blocks)).
+    /// A no-op once present or when there are no frozen blocks. The steady state appends one block at a
+    /// time (freeze) and slices in place (truncate), so this O(blocks) concat runs at most once.
     fn ensure_frozen(&mut self, layer: usize) -> Result<()> {
         if self.frozen_k[layer].is_some() || self.block_ids.is_empty() {
             return Ok(());
         }
         let pool = self.pool.borrow();
+        assert!(
+            self.block_ids.iter().all(|&id| pool.is_materialized(id)),
+            "ensure_frozen over an unmaterialized block — frozen_k must stay valid for unshared blocks (sc-7363)"
+        );
         let ks: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).k[layer]).collect();
         let vs: Vec<&Array> = self.block_ids.iter().map(|&id| &pool.block(id).v[layer]).collect();
         self.frozen_k[layer] = Some(concat_or_clone(&ks)?);
         self.frozen_v[layer] = Some(concat_or_clone(&vs)?);
         Ok(())
-    }
-
-    /// Invalidate every layer's cached frozen-blocks concat (after the block table changes in a way
-    /// that is not a simple append — `truncate`/`reset`). The next [`gather`](PagedKvCache::gather)
-    /// rebuilds it from the current blocks.
-    fn invalidate_frozen(&mut self) {
-        for l in 0..self.num_layers {
-            self.frozen_k[l] = None;
-            self.frozen_v[l] = None;
-        }
     }
 }
 
@@ -386,31 +446,33 @@ impl KvCache for PagedKvCache {
             self.tail_len = new_tail;
             return Ok(());
         }
-        // Truncation drops whole blocks (and may unfreeze part of one into a fresh private tail).
+        // Truncation drops whole blocks (and may unfreeze part of one into a fresh private tail). The
+        // frozen KV lives only in `frozen_k` now, so re-derive the kept prefix and the unfrozen tail
+        // by slicing it directly (no pool read, no rebuild) — `frozen_k` stays the source of truth.
         let keep_full = len / self.block_size;
         let rem = len % self.block_size;
-        // Unfreeze the remainder of the boundary block into the tail *before* releasing anything.
-        if rem > 0 {
-            let id = self.block_ids[keep_full];
-            let pool = self.pool.borrow();
-            let block = pool.block(id);
-            let mut nk = Vec::with_capacity(self.num_layers);
-            let mut nv = Vec::with_capacity(self.num_layers);
-            for l in 0..self.num_layers {
-                nk.push(slice_prefix(&block.k[l], rem as i32)?);
-                nv.push(slice_prefix(&block.v[l], rem as i32)?);
+        let boundary = (keep_full * self.block_size) as i32; // first dropped position
+        for l in 0..self.num_layers {
+            self.ensure_frozen(l)?;
+            let fk = self.frozen_k[l].as_ref().expect("frozen present after ensure_frozen");
+            let fv = self.frozen_v[l].as_ref().expect("frozen present after ensure_frozen");
+            // Unfreeze the boundary block's remainder into the tail before shrinking the frozen prefix.
+            if rem > 0 {
+                self.tail_k[l] = Some(seq_range(fk, boundary, rem as i32)?);
+                self.tail_v[l] = Some(seq_range(fv, boundary, rem as i32)?);
+            } else {
+                self.tail_k[l] = None;
+                self.tail_v[l] = None;
             }
-            drop(pool);
-            for l in 0..self.num_layers {
-                self.tail_k[l] = Some(nk[l].clone());
-                self.tail_v[l] = Some(nv[l].clone());
-            }
-            self.tail_len = rem;
-        } else {
-            self.tail_k = vec![None; self.num_layers];
-            self.tail_v = vec![None; self.num_layers];
-            self.tail_len = 0;
+            let (nfk, nfv) = if keep_full > 0 {
+                (Some(slice_prefix(fk, boundary)?), Some(slice_prefix(fv, boundary)?))
+            } else {
+                (None, None)
+            };
+            self.frozen_k[l] = nfk;
+            self.frozen_v[l] = nfv;
         }
+        self.tail_len = rem;
         // Release the dropped blocks (everything from keep_full on) and shrink the table.
         {
             let mut pool = self.pool.borrow_mut();
@@ -419,8 +481,6 @@ impl KvCache for PagedKvCache {
             }
         }
         self.block_ids.truncate(keep_full);
-        // The block table changed by more than an append; rebuild the frozen concat on next gather.
-        self.invalidate_frozen();
         Ok(())
     }
 
@@ -435,7 +495,8 @@ impl KvCache for PagedKvCache {
         self.tail_k = vec![None; self.num_layers];
         self.tail_v = vec![None; self.num_layers];
         self.tail_len = 0;
-        self.invalidate_frozen();
+        self.frozen_k = vec![None; self.num_layers];
+        self.frozen_v = vec![None; self.num_layers];
     }
 }
 
@@ -462,6 +523,12 @@ fn split_seq(a: &Array, at: i32) -> Result<(Array, Array)> {
 /// sequence length.
 fn slice_prefix(a: &Array, n: i32) -> Result<Array> {
     let idx = Array::from_slice(&(0..n).collect::<Vec<_>>(), &[n]);
+    Ok(a.take_axis(&idx, SEQ_AXIS)?)
+}
+
+/// The `len` positions of `a` starting at `start` along the sequence axis (`a[start..start+len]`).
+fn seq_range(a: &Array, start: i32, len: i32) -> Result<Array> {
+    let idx = Array::from_slice(&(start..start + len).collect::<Vec<_>>(), &[len]);
     Ok(a.take_axis(&idx, SEQ_AXIS)?)
 }
 
@@ -577,7 +644,7 @@ mod tests {
             let k = seq(1, 4, 1, layer as f32 * 100.0);
             a.update(layer, &k, &k).unwrap();
         }
-        let shared = a.shareable_prefix_blocks(4);
+        let shared = a.shareable_prefix_blocks(4).unwrap();
         assert_eq!(shared.len(), 2);
 
         // Seed B from A's two prefix blocks, then decode a 3-token suffix per layer — crossing a block
@@ -621,7 +688,7 @@ mod tests {
         assert_eq!(pool.borrow().shared_blocks(), 0);
 
         // A sibling sequence adopts both prefix blocks (copy-on-write share).
-        let shared = a.shareable_prefix_blocks(4);
+        let shared = a.shareable_prefix_blocks(4).unwrap();
         assert_eq!(shared.len(), 2);
         let mut b = PagedKvCache::new_seeded(pool.clone(), 1, &shared);
         assert_eq!(b.offset(), 4, "seeded sequence starts past the shared prefix");
@@ -639,6 +706,33 @@ mod tests {
         drop(b);
         assert_eq!(pool.borrow().shared_blocks(), 0);
         assert_eq!(pool.borrow().live_blocks(), 2);
+    }
+
+    #[test]
+    fn unshared_blocks_hold_no_bytes_until_shared() {
+        // sc-7363 memory neutrality, asserted on the storage invariant (no fragile MB accounting): an
+        // unshared sequence's frozen KV lives once, in `frozen_k`; its pool blocks carry NO tensors,
+        // so there is no contiguous-vs-block duplicate. A block materializes its own copy only when it
+        // is offered for copy-on-write sharing.
+        let pool = BlockPool::new(2);
+        let mut a = PagedKvCache::with_pool(pool.clone(), 1);
+        let k = seq(1, 6, 1, 0.0); // 6 tokens -> 3 full blocks (block_size 2), empty tail
+        a.update(0, &k, &k).unwrap();
+        assert_eq!(a.block_ids.len(), 3);
+        assert!(a.frozen_k[0].is_some(), "frozen KV is held contiguously (the sole copy)");
+        {
+            let p = pool.borrow();
+            for &id in &a.block_ids {
+                assert!(!p.is_materialized(id), "unshared block {id} holds no bytes (no duplicate)");
+            }
+        }
+        // Offering the first two blocks for sharing materializes exactly those (sliced from frozen_k);
+        // the third, unshared, stays byte-less.
+        let shared = a.shareable_prefix_blocks(4).unwrap();
+        assert_eq!(shared.len(), 2);
+        let p = pool.borrow();
+        assert!(p.is_materialized(shared[0]) && p.is_materialized(shared[1]), "shared blocks materialized");
+        assert!(!p.is_materialized(a.block_ids[2]), "the unshared third block stays byte-less");
     }
 
     #[test]
