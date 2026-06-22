@@ -15,7 +15,9 @@
 
 pub mod attention;
 pub mod kv_cache;
+pub mod metal_kernel;
 pub mod nn;
+pub mod paged_attention;
 pub mod paged_kv_cache;
 pub mod projection;
 pub mod quant;

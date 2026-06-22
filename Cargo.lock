@@ -541,6 +541,7 @@ dependencies = [
  "half",
  "inventory",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "serde_json",
  "thiserror",
 ]

@@ -17,6 +17,11 @@ categories = ["science"]
 # Crates.io publish (a later epic-7153 story) will swap this for a registry/patch arrangement;
 # during development it is the fork so the engine actually runs correctly on-device.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "44929a001ab8a8837403a71c65cf064224de0cdc" }
+# Raw mlx-c FFI (same fork + rev as mlx-rs, so cargo unifies on ONE mlx-sys / one `Array` type). Used
+# only by the paged-attention custom Metal kernel (story 7170) to reach `mlx_fast_metal_kernel_*`,
+# which mlx-rs does not surface at the Rust level. No fork patch / rebuild — the symbols are already
+# compiled into the linked mlx-c, and `mlx_rs::Array::as_ptr()` exposes the C handle.
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "44929a001ab8a8837403a71c65cf064224de0cdc" }
 # The backend-neutral contract this crate implements (epic 7153). Git dep on the published repo
 # during development (crates.io publish coordination is a later story); shares its `CancelFlag`,
 # `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not two.
