@@ -1,10 +1,15 @@
-//! GGUF → `tokenizer.json` reconstruction parity (`#[ignore]` — needs models on disk), story 7251.
+//! GGUF → `tokenizer.json` reconstruction parity (`#[ignore]` — needs models on disk), stories
+//! 7251 (byte-level BPE) + 7334 (SentencePiece BPE).
 //!
-//! Point `MLX_LLM_BPE_GGUF` at a single byte-level-BPE `*.gguf` and `MLX_LLM_TEST_MODEL` at that
-//! model's HF snapshot (for the reference `tokenizer.json`), then:
+//! Point `MLX_LLM_BPE_GGUF` at a single `*.gguf` — byte-level BPE (SmolLM2/Qwen/Llama-3) or
+//! SentencePiece BPE (Llama-2/Mistral) — and `MLX_LLM_TEST_MODEL` at that model's HF snapshot (for
+//! the reference `tokenizer.json`), then:
 //!
 //! ```text
 //! MLX_LLM_BPE_GGUF=/tmp/SmolLM2-135M-Instruct-F16.gguf MLX_LLM_TEST_MODEL=/tmp/smollm2-135m \
+//!   cargo test --test gguf_tokenizer -- --ignored --nocapture
+//! # or a SentencePiece model:
+//! MLX_LLM_BPE_GGUF=/tmp/tinyllama-q4km.gguf MLX_LLM_TEST_MODEL=/tmp/tinyllama-hf \
 //!   cargo test --test gguf_tokenizer -- --ignored --nocapture
 //! ```
 //!

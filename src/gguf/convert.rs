@@ -14,13 +14,14 @@
 //!   Q4/Q8 and stored as packed `weight`/`scales`/`biases` with a `quantization` block in
 //!   `config.json`; embeddings, the LM head, and norms stay dense (the engine's quant invariant).
 //!
-//! The tokenizer is reconstructed too (story 7251): for the byte-level BPE family the GGUF's
-//! `tokenizer.ggml.*` metadata is encoded into a `tokenizer.json` + `tokenizer_config.json`
-//! ([`super::tokenizer`]), and the special-token ids are stamped into `config.json` so the snapshot
-//! runs end-to-end with no external files. A tokenizer kind we can't faithfully rebuild from GGUF
-//! (SentencePiece/Unigram) is reported in [`ConvertReport::tokenizer`] rather than guessed at; pass
-//! the source repo's `tokenizer.json` via the `convert_gguf` example's `--tokenizer` in that case
-//! (which also overrides a reconstructed one).
+//! The tokenizer is reconstructed too (stories 7251/7334): the GGUF's `tokenizer.ggml.*` metadata is
+//! encoded into a `tokenizer.json` + `tokenizer_config.json` ([`super::tokenizer`]) for both the
+//! byte-level BPE family (SmolLM2/Qwen/Llama-3) and the SentencePiece BPE family (Llama-2/Mistral),
+//! and the special-token ids are stamped into `config.json` so the snapshot runs end-to-end with no
+//! external files. A tokenizer kind we can't faithfully rebuild from GGUF (Unigram/T5-style
+//! SentencePiece, whose normalizer charsmap isn't stored) is reported in [`ConvertReport::tokenizer`]
+//! rather than guessed at; pass the source repo's `tokenizer.json` via the `convert_gguf` example's
+//! `--tokenizer` in that case (which also overrides a reconstructed one).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

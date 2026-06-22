@@ -13,9 +13,11 @@
 //! attention/MLP projections to MLX group-wise quantization (embeddings, LM head, and norms stay
 //! dense).
 //!
-//! If the GGUF uses a tokenizer kind that can't be reconstructed from its metadata (SentencePiece),
-//! the converter reports that and writes no `tokenizer.json`. Pass `--tokenizer <path>` to drop in a
-//! `tokenizer.json` from the source model's HF repo (it also overrides a reconstructed one).
+//! Byte-level BPE (SmolLM2/Qwen/Llama-3) and SentencePiece BPE (Llama-2/Mistral) tokenizers are
+//! reconstructed. If the GGUF uses a kind that can't be rebuilt from its metadata (Unigram/T5-style
+//! SentencePiece, whose normalizer charsmap isn't stored), the converter reports that and writes no
+//! `tokenizer.json`. Pass `--tokenizer <path>` to drop in a `tokenizer.json` from the source model's
+//! HF repo (it also overrides a reconstructed one).
 
 use std::path::Path;
 
