@@ -5,9 +5,11 @@
 //! ```
 //!
 //! Writes `<out_dir>/config.json` and `<out_dir>/model.safetensors`. The weights are dequantized
-//! from the GGUF (F16/BF16, legacy `Q*_0/_1`, and the `Q2_K…Q6_K` k-quants) and remapped to the
-//! transformer key layout. `--quant q4|q8` re-quantizes the attention/MLP projections to MLX
-//! group-wise quantization (embeddings, LM head, and norms stay dense).
+//! from the GGUF (F16/BF16, legacy `Q*_0/_1`, the `Q2_K…Q6_K` k-quants, `IQ4_NL`/`IQ4_XS`, and the
+//! sub-4-bit importance-matrix grid quants `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/
+//! `IQ3_S`) and remapped to the transformer key layout. `--quant q4|q8` re-quantizes the
+//! attention/MLP projections to MLX group-wise quantization (embeddings, LM head, and norms stay
+//! dense).
 //!
 //! A GGUF carries a llama.cpp tokenizer in its metadata, not a HF `tokenizer.json`, so the
 //! tokenizer is not reconstructed here. Pass `--tokenizer <path>` to copy a `tokenizer.json` (from
