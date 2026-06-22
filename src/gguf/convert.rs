@@ -14,10 +14,13 @@
 //!   Q4/Q8 and stored as packed `weight`/`scales`/`biases` with a `quantization` block in
 //!   `config.json`; embeddings, the LM head, and norms stay dense (the engine's quant invariant).
 //!
-//! The tokenizer is **not** part of this conversion: a GGUF embeds a llama.cpp tokenizer in its
-//! metadata, not a HF `tokenizer.json`. Drop the source repo's `tokenizer.json` into the output
-//! directory to run the converted model end-to-end (the `convert_gguf` example does this when given
-//! `--tokenizer`).
+//! The tokenizer is reconstructed too (story 7251): for the byte-level BPE family the GGUF's
+//! `tokenizer.ggml.*` metadata is encoded into a `tokenizer.json` + `tokenizer_config.json`
+//! ([`super::tokenizer`]), and the special-token ids are stamped into `config.json` so the snapshot
+//! runs end-to-end with no external files. A tokenizer kind we can't faithfully rebuild from GGUF
+//! (SentencePiece/Unigram) is reported in [`ConvertReport::tokenizer`] rather than guessed at; pass
+//! the source repo's `tokenizer.json` via the `convert_gguf` example's `--tokenizer` in that case
+//! (which also overrides a reconstructed one).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +30,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::gguf::reader::GgufFile;
+use crate::gguf::tokenizer::{self, TokenizerOutcome};
 use crate::primitives::quant::QuantizedLinear;
 use crate::primitives::QuantSpec;
 
@@ -53,8 +57,22 @@ pub struct ConvertReport {
     pub num_tensors: usize,
     /// The requant scheme applied to projections, if any.
     pub quantized: Option<QuantSpec>,
+    /// Whether a `tokenizer.json` was reconstructed from the GGUF metadata.
+    pub tokenizer: TokenizerStatus,
     /// Directory the snapshot was written to.
     pub out_dir: PathBuf,
+}
+
+/// Outcome of reconstructing a `tokenizer.json` from the GGUF metadata.
+#[derive(Clone, Debug)]
+pub enum TokenizerStatus {
+    /// `tokenizer.json` + `tokenizer_config.json` were written (with a short description of the kind).
+    Reconstructed(String),
+    /// The GGUF carries tokenizer metadata we can't faithfully rebuild (the reason); pass
+    /// `--tokenizer`.
+    Unsupported(String),
+    /// The GGUF carries no tokenizer metadata.
+    Absent,
 }
 
 /// Convert a GGUF file on disk into an MLX snapshot directory.
@@ -167,13 +185,34 @@ pub fn convert(g: &GgufFile, out_dir: impl AsRef<Path>, opts: ConvertOptions) ->
     Array::save_safetensors(tensors.iter().map(|(k, v)| (k.as_str(), v)), None, out_dir.join("model.safetensors"))
         .map_err(|e| Error::Msg(format!("gguf: write model.safetensors: {e}")))?;
 
+    // --- reconstruct tokenizer.json / tokenizer_config.json from the GGUF tokenizer metadata ---
+    let tokenizer = match tokenizer::reconstruct(g)? {
+        TokenizerOutcome::Reconstructed(t) => {
+            write_json(out_dir.join("tokenizer.json"), &t.tokenizer_json)?;
+            write_json(out_dir.join("tokenizer_config.json"), &t.tokenizer_config_json)?;
+            TokenizerStatus::Reconstructed(t.kind)
+        }
+        TokenizerOutcome::Unsupported(reason) => TokenizerStatus::Unsupported(reason),
+        TokenizerOutcome::Absent => TokenizerStatus::Absent,
+    };
+
     Ok(ConvertReport {
         architecture: arch,
         model_type: model_type.to_string(),
         num_tensors,
         quantized: opts.quantize,
+        tokenizer,
         out_dir: out_dir.to_path_buf(),
     })
+}
+
+/// Write a JSON value to `path`, pretty-printed.
+fn write_json(path: PathBuf, value: &Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|e| Error::Msg(format!("gguf: serialize {}: {e}", path.display())))?;
+    std::fs::write(&path, text)
+        .map_err(|e| Error::Msg(format!("gguf: write {}: {e}", path.display())))?;
+    Ok(())
 }
 
 /// Map a GGML tensor name to the transformer (HF) key the engine loads, or `None` if it is not a
@@ -300,6 +339,14 @@ fn reconstruct_config(
     cfg.insert("tie_word_embeddings".into(), json!(tied));
     if context > 0 {
         cfg.insert("max_position_embeddings".into(), json!(context));
+    }
+    // Special-token ids so the engine resolves stop tokens (`provider::eos_token_ids` reads
+    // `config.json`) and BOS without an external file.
+    if let Some(eos) = g.meta_u64("tokenizer.ggml.eos_token_id") {
+        cfg.insert("eos_token_id".into(), json!(eos as i64));
+    }
+    if let Some(bos) = g.meta_u64("tokenizer.ggml.bos_token_id") {
+        cfg.insert("bos_token_id".into(), json!(bos as i64));
     }
     if let Some(scaling) = reconstruct_rope_scaling(g, arch) {
         cfg.insert("rope_scaling".into(), scaling);
