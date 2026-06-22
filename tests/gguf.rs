@@ -29,7 +29,8 @@ use mlx_rs::Dtype;
 
 use mlx_llm::config::LlamaConfig;
 use mlx_llm::decode::{generate, CancelFlag, GenerationConfig};
-use mlx_llm::gguf::{convert_file, ConvertOptions};
+use mlx_llm::gguf::convert::remap_key;
+use mlx_llm::gguf::{convert_file, ConvertOptions, GgufFile};
 use mlx_llm::models::LlamaModel;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::{input_ids, QuantSpec, Weights};
@@ -349,4 +350,213 @@ fn gguf_dequant_matches_hf_weights() {
     }
     assert!(covered > 0, "no convertible GGUF found");
     assert!(failures.is_empty(), "dequant weight-parity failures:\n  {}", failures.join("\n  "));
+}
+
+/// Human name for a GGML quant tag (the sub-4-bit IQ grid types this story added, plus the
+/// neighbours that the unsloth dynamic mixes interleave).
+fn ggml_type_name(tag: u32) -> &'static str {
+    match tag {
+        0 => "F32",
+        1 => "F16",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        29 => "IQ1_M",
+        30 => "BF16",
+        _ => "other",
+    }
+}
+
+/// Per-GGML-type weight-parity for the sub-4-bit IQ grid codebooks (story 7250). Point
+/// `MLX_LLM_IQ_GGUF_DIR` at a directory of IQ `*.gguf` files (e.g. unsloth's `UD-IQ1_S/IQ1_M/
+/// IQ2_XXS/IQ2_M/IQ3_XXS` dynamic quants) for the model whose HF snapshot is `MLX_LLM_TEST_MODEL`:
+///
+/// ```text
+/// MLX_LLM_IQ_GGUF_DIR=/path/to/iq-ggufs MLX_LLM_TEST_MODEL=/tmp/qwen3-0.6b \
+///   cargo test --test gguf -- --ignored gguf_iq_dequant_matches_hf_by_type --nocapture
+/// ```
+///
+/// Unlike the per-file check above, this buckets every converted tensor's cosine-vs-HF by the
+/// tensor's *actual* GGML type (the dynamic quants interleave many IQ types per file), so each of
+/// the seven new grid types is validated directly. A correct grid decode reproduces each weight up
+/// to that type's (genuinely lossy, for the 1–3 bit types) quantization error — cosine well clear of
+/// zero; a wrong grid/sign unpack collapses the cosine toward 0 on exactly the tensors of that type.
+/// The floors are set per bit-width to cleanly separate "correctly lossy" from "broken".
+#[test]
+#[ignore = "needs MLX_LLM_IQ_GGUF_DIR + MLX_LLM_TEST_MODEL"]
+fn gguf_iq_dequant_matches_hf_by_type() {
+    let Ok(hf_dir) = std::env::var("MLX_LLM_TEST_MODEL") else {
+        eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        return;
+    };
+    let Ok(gguf_dir) = std::env::var("MLX_LLM_IQ_GGUF_DIR") else {
+        eprintln!("skip: set MLX_LLM_IQ_GGUF_DIR to a directory of IQ *.gguf files");
+        return;
+    };
+    let mut files: Vec<_> = std::fs::read_dir(&gguf_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gguf"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no *.gguf in MLX_LLM_IQ_GGUF_DIR");
+
+    let hf = Weights::from_dir(&hf_dir).unwrap();
+    let hf_f32: std::collections::HashMap<String, Vec<f32>> = hf
+        .keys()
+        .map(|k| (k.to_string(), hf.require(k).unwrap().as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec()))
+        .collect();
+
+    // type -> (count, sum_cos, min_cos, worst_key)
+    let mut by_type: std::collections::BTreeMap<&'static str, (usize, f32, f32, String)> =
+        std::collections::BTreeMap::new();
+
+    for path in &files {
+        let label = path.file_stem().unwrap().to_string_lossy().to_string();
+        // GGUF tensor name -> its GGML type, so a converted (HF-keyed) tensor can be bucketed.
+        let g = GgufFile::open(path).unwrap();
+        let mut hf_key_type: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for t in &g.tensors {
+            if let Some(hf_key) = remap_key(&t.name) {
+                hf_key_type.insert(hf_key, t.ggml_type);
+            }
+        }
+
+        let out = tmp_out(&format!("iqcos-{label}"));
+        let _report = convert_file(path, &out, ConvertOptions::default())
+            .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
+        let conv = Weights::from_dir(&out).unwrap();
+        for k in conv.keys() {
+            let Some(&tag) = hf_key_type.get(k) else { continue };
+            let av = hf_f32.get(k).unwrap_or_else(|| panic!("{label}: {k} absent from HF"));
+            let b = conv.require(k).unwrap().as_dtype(Dtype::Float32).unwrap();
+            let cos = cosine(av, b.as_slice::<f32>());
+            let name = ggml_type_name(tag);
+            let e = by_type.entry(name).or_insert((0, 0.0, f32::INFINITY, String::new()));
+            e.0 += 1;
+            e.1 += cos;
+            if cos < e.2 {
+                e.2 = cos;
+                e.3 = format!("{label}:{k}");
+            }
+        }
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    println!("{:>9}  {:>5}  {:>8}  {:>8}  worst-tensor", "type", "n", "min", "mean");
+    for (name, (n, sum, min, worst)) in &by_type {
+        println!("{name:>9}  {n:>5}  {min:>8.5}  {:>8.5}  {worst}", sum / *n as f32);
+    }
+
+    // Floors a *correct* (lossy) decode clears for each bit-width; a broken grid/sign unpack lands
+    // near 0 and trips them. The seven grid types this story added must all be present and pass.
+    // Calibrated on unsloth's Qwen3-0.6B dynamic quants (observed per-type worst-tensor cosine:
+    // IQ1_S 0.878, IQ1_M 0.892, IQ2_XXS 0.936, IQ2_XS 0.954, IQ2_S 0.964, IQ3_XXS 0.982, IQ3_S
+    // 0.980), with margin for model/recipe variation. A broken grid/sign unpack lands near 0.
+    let floor = |name: &str| -> f32 {
+        match name {
+            "IQ1_S" | "IQ1_M" => 0.60,
+            "IQ2_XXS" | "IQ2_XS" | "IQ2_S" => 0.80,
+            "IQ3_XXS" | "IQ3_S" => 0.88,
+            _ => 0.90, // Q2_K..Q6_K / IQ4_* neighbours in the dynamic mix
+        }
+    };
+    let required = ["IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M"];
+    let mut failures: Vec<String> = Vec::new();
+    for t in required {
+        match by_type.get(t) {
+            None => failures.push(format!("{t}: no tensors of this type found in the GGUF dir")),
+            Some((n, sum, min, worst)) => {
+                let f = floor(t);
+                if *min < f {
+                    failures.push(format!("{t}: worst tensor {worst} cosine {min:.5} < {f} (broken decode?)"));
+                }
+                let mean = sum / *n as f32;
+                if mean < f {
+                    failures.push(format!("{t}: mean cosine {mean:.5} < {f}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "IQ per-type dequant parity failures:\n  {}", failures.join("\n  "));
+}
+
+/// End-to-end: each IQ-quantized GGUF converts to a snapshot that loads and *runs* — the prefill
+/// produces all-finite logits (no NaN/Inf) and greedy generation yields non-empty text. This proves
+/// the IQ grids decode into a numerically-sound, runnable model end to end (convert → load → forward
+/// → sample), not just correlated weights.
+///
+/// It deliberately does **not** gate on a next-token-distribution match with HF. On a 0.6B base these
+/// 1.5–3 bpw quants are genuinely lossy, and softmax-cosine over the near-one-hot next-token
+/// distribution essentially measures top-1 agreement — which a correct-but-lossy decode legitimately
+/// shifts (e.g. the IQ3_XXS snapshot still generates "...the city of Paris..." while its first-token
+/// softmax-cosine sits near zero). So that metric can't separate "lossy" from "broken" here; the
+/// rigorous per-type correctness proof is `gguf_iq_dequant_matches_hf_by_type` (weight cosine ≈ 0.88
+/// for IQ1 up to ≈ 0.98 for IQ3 — a broken grid/sign unpack would instead collapse to ≈ 0). The
+/// probabilities-vs-HF cosine is still printed per file for human inspection.
+#[test]
+#[ignore = "needs MLX_LLM_IQ_GGUF_DIR + MLX_LLM_TEST_MODEL"]
+fn gguf_iq_snapshot_generates() {
+    let Some(r) = load_ref() else {
+        eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        return;
+    };
+    let Ok(gguf_dir) = std::env::var("MLX_LLM_IQ_GGUF_DIR") else {
+        eprintln!("skip: set MLX_LLM_IQ_GGUF_DIR");
+        return;
+    };
+    let mut files: Vec<_> = std::fs::read_dir(&gguf_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gguf"))
+        .filter(|p| {
+            let s = p.to_string_lossy().to_uppercase();
+            s.contains("IQ") && !s.contains("BF16") && !s.contains("F16") && !s.contains("IQ4")
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        eprintln!("skip: no IQ *.gguf in MLX_LLM_IQ_GGUF_DIR");
+        return;
+    }
+
+    let ids = encode(&r.tok, PROMPT);
+    let hf_probs = softmax(&prefill_logits(&r.model, &ids));
+
+    let mut covered = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for path in &files {
+        let label = path.file_stem().unwrap().to_string_lossy().to_string();
+        let out = tmp_out(&format!("iqgen-{label}"));
+        convert_file(path, &out, ConvertOptions::default()).unwrap();
+        let cfg = LlamaConfig::from_dir(&out).unwrap();
+        let model = LlamaModel::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
+        let logits = prefill_logits(&model, &ids);
+        let probcos = cosine(&softmax(&logits), &hf_probs);
+        let tokens = greedy_tokens(&model, &ids, &r.stop, 16);
+        let text = r.tok.decode(&tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
+        println!("{label:>34}: probcos {probcos:.4}  :: {}", text.replace('\n', " "));
+        // Runnability gates: finite logits (a numerically-broken decode would NaN/Inf) and non-empty
+        // generation. Correctness vs HF is asserted at the weight level in the companion test.
+        if !logits.iter().all(|v| v.is_finite()) {
+            failures.push(format!("{label}: prefill logits contain NaN/Inf"));
+        }
+        if text.trim().is_empty() {
+            failures.push(format!("{label}: produced no text"));
+        }
+        covered += 1;
+        std::fs::remove_dir_all(&out).ok();
+    }
+    assert!(covered > 0, "no IQ *.gguf found in MLX_LLM_IQ_GGUF_DIR");
+    assert!(failures.is_empty(), "IQ snapshot run failures:\n  {}", failures.join("\n  "));
 }
