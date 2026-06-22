@@ -4,19 +4,20 @@
 //! cargo run --release --example convert_gguf -- <model.gguf> <out_dir> [--quant q4|q8] [--tokenizer tokenizer.json]
 //! ```
 //!
-//! Writes `<out_dir>/config.json` and `<out_dir>/model.safetensors`. The weights are dequantized
-//! from the GGUF (F16/BF16, legacy `Q*_0/_1`, and the `Q2_K…Q6_K` k-quants) and remapped to the
-//! transformer key layout. `--quant q4|q8` re-quantizes the attention/MLP projections to MLX
+//! Writes `<out_dir>/config.json`, `<out_dir>/model.safetensors`, and — for the byte-level BPE
+//! tokenizer family — `<out_dir>/tokenizer.json` + `<out_dir>/tokenizer_config.json` reconstructed
+//! from the GGUF metadata, so the snapshot runs end-to-end with no external files. The weights are
+//! dequantized from the GGUF (F16/BF16, legacy `Q*_0/_1`, and the `Q2_K…Q6_K` k-quants) and remapped
+//! to the transformer key layout. `--quant q4|q8` re-quantizes the attention/MLP projections to MLX
 //! group-wise quantization (embeddings, LM head, and norms stay dense).
 //!
-//! A GGUF carries a llama.cpp tokenizer in its metadata, not a HF `tokenizer.json`, so the
-//! tokenizer is not reconstructed here. Pass `--tokenizer <path>` to copy a `tokenizer.json` (from
-//! the source model's HF repo) into the output directory so the snapshot runs end-to-end; without
-//! it the snapshot is weights + config only.
+//! If the GGUF uses a tokenizer kind that can't be reconstructed from its metadata (SentencePiece),
+//! the converter reports that and writes no `tokenizer.json`. Pass `--tokenizer <path>` to drop in a
+//! `tokenizer.json` from the source model's HF repo (it also overrides a reconstructed one).
 
 use std::path::Path;
 
-use mlx_llm::gguf::{convert_file, ConvertOptions};
+use mlx_llm::gguf::{convert_file, ConvertOptions, TokenizerStatus};
 use mlx_llm::primitives::QuantSpec;
 
 fn main() {
@@ -52,10 +53,16 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let report = convert_file(&gguf, &out_dir, ConvertOptions { quantize })?;
 
+    match &report.tokenizer {
+        TokenizerStatus::Reconstructed(kind) => println!("tokenizer: reconstructed {kind}"),
+        TokenizerStatus::Unsupported(reason) => println!("tokenizer: not reconstructed — {reason}"),
+        TokenizerStatus::Absent => println!("tokenizer: no tokenizer metadata in GGUF"),
+    }
+
     if let Some(tok) = tokenizer {
         let dst = Path::new(&out_dir).join("tokenizer.json");
         std::fs::copy(&tok, &dst)?;
-        println!("copied tokenizer -> {}", dst.display());
+        println!("copied tokenizer (override) -> {}", dst.display());
     }
 
     println!(
