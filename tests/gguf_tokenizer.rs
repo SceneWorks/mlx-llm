@@ -20,10 +20,10 @@
 
 use core_llm::Tokenizer;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, CancelFlag, GenerationConfig};
 use mlx_llm::gguf::{convert_file, ConvertOptions, TokenizerStatus};
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::provider::eos_token_ids;
@@ -130,8 +130,8 @@ fn gguf_bpe_snapshot_runs_self_contained() {
 
     // Full self-contained load: tokenizer + config + weights all from the converted directory.
     let tok = Tokenizer::from_file(out.join("tokenizer.json")).unwrap();
-    let cfg = LlamaConfig::from_dir(&out).unwrap();
-    let model = LlamaModel::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
+    let cfg = ModelConfig::from_dir(&out).unwrap();
+    let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
 
     let prompt = "The capital of France is";
     let ids: Vec<i32> = tok.encode(prompt, false).unwrap().into_iter().map(|x| x as i32).collect();

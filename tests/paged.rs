@@ -19,25 +19,25 @@
 
 use core_llm::Tokenizer;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, generate_with_cache, CancelFlag, GenerationConfig};
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::{BlockPool, PagedKvCache, Weights};
 
 const BLOCK_SIZE: usize = 8;
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
     max_ctx: i32,
 }
 
 fn load_from(env: &str) -> Option<Fixture> {
     let dir = std::env::var(env).ok()?;
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let max_ctx = cfg.max_position_embeddings;
-    let model = LlamaModel::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
+    let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some(Fixture { model, tok, max_ctx })
 }

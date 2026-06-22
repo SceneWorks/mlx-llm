@@ -27,11 +27,11 @@
 use core_llm::Tokenizer;
 use mlx_rs::Dtype;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, CancelFlag, GenerationConfig};
 use mlx_llm::gguf::convert::remap_key;
 use mlx_llm::gguf::{convert_file, ConvertOptions, GgufFile};
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::{input_ids, QuantSpec, Weights};
 use mlx_llm::provider::eos_token_ids;
@@ -39,16 +39,16 @@ use mlx_llm::provider::eos_token_ids;
 const PROMPT: &str = "The capital of France is";
 
 struct Ref {
-    model: LlamaModel,
-    cfg: LlamaConfig,
+    model: CausalLm,
+    cfg: ModelConfig,
     tok: Tokenizer,
     stop: Vec<i32>,
 }
 
 fn load_ref() -> Option<Ref> {
     let dir = std::env::var("MLX_LLM_TEST_MODEL").ok()?;
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
-    let model = LlamaModel::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg.clone()).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
+    let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg.clone()).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     let stop = eos_token_ids(std::path::Path::new(&dir));
     Some(Ref { model, cfg, tok, stop })
@@ -72,7 +72,7 @@ fn encode(tok: &Tokenizer, text: &str) -> Vec<i32> {
 }
 
 /// Last-position prefill logits as host `f32`.
-fn prefill_logits(model: &LlamaModel, ids: &[i32]) -> Vec<f32> {
+fn prefill_logits(model: &CausalLm, ids: &[i32]) -> Vec<f32> {
     let mut cache = model.new_cache();
     let arr = input_ids(ids);
     let logits = model.decode_logits(&arr, &mut cache, 0).unwrap();
@@ -109,7 +109,7 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-fn greedy_tokens(model: &LlamaModel, ids: &[i32], stop: &[i32], n: usize) -> Vec<i32> {
+fn greedy_tokens(model: &CausalLm, ids: &[i32], stop: &[i32], n: usize) -> Vec<i32> {
     let cfg = GenerationConfig {
         max_new_tokens: n,
         sampling: SamplingParams::default(),
@@ -166,7 +166,7 @@ fn gguf_dense_conversion_tracks_hf() {
             Err(e) => panic!("{label}: convert failed: {e}"),
         };
 
-        let cfg = LlamaConfig::from_dir(&out).unwrap();
+        let cfg = ModelConfig::from_dir(&out).unwrap();
         // Config reconstructed from GGUF metadata must equal the HF config's load-relevant fields.
         assert_eq!(cfg.hidden_size, r.cfg.hidden_size, "{label}: hidden_size");
         assert_eq!(cfg.num_layers, r.cfg.num_layers, "{label}: num_layers");
@@ -177,7 +177,7 @@ fn gguf_dense_conversion_tracks_hf() {
         assert_eq!(cfg.tie_word_embeddings, r.cfg.tie_word_embeddings, "{label}: tie");
         assert!(report.quantized.is_none(), "{label}: dense expected");
 
-        let model = LlamaModel::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
+        let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
         let logits = prefill_logits(&model, &ids);
         let probcos = cosine(&softmax(&logits), &hf_probs);
         let top1 = argmax(&logits);
@@ -255,10 +255,10 @@ fn gguf_requant_snapshot_loads_quantized() {
         let report = convert_file(src, &out, ConvertOptions { quantize: Some(spec) }).unwrap();
         assert_eq!(report.quantized, Some(spec));
 
-        let cfg = LlamaConfig::from_dir(&out).unwrap();
+        let cfg = ModelConfig::from_dir(&out).unwrap();
         assert_eq!(cfg.quantization, Some(spec), "{tag}: config carries quantization block");
 
-        let model = LlamaModel::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
+        let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
         assert!(model.is_quantized(), "{tag}: model loaded as quantized");
 
         let probcos = cosine(&softmax(&prefill_logits(&model, &ids)), &hf_probs);
@@ -539,8 +539,8 @@ fn gguf_iq_snapshot_generates() {
         let label = path.file_stem().unwrap().to_string_lossy().to_string();
         let out = tmp_out(&format!("iqgen-{label}"));
         convert_file(path, &out, ConvertOptions::default()).unwrap();
-        let cfg = LlamaConfig::from_dir(&out).unwrap();
-        let model = LlamaModel::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
+        let cfg = ModelConfig::from_dir(&out).unwrap();
+        let model = CausalLm::from_weights(&Weights::from_dir(&out).unwrap(), "", cfg).unwrap();
         let logits = prefill_logits(&model, &ids);
         let probcos = cosine(&softmax(&logits), &hf_probs);
         let tokens = greedy_tokens(&model, &ids, &r.stop, 16);

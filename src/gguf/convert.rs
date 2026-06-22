@@ -1,7 +1,7 @@
 //! GGUF → MLX snapshot conversion: remap keys, reconstruct config, write `{config.json,
 //! model.safetensors}`.
 //!
-//! The engine loads a Hugging Face-shaped snapshot ([`crate::models::LlamaModel::from_weights`]):
+//! The engine loads a Hugging Face-shaped snapshot ([`crate::models::CausalLm::from_weights`]):
 //! transformer-named weights in safetensors plus a `config.json`. A GGUF instead uses llama.cpp's
 //! `blk.{i}.attn_q.weight` naming, packs hyperparameters in its metadata table, and stores weights
 //! in GGML quant blocks. This module bridges the two: each tensor is dequantized to dense

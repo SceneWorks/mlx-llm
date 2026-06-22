@@ -12,7 +12,7 @@
 use mlx_rs::ops::{add, concatenate_axis};
 use mlx_rs::{Array, Dtype};
 
-use crate::config::LlamaConfig;
+use crate::config::ModelConfig;
 use crate::error::{Error, Result};
 use crate::primitives::attention::{sdpa, AttnMask};
 use crate::primitives::kv_cache::KvCache;
@@ -26,20 +26,20 @@ const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
 
 /// A loaded causal decoder.
 #[derive(Debug)]
-pub struct LlamaModel {
+pub struct CausalLm {
     embed_tokens: Array,
     layers: Vec<LlamaLayer>,
     norm: Array,
     lm_head: Array,
     rope: Rope,
-    cfg: LlamaConfig,
+    cfg: ModelConfig,
     quantized: bool,
 }
 
-impl LlamaModel {
+impl CausalLm {
     /// Build from a loaded checkpoint (dense). `prefix` is the weight-key prefix (`""` for a plain
     /// `*ForCausalLM`, e.g. `"language_model"` for a VLM-nested decoder).
-    pub fn from_weights(w: &Weights, prefix: &str, cfg: LlamaConfig) -> Result<Self> {
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: ModelConfig) -> Result<Self> {
         Self::from_weights_with(w, prefix, cfg, None)
     }
 
@@ -48,7 +48,7 @@ impl LlamaModel {
     pub fn from_weights_with(
         w: &Weights,
         prefix: &str,
-        cfg: LlamaConfig,
+        cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
         let p = |suffix: &str| join(prefix, suffix);
@@ -138,7 +138,7 @@ impl LlamaModel {
     }
 
     /// The model config.
-    pub fn config(&self) -> &LlamaConfig {
+    pub fn config(&self) -> &ModelConfig {
         &self.cfg
     }
 
@@ -153,7 +153,7 @@ impl LlamaModel {
     }
 
     /// A fresh single-sequence **paged** KV cache (story 7169) sized for this model, with
-    /// `block_size`-token blocks. A drop-in for [`LlamaModel::new_cache`] behind the
+    /// `block_size`-token blocks. A drop-in for [`CausalLm::new_cache`] behind the
     /// [`KvCache`] trait; pack concurrency as separate caches over one shared
     /// [`BlockPool`](crate::primitives::BlockPool).
     pub fn new_paged_cache(&self, block_size: usize) -> crate::primitives::PagedKvCache {
@@ -168,7 +168,7 @@ impl LlamaModel {
 
     /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions
     /// (row-major flat `positions`, length `rows * cols`) — the **per-sequence** position tables the
-    /// batched decode (story 7167) feeds [`LlamaModel::decode_logits_masked`]. Each is
+    /// batched decode (story 7167) feeds [`CausalLm::decode_logits_masked`]. Each is
     /// `[rows, cols, head_dim]` in the compute dtype.
     pub fn rope_tables(&self, positions: &[i32], rows: i32, cols: i32) -> Result<(Array, Array)> {
         let (cos, sin) = self.rope.cos_sin_at(positions, COMPUTE_DTYPE)?; // [1, rows*cols, head_dim]
@@ -194,7 +194,7 @@ impl LlamaModel {
         self.decode_logits_from_embeds(&embeds, cache, offset)
     }
 
-    /// Like [`LlamaModel::decode_logits`] but from pre-computed input embeddings — the hook the VLM
+    /// Like [`CausalLm::decode_logits`] but from pre-computed input embeddings — the hook the VLM
     /// path (story 7157) uses to splice image features before the decoder.
     pub fn decode_logits_from_embeds(
         &self,
@@ -260,11 +260,11 @@ impl LlamaModel {
     /// construction, since each sequence sits at its own cache offset). Returns the **last column**
     /// logits `[batch, vocab]`.
     ///
-    /// Unlike [`LlamaModel::decode_logits`] run per row, the **batched** projections here are not
+    /// Unlike [`CausalLm::decode_logits`] run per row, the **batched** projections here are not
     /// bit-identical to the batch-1 logits: MLX's batched matmul is not row-invariant, so a row
     /// tracks its batch-1 run only to sub-ULP (the documented Throughput-mode tradeoff — it buys the
     /// weight-read amortization that scales throughput with occupancy). The bit-exact continuous path
-    /// runs each sequence through [`LlamaModel::decode_logits`] on its own cache instead.
+    /// runs each sequence through [`CausalLm::decode_logits`] on its own cache instead.
     pub fn decode_logits_per_seq(
         &self,
         input_ids: &Array,
@@ -326,7 +326,7 @@ impl LlamaModel {
     }
 }
 
-impl crate::decode::Decode for LlamaModel {
+impl crate::decode::Decode for CausalLm {
     fn make_cache(&self) -> Box<dyn KvCache> {
         Box::new(self.new_cache())
     }
@@ -465,7 +465,7 @@ impl LlamaAttention {
     ///
     /// Attention is the only step that loops; the projections, MLP, and lm_head around it stay
     /// batched, which is where the throughput comes from. (The matmul batching is also why the
-    /// surrounding logits only *track* batch-1 to sub-ULP — see [`LlamaModel::decode_logits_per_seq`].)
+    /// surrounding logits only *track* batch-1 to sub-ULP — see [`CausalLm::decode_logits_per_seq`].)
     fn forward_per_seq(
         &self,
         x: &Array,

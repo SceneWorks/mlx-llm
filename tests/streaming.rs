@@ -9,15 +9,15 @@ use std::collections::HashMap;
 
 use mlx_rs::Array;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, CancelFlag, Decode, FinishReason, GenerationConfig, StreamEvent};
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::{SamplingParams, SplitMix64, TokenRng};
 use mlx_llm::primitives::Weights;
 
 /// Tiny but structurally complete config: hidden = num_heads * head_dim, GQA (2 q heads, 1 kv head).
-fn tiny_config() -> LlamaConfig {
-    LlamaConfig {
+fn tiny_config() -> ModelConfig {
+    ModelConfig {
         hidden_size: 8,
         intermediate_size: 16,
         num_layers: 2,
@@ -42,7 +42,7 @@ fn randn(shape: &[i32], rng: &mut SplitMix64) -> Array {
 }
 
 /// Build a complete set of weights for `tiny_config` — also exercises `from_weights` key handling.
-fn tiny_model(cfg: &LlamaConfig) -> LlamaModel {
+fn tiny_model(cfg: &ModelConfig) -> CausalLm {
     let mut rng = SplitMix64::new(0xC0FFEE);
     let h = cfg.hidden_size;
     let v = cfg.vocab_size;
@@ -71,7 +71,7 @@ fn tiny_model(cfg: &LlamaConfig) -> LlamaModel {
     }
 
     let w = Weights::from_map(m);
-    LlamaModel::from_weights(&w, "", cfg.clone()).unwrap()
+    CausalLm::from_weights(&w, "", cfg.clone()).unwrap()
 }
 
 fn greedy(max_new_tokens: usize) -> GenerationConfig {

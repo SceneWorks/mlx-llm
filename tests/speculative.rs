@@ -18,25 +18,25 @@
 
 use core_llm::Tokenizer;
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{
     generate, generate_draft_speculative, generate_prompt_lookup, CancelFlag, GenerationConfig,
     SpeculativeConfig,
 };
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::projection::QuantSpec;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 
 struct Fixture {
-    model: LlamaModel,
+    model: CausalLm,
     tok: Tokenizer,
 }
 
 fn load_from(env: &str) -> Option<Fixture> {
     let dir = std::env::var(env).ok()?;
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
-    let model = LlamaModel::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
+    let model = CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some(Fixture { model, tok })
 }
@@ -119,18 +119,18 @@ fn run_suite(fx: Fixture) {
 /// Load a dense **target** and a Q4-quantized **draft** from the same snapshot — vocab-compatible by
 /// construction, with the Q4 draft a faster, lossy approximation that yields genuine partial
 /// acceptance.
-fn load_draft_target(env: &str) -> Option<(LlamaModel, LlamaModel, Tokenizer)> {
+fn load_draft_target(env: &str) -> Option<(CausalLm, CausalLm, Tokenizer)> {
     let dir = std::env::var(env).ok()?;
     let w = Weights::from_dir(&dir).unwrap();
-    let target = LlamaModel::from_weights(&w, "", LlamaConfig::from_dir(&dir).unwrap()).unwrap();
+    let target = CausalLm::from_weights(&w, "", ModelConfig::from_dir(&dir).unwrap()).unwrap();
     let draft =
-        LlamaModel::from_weights_with(&w, "", LlamaConfig::from_dir(&dir).unwrap(), Some(QuantSpec::q4()))
+        CausalLm::from_weights_with(&w, "", ModelConfig::from_dir(&dir).unwrap(), Some(QuantSpec::q4()))
             .unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some((target, draft, tok))
 }
 
-fn run_draft_suite(target: LlamaModel, draft: LlamaModel, tok: Tokenizer) {
+fn run_draft_suite(target: CausalLm, draft: CausalLm, tok: Tokenizer) {
     // ---- Exactness gate: num_draft = 0 ⇒ identical to non-speculative target decoding. ----
     let no_draft = SpeculativeConfig { max_ngram: 3, num_draft: 0 };
     for text in ["The capital of France is", "Q: What is 2+2? A:"] {

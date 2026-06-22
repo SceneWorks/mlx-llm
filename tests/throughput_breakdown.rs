@@ -1,7 +1,7 @@
 //! Throughput-mode "where does the step time go" breakdown (story 7325, `#[ignore]` — needs a model).
 //!
 //! Answers the sc-7325 measurement deliverable: at occupancy `N` × context `L`, how is a
-//! **Throughput-mode** decode step ([`LlamaModel::decode_logits_per_seq`]) split between the batched
+//! **Throughput-mode** decode step ([`CausalLm::decode_logits_per_seq`]) split between the batched
 //! matmuls (projections / MLP / lm_head) and the **per-sequence attention loop** (`N × (gather +
 //! SDPA)` per layer, [`LlamaAttention::forward_per_seq`]) — and, within the attention loop, how much
 //! is the **real per-step paged gather** vs SDPA.
@@ -39,8 +39,8 @@ use mlx_rs::random::normal;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
-use mlx_llm::config::LlamaConfig;
-use mlx_llm::models::LlamaModel;
+use mlx_llm::config::ModelConfig;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::attention::{sdpa, AttnMask};
 use mlx_llm::primitives::{BlockPool, KvCache, PagedKvCache, Weights};
 
@@ -63,10 +63,10 @@ const MLX_CACHE_LIMIT: usize = 2 * 1024 * 1024 * 1024;
 /// Skip (and log) any `(N, L)` cell whose estimated resident KV exceeds this, rather than risk the OS.
 const KV_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
-fn load(env: &str) -> Option<LlamaModel> {
+fn load(env: &str) -> Option<CausalLm> {
     let dir = std::env::var(env).ok()?;
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
-    Some(LlamaModel::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap())
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
+    Some(CausalLm::from_weights(&Weights::from_dir(&dir).unwrap(), "", cfg).unwrap())
 }
 
 /// A bf16 random tensor of the given shape (values are irrelevant — timing is shape/length driven).
@@ -81,7 +81,7 @@ fn synth(shape: &[i32]) -> Array {
 /// KV. Growth uses one `update` per layer with an `l`-token chunk (same block-freeze structure `l`
 /// real decode steps would produce), and evals each cache's gather so the block tensors are
 /// materialized now — not charged to the first timed step.
-fn grown_caches(cfg: &LlamaConfig, n: usize, l: usize) -> Vec<PagedKvCache> {
+fn grown_caches(cfg: &ModelConfig, n: usize, l: usize) -> Vec<PagedKvCache> {
     let pool = BlockPool::new(BLOCK);
     let (kvh, hd) = (cfg.num_kv_heads, cfg.head_dim);
     let mut caches: Vec<PagedKvCache> =
@@ -112,7 +112,7 @@ fn timed(mut f: impl FnMut()) -> f64 {
 }
 
 /// One real Throughput decode step over all `caches` (`decode_logits_per_seq`, evaluated).
-fn full_step(model: &LlamaModel, caches: &mut [PagedKvCache], ids: &Array) {
+fn full_step(model: &CausalLm, caches: &mut [PagedKvCache], ids: &Array) {
     let positions: Vec<i32> = caches.iter().map(|c| c.offset()).collect();
     let mut refs: Vec<&mut PagedKvCache> = caches.iter_mut().collect();
     let logits = model.decode_logits_per_seq(ids, &mut refs, &positions).unwrap();
@@ -121,7 +121,7 @@ fn full_step(model: &LlamaModel, caches: &mut [PagedKvCache], ids: &Array) {
 
 /// The cache work of one step: `update` (append + the real paged gather) for every layer × sequence,
 /// mirroring `forward_per_seq`'s layer-outer / sequence-inner loop. The gathered K/V are evaluated.
-fn gather_step(caches: &mut [PagedKvCache], cfg: &LlamaConfig, k1: &Array, v1: &Array) {
+fn gather_step(caches: &mut [PagedKvCache], cfg: &ModelConfig, k1: &Array, v1: &Array) {
     let mut outs = Vec::with_capacity(cfg.num_layers * caches.len() * 2);
     for layer in 0..cfg.num_layers {
         for c in caches.iter_mut() {
@@ -145,7 +145,7 @@ fn sdpa_step(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize, n: usiz
 }
 
 /// Estimated resident KV bytes for `N` per-sequence bf16 caches at length `l` (k+v, all layers).
-fn kv_bytes(cfg: &LlamaConfig, n: usize, l: usize) -> usize {
+fn kv_bytes(cfg: &ModelConfig, n: usize, l: usize) -> usize {
     n * cfg.num_layers * 2 * cfg.num_kv_heads as usize * l * cfg.head_dim as usize * 2
 }
 
@@ -161,7 +161,7 @@ fn fit(xs: &[f64], ys: &[f64]) -> (f64, f64) {
 }
 
 /// Run and print the full breakdown for one loaded model.
-fn breakdown(name: &str, model: &LlamaModel) {
+fn breakdown(name: &str, model: &CausalLm) {
     // Memory safety: cap MLX's backpressure limit and keep the buffer cache small so freed KV
     // returns to the OS between cells (the unbounded version let it climb until the Mac fell over).
     memory::set_memory_limit(MLX_MEMORY_LIMIT);

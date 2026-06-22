@@ -60,13 +60,13 @@ curl -N http://localhost:8080/v1/chat/completions -H 'content-type: application/
 ```
 
 ```rust
-use mlx_llm::config::LlamaConfig;
-use mlx_llm::models::LlamaModel;
+use mlx_llm::config::ModelConfig;
+use mlx_llm::models::CausalLm;
 use mlx_llm::decode::{generate, CancelFlag, GenerationConfig, StreamEvent};
 use mlx_llm::primitives::Weights;
 
-let cfg = LlamaConfig::from_dir(dir)?;
-let model = LlamaModel::from_weights(&Weights::from_dir(dir)?, "", cfg)?;
+let cfg = ModelConfig::from_dir(dir)?;
+let model = CausalLm::from_weights(&Weights::from_dir(dir)?, "", cfg)?;
 
 let mut out_ids = Vec::new();
 generate(&model, &prompt_ids, &GenerationConfig::default(), &CancelFlag::new(), &mut |ev| {

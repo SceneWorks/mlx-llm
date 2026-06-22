@@ -14,9 +14,9 @@ use core_llm::{
     load_textllm, LoadSpec, Message, Sampling, StreamEvent as CoreEvent, TextLlmRequest, Tokenizer,
 };
 
-use mlx_llm::config::LlamaConfig;
+use mlx_llm::config::ModelConfig;
 use mlx_llm::decode::{generate, CancelFlag, FinishReason, GenerationConfig, StreamEvent};
-use mlx_llm::models::LlamaModel;
+use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::primitives::Weights;
 use mlx_llm::provider::PROVIDER_ID;
@@ -29,9 +29,9 @@ fn model_dir() -> Option<String> {
 #[ignore = "needs a real Llama snapshot via MLX_LLM_TEST_MODEL"]
 fn streams_text_from_snapshot() {
     let dir = model_dir().expect("set MLX_LLM_TEST_MODEL");
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let weights = Weights::from_dir(&dir).unwrap();
-    let model = LlamaModel::from_weights(&weights, "", cfg).unwrap();
+    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
 
     let prompt_ids: Vec<i32> = tok
@@ -69,9 +69,9 @@ fn streams_text_from_snapshot() {
 #[ignore = "needs a real Llama snapshot via MLX_LLM_TEST_MODEL"]
 fn mid_stream_cancel_on_real_model() {
     let dir = model_dir().expect("set MLX_LLM_TEST_MODEL");
-    let cfg = LlamaConfig::from_dir(&dir).unwrap();
+    let cfg = ModelConfig::from_dir(&dir).unwrap();
     let weights = Weights::from_dir(&dir).unwrap();
-    let model = LlamaModel::from_weights(&weights, "", cfg).unwrap();
+    let model = CausalLm::from_weights(&weights, "", cfg).unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     let prompt_ids: Vec<i32> = tok
         .encode("Write a long story about a robot:", true)

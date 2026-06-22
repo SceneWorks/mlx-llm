@@ -5,7 +5,7 @@
 //! vision tower ([`crate::models::SiglipVisionTower`]) encodes the image, a two-layer GELU MLP
 //! projector lifts the penultimate-layer patch features into the language hidden size, those 729
 //! projected rows replace the expanded image-token placeholders in the prompt embeddings, and a
-//! Llama-3.1 8B decoder ([`crate::models::LlamaModel`], reused as-is) generates the caption.
+//! Llama-3.1 8B decoder ([`crate::models::CausalLm`], reused as-is) generates the caption.
 //!
 //! Only the **model** lives here — the vision tower, projector, image splice, the model's LLaVA
 //! chat-input format, and generation (repetition penalty + stop tokens + cancellation). The
@@ -27,12 +27,12 @@ use core_llm::{
     TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
-use crate::config::LlamaConfig;
+use crate::config::ModelConfig;
 use crate::decode::{CancelFlag, FinishReason};
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
-use crate::models::LlamaModel;
+use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, linear};
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 use crate::primitives::{input_ids, Weights};
@@ -195,7 +195,7 @@ pub struct JoyGeneration {
 pub struct JoyCaptionModel {
     vision: SiglipVisionTower,
     projector: LlavaProjector,
-    language: LlamaModel,
+    language: CausalLm,
     processor: SiglipImageProcessor,
 }
 
@@ -210,10 +210,10 @@ impl JoyCaptionModel {
         let tc = v
             .get("text_config")
             .ok_or_else(|| Error::Config("joycaption: config.json has no text_config".into()))?;
-        let llama_cfg = LlamaConfig::from_json(tc)?;
+        let llama_cfg = ModelConfig::from_json(tc)?;
 
         let w = Weights::from_dir(dir)?;
-        let language = LlamaModel::from_weights(&w, "language_model", llama_cfg)?;
+        let language = CausalLm::from_weights(&w, "language_model", llama_cfg)?;
         let vision =
             SiglipVisionTower::from_weights(&w, "vision_tower.vision_model", SiglipVisionConfig::default())?;
         let projector = LlavaProjector::from_weights(&w, "multi_modal_projector")?;
@@ -226,7 +226,7 @@ impl JoyCaptionModel {
     }
 
     /// The language config.
-    pub fn language_config(&self) -> &LlamaConfig {
+    pub fn language_config(&self) -> &ModelConfig {
         self.language.config()
     }
 
