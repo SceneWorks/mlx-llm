@@ -117,7 +117,7 @@ fn run_suite(fx: Fixture) {
     assert_eq!(out1, cold1, "paged seq 1 must match its cold run");
 
     // Sequence 2 adopts seq 1's whole system-prefix blocks (no recompute, no copy).
-    let shared = c1.shareable_prefix_blocks(sys.len());
+    let shared = c1.shareable_prefix_blocks(sys.len()).unwrap();
     let shared_tokens = shared.len() * BLOCK_SIZE;
     assert!(!shared.is_empty(), "the system prefix should span at least one block");
     let mut c2 = PagedKvCache::new_seeded(pool.clone(), fx.model.config().num_layers, &shared);

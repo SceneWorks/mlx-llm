@@ -186,8 +186,9 @@ fn breakdown(name: &str, model: &LlamaModel) {
         );
         let (mut ls, mut ts) = (Vec::new(), Vec::new());
         for &l in LS {
-            // Footprint guard: never allocate a cell that could threaten the OS. ×2 because the
-            // frozen-blocks concat (sc-7325) now persists a contiguous copy alongside the blocks.
+            // Footprint guard: never allocate a cell that could threaten the OS. ×2 as a safe ceiling
+            // for the ~1× resident frozen KV (sc-7363 dropped the sc-7325 duplicate) plus the
+            // transient per-step gather it sits beside.
             let est = 2 * kv_bytes(cfg, n, l);
             if est > KV_BUDGET_BYTES {
                 println!("    {l:>5} | SKIPPED — est resident {:.1} GB > {:.0} GB budget", est as f64 / 1e9, KV_BUDGET_BYTES as f64 / 1e9);
