@@ -7,18 +7,24 @@
 //! reconstructs to the same floats the GPU would compute against.
 //!
 //! Supported: `F32`, `F16`, `BF16`, legacy `Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_0`, k-quants
-//! `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, and the non-linear 4-bit `IQ4_NL`/`IQ4_XS` (a fixed 16-entry
-//! codebook — common in real `Q2_K`/`Q3_K_M`/`IQ4_XS` builds, which mix it in). That covers every
-//! tensor type a standard Llama/Qwen GGUF is built from. The sub-4-bit importance-matrix `IQ*` types
-//! (`IQ1_*`/`IQ2_*`/`IQ3_*` — grid codebooks needing an imatrix) are **not** handled:
-//! [`tensor_byte_len`]/[`dequantize`] return [`Error::Unsupported`] for them rather than mis-convert.
+//! `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, the non-linear 4-bit `IQ4_NL`/`IQ4_XS` (a fixed 16-entry
+//! codebook — common in real `Q2_K`/`Q3_K_M`/`IQ4_XS` builds, which mix it in), and the sub-4-bit
+//! importance-matrix grid-codebook types `IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ1_S`/`IQ1_M`
+//! (story 7250). The IQ grid/sign tables live in [`super::iq_grids`]; the imatrix only shaped the
+//! original quantization, so dequant is self-contained — no importance matrix is needed to decode.
+//! Every quant type a standard Llama/Qwen GGUF is built from now converts.
 
 use crate::error::{Error, Result};
+use crate::gguf::iq_grids::{
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS,
+};
 
 /// `QK_K` — elements per k-quant super-block.
 const QK_K: usize = 256;
 /// Elements per legacy (`Q*_0`/`Q*_1`/`Q8_0`) block.
 const QK: usize = 32;
+/// The grid-offset bias added to each IQ1 codebook value (llama.cpp `IQ1S_DELTA`).
+const IQ1S_DELTA: f32 = 0.125;
 
 /// A recognized GGML tensor type with its block geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +57,20 @@ pub enum GgmlType {
     Iq4Nl,
     /// Non-linear 4-bit k-quant super-block, fixed codebook (tag 23).
     Iq4Xs,
+    /// 2.06-bpw imatrix grid codebook, packed scale in `qs` (tag 16).
+    Iq2Xxs,
+    /// 2.31-bpw imatrix grid codebook, per-sub-block scales (tag 17).
+    Iq2Xs,
+    /// 2.56-bpw imatrix grid codebook, high-bit + sign bytes + scales (tag 22).
+    Iq2S,
+    /// 3.06-bpw imatrix grid codebook, packed scale+signs in `qs` (tag 18).
+    Iq3Xxs,
+    /// 3.44-bpw imatrix grid codebook, high-bit + sign bytes + scales (tag 21).
+    Iq3S,
+    /// 1.56-bpw imatrix grid codebook, signed grid + per-sub-block scale/delta (tag 19).
+    Iq1S,
+    /// 1.75-bpw imatrix grid codebook, f16 scale packed across `scales` nibbles (tag 29).
+    Iq1M,
     /// bfloat16 (tag 30).
     BF16,
 }
@@ -76,15 +96,16 @@ impl GgmlType {
             12 => GgmlType::Q4K,
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
+            16 => GgmlType::Iq2Xxs,
+            17 => GgmlType::Iq2Xs,
+            18 => GgmlType::Iq3Xxs,
+            19 => GgmlType::Iq1S,
             20 => GgmlType::Iq4Nl,
+            21 => GgmlType::Iq3S,
+            22 => GgmlType::Iq2S,
             23 => GgmlType::Iq4Xs,
+            29 => GgmlType::Iq1M,
             30 => GgmlType::BF16,
-            16..=19 | 21 | 22 | 29 => {
-                return Err(Error::Unsupported(format!(
-                    "GGUF type tag {tag} (sub-4-bit IQ importance-matrix quant — not supported; \
-                     reconvert with a Q4_K_M/Q5_K_M/Q6_K/Q8_0/IQ4_XS/F16 quantization)"
-                )))
-            }
             other => {
                 return Err(Error::Unsupported(format!("GGUF type tag {other}")))
             }
@@ -108,6 +129,13 @@ impl GgmlType {
             GgmlType::Q6K => (QK_K, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2), // ql + qh + scales + d = 210
             GgmlType::Iq4Nl => (QK, 2 + QK / 2),                 // d + qs = 18
             GgmlType::Iq4Xs => (QK_K, 2 + 2 + QK_K / 64 + QK_K / 2), // d + scales_h + scales_l + qs = 136
+            GgmlType::Iq2Xxs => (QK_K, 2 + QK_K / 8 * 2),        // d + qs(u16) = 66
+            GgmlType::Iq2Xs => (QK_K, 2 + QK_K / 8 * 2 + QK_K / 32), // d + qs(u16) + scales = 74
+            GgmlType::Iq2S => (QK_K, 2 + QK_K / 4 + QK_K / 32 + QK_K / 32), // d + qs + qh + scales = 82
+            GgmlType::Iq3Xxs => (QK_K, 2 + 3 * (QK_K / 8)),      // d + qs(grid+signs) = 98
+            GgmlType::Iq3S => (QK_K, 2 + QK_K / 4 + QK_K / 32 + QK_K / 8 + QK_K / 64), // d+qs+qh+signs+scales = 110
+            GgmlType::Iq1S => (QK_K, 2 + QK_K / 8 + QK_K / 32 * 2), // d + qs + qh(u16) = 50
+            GgmlType::Iq1M => (QK_K, QK_K / 8 + QK_K / 16 + QK_K / 32), // qs + qh + scales = 56 (scale packed in scales)
         }
     }
 }
@@ -170,6 +198,13 @@ pub fn dequantize(tag: u32, data: &[u8], num_elements: usize) -> Result<Vec<f32>
         GgmlType::Q6K => blocks(data, &mut out, be, bb, dequant_q6_k),
         GgmlType::Iq4Nl => blocks(data, &mut out, be, bb, dequant_iq4_nl),
         GgmlType::Iq4Xs => blocks(data, &mut out, be, bb, dequant_iq4_xs),
+        GgmlType::Iq2Xxs => blocks(data, &mut out, be, bb, dequant_iq2_xxs),
+        GgmlType::Iq2Xs => blocks(data, &mut out, be, bb, dequant_iq2_xs),
+        GgmlType::Iq2S => blocks(data, &mut out, be, bb, dequant_iq2_s),
+        GgmlType::Iq3Xxs => blocks(data, &mut out, be, bb, dequant_iq3_xxs),
+        GgmlType::Iq3S => blocks(data, &mut out, be, bb, dequant_iq3_s),
+        GgmlType::Iq1S => blocks(data, &mut out, be, bb, dequant_iq1_s),
+        GgmlType::Iq1M => blocks(data, &mut out, be, bb, dequant_iq1_m),
     }
     Ok(out)
 }
@@ -461,6 +496,228 @@ fn dequant_iq4_xs(b: &[u8], y: &mut [f32]) {
     }
 }
 
+// ----- sub-4-bit importance-matrix grid-codebook quants (IQ1/IQ2/IQ3) -----
+//
+// These mirror llama.cpp's `dequantize_row_iq*` (`ggml-quants.c`). Each 256-element super-block is
+// decoded as 8 sub-blocks of 32; a grid index selects a codebook point (8 packed bytes for the
+// `u64` grids, 4 for the `u32` grids) and a sign byte from `KSIGNS_IQ2XS` flips per-element signs
+// via `KMASK_IQ2XS`. Grid bytes are unsigned magnitudes for IQ2/IQ3 and signed values for IQ1
+// (exactly the `const uint8_t *` vs `const int8_t *` cast llama.cpp uses). The imatrix that guided
+// the original quantization is not needed here — decode is fully determined by the stored bits.
+
+/// Sign multiplier for output lane `j` given a `KSIGNS_IQ2XS` byte: `-1` where the masked bit is set.
+#[inline]
+fn sign(signs: u8, j: usize) -> f32 {
+    if signs & KMASK_IQ2XS[j] != 0 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// IQ2_XXS (tag 16): `d` + 32×`u16` `qs`. Each 32-block reads two `u32` from `qs`: the first holds
+/// four 8-bit grid indices, the second packs the 4-bit block scale (top nibble) and four 7-bit sign
+/// indices.
+fn dequant_iq2_xxs(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    let mut yi = 0usize;
+    for ib32 in 0..QK_K / 32 {
+        let off = 2 + 8 * ib32;
+        let aux0 = u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let aux1 = u32::from_le_bytes(b[off + 4..off + 8].try_into().unwrap());
+        let db = d * (0.5 + (aux1 >> 28) as f32) * 0.25;
+        let idx = aux0.to_le_bytes();
+        for l in 0..4 {
+            let grid = IQ2XXS_GRID[idx[l] as usize].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
+            for j in 0..8 {
+                y[yi + j] = db * grid[j] as f32 * sign(signs, j);
+            }
+            yi += 8;
+        }
+    }
+}
+
+/// IQ2_XS (tag 17): `d` + 32×`u16` `qs` + 8 `scales`. Each `qs` entry is a 9-bit grid index plus a
+/// 7-bit sign index; the per-sub-block scale comes from the `scales` nibbles.
+fn dequant_iq2_xs(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    let scales = &b[66..74];
+    let mut yi = 0usize;
+    for (ib32, &sc) in scales.iter().enumerate() {
+        let db = [
+            d * (0.5 + (sc & 0xf) as f32) * 0.25,
+            d * (0.5 + (sc >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let qoff = 2 + 2 * (4 * ib32 + l);
+            let q = u16::from_le_bytes([b[qoff], b[qoff + 1]]);
+            let grid = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[(q >> 9) as usize];
+            let dl = db[l / 2];
+            for j in 0..8 {
+                y[yi + j] = dl * grid[j] as f32 * sign(signs, j);
+            }
+            yi += 8;
+        }
+    }
+}
+
+/// IQ2_S (tag 22): `d` + 64 `qs` (32 grid-low bytes then 32 sign bytes) + 8 `qh` (grid high bits) +
+/// 8 `scales`.
+fn dequant_iq2_s(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    let qs = &b[2..66]; // first 32 = grid-low, next 32 = signs
+    let qh = &b[66..74];
+    let scales = &b[74..82];
+    let mut yi = 0usize;
+    for ib32 in 0..QK_K / 32 {
+        let sc = scales[ib32];
+        let db = [
+            d * (0.5 + (sc & 0xf) as f32) * 0.25,
+            d * (0.5 + (sc >> 4) as f32) * 0.25,
+        ];
+        for l in 0..4 {
+            let idx = qs[4 * ib32 + l] as usize | (((qh[ib32] as usize) << (8 - 2 * l)) & 0x300);
+            let grid = IQ2S_GRID[idx].to_le_bytes();
+            let signs = qs[32 + 4 * ib32 + l];
+            let dl = db[l / 2];
+            for j in 0..8 {
+                y[yi + j] = dl * grid[j] as f32 * sign(signs, j);
+            }
+            yi += 8;
+        }
+    }
+}
+
+/// IQ3_XXS (tag 18): `d` + 96 `qs` (64 grid-index bytes then 32 scale+sign bytes). Each 32-block
+/// reads a `u32` of scale (top nibble) and four 7-bit sign indices, and eight 8-bit grid indices
+/// (each grid point is 4 bytes).
+fn dequant_iq3_xxs(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    let ss = &b[66..98]; // scales_and_signs: one u32 per 32-block
+    let mut yi = 0usize;
+    for ib32 in 0..QK_K / 32 {
+        let aux = u32::from_le_bytes(ss[4 * ib32..4 * ib32 + 4].try_into().unwrap());
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+        let qbase = 2 + 8 * ib32;
+        for l in 0..4 {
+            let g1 = IQ3XXS_GRID[b[qbase + 2 * l] as usize].to_le_bytes();
+            let g2 = IQ3XXS_GRID[b[qbase + 2 * l + 1] as usize].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+            for j in 0..4 {
+                y[yi + j] = db * g1[j] as f32 * sign(signs, j);
+                y[yi + j + 4] = db * g2[j] as f32 * sign(signs, j + 4);
+            }
+            yi += 8;
+        }
+    }
+}
+
+/// IQ3_S (tag 21): `d` + 64 `qs` + 8 `qh` (one grid high-bit per 32-block, two per `step`) + 32
+/// `signs` + 4 `scales` (two 4-bit scales each). Grid points are 4 bytes (`u32` grid).
+fn dequant_iq3_s(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    let qh = &b[66..74];
+    let signs = &b[74..106];
+    let scales = &b[106..110];
+    let mut yi = 0usize;
+    // Process 32-blocks in pairs (matching llama.cpp's `ib32 += 2`): the low scale nibble + qh byte
+    // drive the first block, the high nibble + next qh byte the second.
+    for k in 0..QK_K / 64 {
+        let sc = scales[k];
+        let db1 = d * (1 + 2 * (sc & 0xf) as i32) as f32;
+        let db2 = d * (1 + 2 * (sc >> 4) as i32) as f32;
+        for (half, (db, qhb)) in [(db1, qh[2 * k] as u32), (db2, qh[2 * k + 1] as u32)]
+            .into_iter()
+            .enumerate()
+        {
+            let qbase = 2 + 16 * k + 8 * half;
+            let sbase = 8 * k + 4 * half;
+            for l in 0..4 {
+                let i1 = b[qbase + 2 * l] as usize | (((qhb << (8 - 2 * l)) & 256) as usize);
+                let i2 = b[qbase + 2 * l + 1] as usize | (((qhb << (7 - 2 * l)) & 256) as usize);
+                let g1 = IQ3S_GRID[i1].to_le_bytes();
+                let g2 = IQ3S_GRID[i2].to_le_bytes();
+                let s = signs[sbase + l];
+                for j in 0..4 {
+                    y[yi + j] = db * g1[j] as f32 * sign(s, j);
+                    y[yi + j + 4] = db * g2[j] as f32 * sign(s, j + 4);
+                }
+                yi += 8;
+            }
+        }
+    }
+}
+
+/// IQ1_S (tag 19): `d` + 32 `qs` + 8 `u16` `qh`. The grid is **signed**; each sub-block has a 3-bit
+/// scale and a sign-selected `±IQ1S_DELTA` grid offset, both packed in `qh`.
+fn dequant_iq1_s(b: &[u8], y: &mut [f32]) {
+    let d = rd_f16(b, 0);
+    let qs = &b[2..34];
+    let qh = &b[34..50];
+    let mut yi = 0usize;
+    for ib in 0..QK_K / 32 {
+        let h = u16::from_le_bytes([qh[2 * ib], qh[2 * ib + 1]]);
+        let dl = d * (2 * ((h >> 12) & 7) + 1) as f32;
+        let delta = if h & 0x8000 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+        for l in 0..4 {
+            let idx = qs[4 * ib + l] as usize | ((((h >> (3 * l)) & 7) as usize) << 8);
+            let grid = IQ1S_GRID[idx].to_le_bytes();
+            for j in 0..8 {
+                y[yi + j] = dl * ((grid[j] as i8) as f32 + delta);
+            }
+            yi += 8;
+        }
+    }
+}
+
+/// IQ1_M (tag 29): 32 `qs` + 16 `qh` + 8 `scales`. Unlike the others there is **no per-block `d`** —
+/// the f16 super-block scale is reassembled from the top nibbles of the four `u16` `scales` words,
+/// and each `scales` word also carries four 3-bit sub-scales. Grid is signed, shared with IQ1_S.
+fn dequant_iq1_m(b: &[u8], y: &mut [f32]) {
+    let qs = &b[0..32];
+    let qh = &b[32..48];
+    let sc = [
+        u16::from_le_bytes([b[48], b[49]]),
+        u16::from_le_bytes([b[50], b[51]]),
+        u16::from_le_bytes([b[52], b[53]]),
+        u16::from_le_bytes([b[54], b[55]]),
+    ];
+    let scale_bits =
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    let d = half::f16::from_bits(scale_bits).to_f32();
+    let mut yi = 0usize;
+    for ib in 0..QK_K / 32 {
+        let w = sc[ib / 2];
+        let shift = 6 * (ib % 2);
+        let dl1 = d * (2 * ((w >> shift) & 0x7) + 1) as f32;
+        let dl2 = d * (2 * ((w >> (shift + 3)) & 0x7) + 1) as f32;
+        let qh0 = qh[2 * ib] as usize;
+        let qh1 = qh[2 * ib + 1] as usize;
+        let idx = [
+            qs[4 * ib] as usize | ((qh0 << 8) & 0x700),
+            qs[4 * ib + 1] as usize | ((qh0 << 4) & 0x700),
+            qs[4 * ib + 2] as usize | ((qh1 << 8) & 0x700),
+            qs[4 * ib + 3] as usize | ((qh1 << 4) & 0x700),
+        ];
+        let delta = [
+            if qh0 & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+            if qh0 & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+            if qh1 & 0x08 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+            if qh1 & 0x80 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA },
+        ];
+        for l in 0..4 {
+            let dl = if l < 2 { dl1 } else { dl2 };
+            let grid = IQ1S_GRID[idx[l]].to_le_bytes();
+            for j in 0..8 {
+                y[yi + j] = dl * ((grid[j] as i8) as f32 + delta[l]);
+            }
+            yi += 8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,18 +736,33 @@ mod tests {
         assert_eq!(GgmlType::Q6K.block(), (256, 210));
         assert_eq!(GgmlType::Iq4Nl.block(), (32, 18));
         assert_eq!(GgmlType::Iq4Xs.block(), (256, 136));
+        // IQ1/IQ2/IQ3 super-block sizes (the upstream `static_assert`ed `block_iq*` sizes).
+        assert_eq!(GgmlType::Iq2Xxs.block(), (256, 66));
+        assert_eq!(GgmlType::Iq2Xs.block(), (256, 74));
+        assert_eq!(GgmlType::Iq2S.block(), (256, 82));
+        assert_eq!(GgmlType::Iq3Xxs.block(), (256, 98));
+        assert_eq!(GgmlType::Iq3S.block(), (256, 110));
+        assert_eq!(GgmlType::Iq1S.block(), (256, 50));
+        assert_eq!(GgmlType::Iq1M.block(), (256, 56));
     }
 
     #[test]
     fn supported_and_unsupported_types() {
         assert_eq!(GgmlType::from_tag(20).unwrap(), GgmlType::Iq4Nl);
         assert_eq!(GgmlType::from_tag(23).unwrap(), GgmlType::Iq4Xs);
-        // Sub-4-bit importance-matrix IQ types and intermediates stay unsupported.
-        assert!(matches!(GgmlType::from_tag(16), Err(Error::Unsupported(_)))); // IQ2_XXS
-        assert!(matches!(GgmlType::from_tag(19), Err(Error::Unsupported(_)))); // IQ1_S
-        assert!(matches!(GgmlType::from_tag(22), Err(Error::Unsupported(_)))); // IQ2_S
+        // The sub-4-bit importance-matrix IQ grid types now decode (story 7250).
+        assert_eq!(GgmlType::from_tag(16).unwrap(), GgmlType::Iq2Xxs);
+        assert_eq!(GgmlType::from_tag(17).unwrap(), GgmlType::Iq2Xs);
+        assert_eq!(GgmlType::from_tag(18).unwrap(), GgmlType::Iq3Xxs);
+        assert_eq!(GgmlType::from_tag(19).unwrap(), GgmlType::Iq1S);
+        assert_eq!(GgmlType::from_tag(21).unwrap(), GgmlType::Iq3S);
+        assert_eq!(GgmlType::from_tag(22).unwrap(), GgmlType::Iq2S);
+        assert_eq!(GgmlType::from_tag(29).unwrap(), GgmlType::Iq1M);
+        assert_eq!(tensor_byte_len(16, 256).unwrap(), 66);
+        // Intermediate/quantization-only types stay unsupported.
         assert!(matches!(GgmlType::from_tag(9), Err(Error::Unsupported(_)))); // Q8_1 (intermediate)
-        assert!(matches!(tensor_byte_len(16, 256), Err(Error::Unsupported(_))));
+        assert!(matches!(GgmlType::from_tag(15), Err(Error::Unsupported(_)))); // Q8_K (intermediate)
+        assert!(matches!(tensor_byte_len(9, 256), Err(Error::Unsupported(_))));
     }
 
     /// IQ4_NL maps each 4-bit index through the fixed codebook and scales by the block's f16 `d`.
@@ -600,5 +872,84 @@ mod tests {
         b[209] = dbytes[1];
         let out = dequantize(14, &b, 256).unwrap();
         assert!(out.iter().all(|&v| v == 0.0), "all centered q6_k values are zero");
+    }
+
+    /// Push an f16 `d` as the first two bytes of an IQ block, then `n` zero payload bytes.
+    fn iq_block_d1(total: usize) -> Vec<u8> {
+        let mut b = half::f16::from_f32(1.0).to_bits().to_le_bytes().to_vec();
+        b.resize(total, 0);
+        b
+    }
+
+    /// IQ2_XXS: an all-zero-`qs` block with `d=1` selects grid point 0 (`0x0808…` → byte 8) at scale
+    /// `(0.5+0)·0.25 = 0.125` with no sign flips, so every output is `0.125·8 = 1.0`. Setting block 0's
+    /// scale nibble (top of the second `u32`) to 3 lifts only its 32 lanes to `(0.5+3)·0.25·8 = 7.0`,
+    /// proving the per-32-block scale unpack and window offset.
+    #[test]
+    fn iq2_xxs_grid_scale_and_offset() {
+        let b = iq_block_d1(66);
+        let out = dequantize(16, &b, 256).unwrap();
+        assert!(out.iter().all(|&v| v == 1.0), "grid-0 decode = 0.125*8 = 1.0");
+
+        let mut b2 = iq_block_d1(66);
+        b2[9] = 0x30; // second u32 of block 0 = 0x30000000 => scale nibble 3, sign indices 0
+        let out2 = dequantize(16, &b2, 256).unwrap();
+        assert!(out2[..32].iter().all(|&v| v == 7.0), "block 0 scaled to 7.0");
+        assert_eq!(out2[32], 1.0, "block 1 unaffected");
+    }
+
+    /// IQ2_XS / IQ2_S share the grid-0 magnitude (byte 8) and the `(0.5+s)·0.25` scale; an all-zero
+    /// block decodes to `0.125·8 = 1.0` everywhere (zero scales, zero sign bytes ⇒ no flips).
+    #[test]
+    fn iq2_xs_and_s_grid_zero_decode() {
+        let out_xs = dequantize(17, &iq_block_d1(74), 256).unwrap();
+        assert!(out_xs.iter().all(|&v| v == 1.0), "iq2_xs grid-0 = 1.0");
+        let out_s = dequantize(22, &iq_block_d1(82), 256).unwrap();
+        assert!(out_s.iter().all(|&v| v == 1.0), "iq2_s grid-0 = 1.0");
+    }
+
+    /// IQ3_XXS grid point 0 is `0x04040404` → byte 4; scale `(0.5+0)·0.5 = 0.25`, so `0.25·4 = 1.0`.
+    /// IQ3_S grid point 0 is `0x01010101` → byte 1; scale `1+2·0 = 1`, so `1·1 = 1.0`.
+    #[test]
+    fn iq3_xxs_and_s_grid_zero_decode() {
+        let out_xxs = dequantize(18, &iq_block_d1(98), 256).unwrap();
+        assert!(out_xxs.iter().all(|&v| v == 1.0), "iq3_xxs grid-0 = 0.25*4 = 1.0");
+        let out_s = dequantize(21, &iq_block_d1(110), 256).unwrap();
+        assert!(out_s.iter().all(|&v| v == 1.0), "iq3_s grid-0 = 1*1 = 1.0");
+    }
+
+    /// IQ1_S uses a **signed** grid: point 0 is `0xffff…` → byte `-1`. With `d=1`, zero `qh` gives
+    /// scale `2·0+1 = 1` and `+IQ1S_DELTA` offset, so each lane is `1·(-1 + 0.125) = -0.875`. Setting
+    /// block 0's 3-bit scale (`qh` bits 12..15 = 1) triples it to `3·(-0.875) = -2.625` on its lanes.
+    #[test]
+    fn iq1_s_signed_grid_and_scale() {
+        let out = dequantize(19, &iq_block_d1(50), 256).unwrap();
+        assert!(out.iter().all(|&v| v == -0.875), "iq1_s grid-0 = 1*(-1+0.125) = -0.875");
+
+        let mut b = iq_block_d1(50);
+        b[35] = 0x10; // qh[0] = 0x1000 => (h>>12)&7 = 1 => scale 3
+        let out2 = dequantize(19, &b, 256).unwrap();
+        assert!(out2[..32].iter().all(|&v| v == -2.625), "block 0 scaled to -2.625");
+        assert_eq!(out2[32], -0.875, "block 1 unaffected");
+    }
+
+    /// IQ1_M carries **no per-block `d`**: its f16 super-block scale is reassembled from the top
+    /// nibbles of the four `u16` `scales` words. Encode `d = 1.0` (f16 `0x3C00`) across those nibbles
+    /// (`sc2=0xC000`, `sc3=0x3000`, rest 0) with zero 3-bit sub-scales and zero `qs`/`qh`; the signed
+    /// grid-0 byte `-1` plus `+IQ1S_DELTA` gives `1·(-1 + 0.125) = -0.875` on every lane.
+    #[test]
+    fn iq1_m_packed_f16_scale() {
+        let mut b = vec![0u8; 56];
+        b[52] = 0x00; // sc2 = 0xC000
+        b[53] = 0xC0;
+        b[54] = 0x00; // sc3 = 0x3000
+        b[55] = 0x30;
+        let out = dequantize(29, &b, 256).unwrap();
+        assert!(out.iter().all(|&v| v == -0.875), "iq1_m reconstructed d=1 => -0.875");
+
+        // A broken scale reconstruction (all-zero scales => d=0) would instead give all zeros — guard
+        // that the nibble assembly is actually doing work.
+        let zero = dequantize(29, &[0u8; 56], 256).unwrap();
+        assert!(zero.iter().all(|&v| v == 0.0), "zero scales => d=0 => all zero");
     }
 }
