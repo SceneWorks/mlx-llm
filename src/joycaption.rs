@@ -478,7 +478,9 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
 
 fn map_finish(f: FinishReason) -> CoreFinish {
     match f {
-        FinishReason::StopToken => CoreFinish::Stop,
+        // `Stopped` (a host stop condition) maps to `Stop` like an EOS id; JoyCaption's loop never
+        // produces it, but the mapping stays total.
+        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
         FinishReason::MaxTokens => CoreFinish::Length,
         FinishReason::Cancelled => CoreFinish::Cancelled,
     }

@@ -176,6 +176,7 @@ pub fn generate_cached(
         cancel,
         on_event,
         None,
+        None,
     )?;
 
     // Store the full sequence (prompt + generated) so the next shared-prefix request reuses it.

@@ -37,6 +37,11 @@ pub enum FinishReason {
     MaxTokens,
     /// Cancellation tripped mid-stream.
     Cancelled,
+    /// A host stop condition halted generation after emitting a token — e.g. a request `stop`
+    /// string was detected in the decoded text (see the `should_stop` predicate on
+    /// [`generate_with`]). Distinct from [`StopToken`](FinishReason::StopToken) (an EOS *id*) but
+    /// maps to the same contract `Stop` finish reason.
+    Stopped,
 }
 
 /// An event emitted as decoding proceeds.
@@ -112,13 +117,21 @@ pub fn generate(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Result<GenerationOutput> {
-    generate_with(decoder, prompt_ids, config, cancel, on_event, None)
+    generate_with(decoder, prompt_ids, config, cancel, on_event, None, None)
 }
 
-/// Like [`generate`], with an optional per-step [`ConstraintMask`] (structured-output decoding).
+/// Like [`generate`], with an optional per-step [`ConstraintMask`] (structured-output decoding) and
+/// an optional `should_stop` predicate.
+///
+/// `should_stop` is checked after each token is emitted and counted; returning `true` halts
+/// generation with [`FinishReason::Stopped`]. It is the seam the provider uses to honor request
+/// `stop` strings — the predicate inspects state the provider's detokenizing `on_event` maintains
+/// (a `core_llm::StopMatcher`), which is why stop-string matching lives in the text/detok layer and
+/// not in this token-id loop.
 ///
 /// Returns [`Error::Canceled`] if `cancel` is already set before any inference runs; otherwise runs
-/// to a stop token, the token budget, or a mid-stream cancel, returning the generated tokens.
+/// to a stop token, the token budget, a mid-stream cancel, or a tripped `should_stop`, returning the
+/// generated tokens.
 pub fn generate_with(
     decoder: &dyn Decode,
     prompt_ids: &[i32],
@@ -126,6 +139,7 @@ pub fn generate_with(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
     constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
@@ -151,6 +165,7 @@ pub fn generate_with(
         cancel,
         on_event,
         constraint,
+        should_stop,
     )
 }
 
@@ -198,6 +213,7 @@ pub fn generate_with_cache(
         cancel,
         on_event,
         None,
+        None,
     )
 }
 
@@ -220,6 +236,7 @@ pub(crate) fn decode_loop(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
@@ -251,6 +268,13 @@ pub(crate) fn decode_loop(
         on_event(StreamEvent::Token { id: next, step });
         generated.push(next);
         history.push(next);
+
+        // A host stop condition (e.g. a request `stop` string detected by `on_event`'s detokenizer)
+        // halts here, after the triggering token is counted. The next decode step is skipped.
+        if should_stop.is_some_and(|f| f()) {
+            finish = FinishReason::Stopped;
+            break;
+        }
 
         if step + 1 == config.max_new_tokens {
             break; // budget reached; finish stays MaxTokens
