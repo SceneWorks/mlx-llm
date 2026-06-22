@@ -9,6 +9,12 @@ readme = "README.md"
 keywords = ["mlx", "apple-silicon", "llm", "inference", "serving"]
 categories = ["science"]
 
+# The engine is the workspace root; `server/` is a separate example bin (story 7174) so its HTTP
+# deps never enter the engine's dependency graph. One lockfile + the root `.cargo/config.toml`
+# (single-threaded MLX, deployment target) cover both members.
+[workspace]
+members = ["server"]
+
 [dependencies]
 # mlx-rs is pinned to the pmetal fork by commit SHA — the SAME pin mlx-gen uses, so the two
 # build ONE mlx-rs and share a single `Array` type (the inversion: mlx-gen will consume mlx-llm).

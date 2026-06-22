@@ -50,6 +50,15 @@ tokenizer.json` to copy a tokenizer in for end-to-end use):
 cargo run --release --example convert_gguf -- model.gguf /path/to/out --tokenizer tokenizer.json
 ```
 
+Serve an **OpenAI-compatible** chat endpoint (`server/`, a separate bin so its HTTP deps stay out of
+the engine — streaming SSE, single model, backend-neutral over the `core_llm::TextLlm` contract):
+
+```sh
+cargo run --release -p mlx-llm-server -- --model /path/to/snapshot --port 8080
+curl -N http://localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"stream":true,"messages":[{"role":"user","content":"Hi!"}]}'
+```
+
 ```rust
 use mlx_llm::config::LlamaConfig;
 use mlx_llm::models::LlamaModel;
