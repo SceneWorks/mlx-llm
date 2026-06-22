@@ -29,7 +29,8 @@ use core_llm::Tokenizer;
 
 use mlx_llm::config::LlamaConfig;
 use mlx_llm::decode::{
-    generate, generate_batch, BatchRequest, CancelFlag, FinishReason, GenerationConfig,
+    generate, generate_batch, generate_continuous, BatchExactness, BatchRequest, CancelFlag,
+    ContinuousConfig, FinishReason, GenerationConfig,
 };
 use mlx_llm::models::LlamaModel;
 use mlx_llm::primitives::sampler::SamplingParams;
@@ -166,9 +167,18 @@ fn batched_decode_is_reproducible() {
     assert!(a.iter().all(|r| !r.is_empty()));
 }
 
-/// N differing-length requests complete coherently under one eval thread, and each row tracks its
-/// batch-1 run (agreeing on the prefill argmax; later tokens may differ only by the documented
-/// sub-ULP batched-kernel rounding). The common prefix with batch-1 is printed for inspection.
+/// N differing-length requests, two ways:
+///   - through the **bit-exact** continuous path ([`generate_continuous`] / [`BatchExactness::Exact`])
+///     each row is **token-for-token identical** to its batch-1 run — the equality assertion that
+///     retires the 7167 sub-ULP left-pad caveat (per-sequence paged attention, no padding mask, no
+///     batched matmul);
+///   - through `generate_batch` (the synchronous left-pad path) each row only **tracks** batch-1,
+///     agreeing on the prefill argmax but free to diverge at sub-ULP — the documented limitation the
+///     exact path now supersedes.
+///
+/// (Full continuous-batching coverage — admit-on-retire, Throughput mode, cancel — lives in
+/// `tests/continuous.rs`; this test pins the headline equality alongside the `generate_batch`
+/// contrast.)
 #[test]
 #[ignore = "needs a real snapshot via MLX_LLM_TEST_MODEL"]
 fn differing_lengths_complete_and_track_batch1() {
@@ -184,19 +194,36 @@ fn differing_lengths_complete_and_track_batch1() {
     let lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
     println!("prompt token lengths: {lens:?}");
 
+    let singles: Vec<(Vec<i32>, FinishReason)> =
+        prompts.iter().map(|p| run_single(&fx, p, 24)).collect();
     let reqs: Vec<BatchRequest> = prompts.iter().map(|p| request(&fx, p, 24)).collect();
+
+    // Bit-exact: the continuous Exact path must equal batch-1 token-for-token.
+    let exact = generate_continuous(
+        &fx.model,
+        &reqs,
+        &ContinuousConfig { max_batch: reqs.len(), block_size: 8, exactness: BatchExactness::Exact },
+        &CancelFlag::new(),
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    // Tracking: generate_batch agrees on the prefill argmax, may diverge at sub-ULP afterward.
     let batched = generate_batch(&fx.model, &reqs, &CancelFlag::new(), &mut |_, _| {}).unwrap();
 
     for (i, p) in prompts.iter().enumerate() {
-        let (single, single_fin) = run_single(&fx, p, 24);
-        let got = &batched[i].tokens;
-        let cp = common_prefix(got, &single);
-        let text = fx.tok.decode(&got.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
-        println!("row {i} (len {}): common prefix {cp}/{} :: {text}", p.len(), single.len());
+        let (single, single_fin) = &singles[i];
+        assert!(!single.is_empty(), "row {i} should generate");
 
+        assert_eq!(&exact[i].tokens, single, "row {i} (len {}) Exact must equal batch-1", p.len());
+        assert_eq!(exact[i].finish_reason, *single_fin, "row {i} Exact finish reason");
+
+        let got = &batched[i].tokens;
+        let cp = common_prefix(got, single);
+        let text = fx.tok.decode(&got.iter().map(|&x| x as u32).collect::<Vec<_>>(), true).unwrap();
+        println!("row {i} (len {}): generate_batch common prefix {cp}/{} :: {text}", p.len(), single.len());
         assert!(!got.is_empty(), "row {i} produced no tokens");
-        assert!(!text.trim().is_empty(), "row {i} should decode to text");
-        assert_eq!(batched[i].finish_reason, single_fin, "row {i} finish reason");
+        assert_eq!(batched[i].finish_reason, *single_fin, "row {i} generate_batch finish reason");
         assert!(cp >= 1, "row {i} must agree with batch-1 on at least the prefill argmax");
     }
 }
