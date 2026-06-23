@@ -11,13 +11,14 @@
 //! The family covered: **standard** RoPE (also Qwen3 — same rotation, config theta), **Llama-3
 //! scaled** RoPE (NTK-by-parts wavelength smoothing), **partial + interleaved** RoPE (GLM-4, the
 //! DeepSeek MLA rope sub-vector; story 7399), and **YaRN-scaled** RoPE (DeepSeek-V2; story 7398).
-//! [`Rope::cos_sin_at`] takes explicit positions, which is what a 3-axis multimodal RoPE (sensenova
-//! MRoPE) is built from when that consolidation lands.
+//! [`Rope::cos_sin_at`] takes explicit positions, which is what a 3-axis multimodal RoPE is built
+//! from: [`Rope::mrope_cos_sin`] composes three of those into the Qwen2-VL / Qwen2.5-VL M-RoPE
+//! tables (and serves the sensenova Qwen3 MRoPE consolidation).
 
 use mlx_rs::ops::{add, concatenate_axis, cos, multiply, sin, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// A rotary embedding: the host-side inverse-frequency table, the head dimension it rotates, and the
 /// pairing convention.
@@ -205,6 +206,82 @@ impl Rope {
         let sin_t = sin(&emb)?.as_dtype(dtype)?;
         Ok((cos_t, sin_t))
     }
+
+    /// Build the 3-axis multimodal-RoPE `(cos, sin)` tables — Qwen2-VL / Qwen2.5-VL **M-RoPE**.
+    ///
+    /// `position_ids` holds the three position rows (temporal / height / width), each of length `L`
+    /// (the sequence length); a text-only sequence sets all three rows equal. `sections` is the
+    /// (un-doubled) `mrope_section` `[t, h, w]`, which must sum to `dim / 2`. The doubled sections
+    /// `[t, h, w, t, h, w]` carve the `dim` channels so that each NeoX rotate-half pair `(c, c + dim/2)`
+    /// draws its frequency from a single axis.
+    ///
+    /// Each axis gets its own [`Rope::cos_sin_at`] table (built in f32), the six channel chunks are
+    /// stitched taking chunk `i` from axis `i % 3` (`apply_multimodal_rotary_pos_emb`), and the result
+    /// is cast to `dtype`. Each returned table is `[1, L, dim]`. With all three rows equal this is
+    /// bit-identical to a plain 1D [`Rope::cos_sin_at`] over that row.
+    ///
+    /// Requires the NeoX (half-split) convention: the doubled-section layout assumes the
+    /// `cat(freqs, freqs)` channel order. The rotation is plain [`apply_rope`] (M-RoPE == RoPE once
+    /// the tables are assembled). All released M-RoPE models are NeoX.
+    pub fn mrope_cos_sin(
+        &self,
+        position_ids: [&[i32]; 3],
+        sections: [usize; 3],
+        dtype: Dtype,
+    ) -> Result<(Array, Array)> {
+        if self.interleaved {
+            return Err(Error::Unsupported(
+                "mrope_cos_sin requires the NeoX (half-split) convention".into(),
+            ));
+        }
+        let half = self.inv_freq.len();
+        let sum: usize = sections.iter().sum();
+        if sum != half {
+            return Err(Error::Msg(format!(
+                "mrope sections {sections:?} sum to {sum}, expected dim/2 = {half}"
+            )));
+        }
+        let l = position_ids[0].len();
+        if position_ids.iter().any(|row| row.len() != l) {
+            return Err(Error::Msg(format!(
+                "mrope position_ids rows must share one length, got {:?}",
+                position_ids.map(<[i32]>::len)
+            )));
+        }
+
+        // Doubled-section cut points: e.g. [16,24,24,16,24,24] → exclusive cuts [16,40,64,80,104],
+        // splitting the `dim` channels into the six chunks (the last width is implied by the end).
+        let doubled = [
+            sections[0],
+            sections[1],
+            sections[2],
+            sections[0],
+            sections[1],
+            sections[2],
+        ];
+        let mut cuts = Vec::with_capacity(5);
+        let mut acc = 0i32;
+        for &d in doubled.iter().take(5) {
+            acc += d as i32;
+            cuts.push(acc);
+        }
+
+        // One rotary table per axis (over its own position row), each split into the six chunks.
+        let mut cos_pieces: Vec<Vec<Array>> = Vec::with_capacity(3);
+        let mut sin_pieces: Vec<Vec<Array>> = Vec::with_capacity(3);
+        for row in position_ids {
+            let (cos_t, sin_t) = self.cos_sin_at(row, Dtype::Float32)?;
+            cos_pieces.push(split_sections(&cos_t, &cuts, 2)?);
+            sin_pieces.push(split_sections(&sin_t, &cuts, 2)?);
+        }
+
+        // Stitch: channel chunk `i` is taken from axis `i % 3`, then cast to the request dtype.
+        let cos_sel: Vec<&Array> = (0..6).map(|i| &cos_pieces[i % 3][i]).collect();
+        let sin_sel: Vec<&Array> = (0..6).map(|i| &sin_pieces[i % 3][i]).collect();
+        let cos_t = concatenate_axis(&cos_sel, 2)?.as_dtype(dtype)?;
+        let sin_t = concatenate_axis(&sin_sel, 2)?.as_dtype(dtype)?;
+        Ok((cos_t, sin_t))
+    }
 }
 
 /// Apply rotary embeddings to `x`.
@@ -378,5 +455,104 @@ mod tests {
             let ys = &yh[pos * 4..pos * 4 + 4];
             assert!((norm(xs) - norm(ys)).abs() < 1e-4, "pos {pos}");
         }
+    }
+
+    // Qwen2.5-VL M-RoPE: head_dim 128, theta 1e6, mrope_section [16,24,24] (sums to head_dim/2).
+    const QWEN_HEAD_DIM: i32 = 128;
+    const QWEN_THETA: f32 = 1_000_000.0;
+    const QWEN_SECTIONS: [usize; 3] = [16, 24, 24];
+
+    #[test]
+    fn mrope_text_equals_1d() {
+        // Acceptance gate: text-only positions (all three axis rows equal) must reproduce a plain 1D
+        // cos_sin_at over that row, bit-for-bit (split → re-concatenate moves data, never arithmetic).
+        let rope = Rope::standard(QWEN_HEAD_DIM, QWEN_THETA);
+        let positions: Vec<i32> = (0..7).collect();
+        let (c1, s1) = rope.cos_sin_at(&positions, Dtype::Float32).unwrap();
+        let (cm, sm) = rope
+            .mrope_cos_sin(
+                [&positions, &positions, &positions],
+                QWEN_SECTIONS,
+                Dtype::Float32,
+            )
+            .unwrap();
+        assert_eq!(cm.shape(), &[1, 7, QWEN_HEAD_DIM]);
+        assert_eq!(cm.shape(), c1.shape());
+        assert_eq!(cm.as_slice::<f32>(), c1.as_slice::<f32>());
+        assert_eq!(sm.as_slice::<f32>(), s1.as_slice::<f32>());
+    }
+
+    #[test]
+    fn mrope_mixed_matches_reference_assembly() {
+        // A genuinely 3-axis case: channel `c` must take its angle from axis `axis(c)` at frequency
+        // inv_freq[c % half] (NeoX `cat(freqs, freqs)`), where axis(c) is the i%3 of the doubled
+        // section chunk c falls in: chunks [0,16) [16,40) [40,64) [80? ...] → axes 0,1,2,0,1,2.
+        let rope = Rope::standard(QWEN_HEAD_DIM, QWEN_THETA);
+        let half = (QWEN_HEAD_DIM / 2) as usize; // 64
+        let rows: [Vec<i32>; 3] = [vec![0, 5, 11], vec![2, 3, 9], vec![7, 1, 4]];
+        let l = rows[0].len();
+        let (cm, sm) = rope
+            .mrope_cos_sin(
+                [&rows[0], &rows[1], &rows[2]],
+                QWEN_SECTIONS,
+                Dtype::Float32,
+            )
+            .unwrap();
+        assert_eq!(cm.shape(), &[1, l as i32, QWEN_HEAD_DIM]);
+
+        // Map each channel to its source axis via the doubled-section chunk boundaries.
+        let doubled = [
+            QWEN_SECTIONS[0],
+            QWEN_SECTIONS[1],
+            QWEN_SECTIONS[2],
+            QWEN_SECTIONS[0],
+            QWEN_SECTIONS[1],
+            QWEN_SECTIONS[2],
+        ];
+        let mut axis_of = vec![0usize; QWEN_HEAD_DIM as usize];
+        let mut c = 0usize;
+        for (chunk, &w) in doubled.iter().enumerate() {
+            for _ in 0..w {
+                axis_of[c] = chunk % 3;
+                c += 1;
+            }
+        }
+
+        let inv = rope.inv_freq();
+        let cos_h = cm.as_slice::<f32>().to_vec();
+        let sin_h = sm.as_slice::<f32>().to_vec();
+        let hd = QWEN_HEAD_DIM as usize;
+        #[allow(clippy::needless_range_loop)] // pos cross-indexes rows[axis][pos] and the flat table
+        for pos in 0..l {
+            for ch in 0..hd {
+                let p = rows[axis_of[ch]][pos] as f32;
+                let angle = p * inv[ch % half];
+                let idx = pos * hd + ch;
+                assert!((cos_h[idx] - angle.cos()).abs() < 1e-5, "cos[{pos},{ch}]");
+                assert!((sin_h[idx] - angle.sin()).abs() < 1e-5, "sin[{pos},{ch}]");
+            }
+        }
+    }
+
+    #[test]
+    fn mrope_rejects_bad_sections() {
+        // Sections must sum to dim/2 (64 here); [16,24,16] sums to 56 → typed error, no panic.
+        let rope = Rope::standard(QWEN_HEAD_DIM, QWEN_THETA);
+        let positions = [0, 1, 2];
+        let err = rope
+            .mrope_cos_sin([&positions, &positions, &positions], [16, 24, 16], Dtype::Float32)
+            .unwrap_err();
+        assert!(matches!(err, Error::Msg(_)), "{err:?}");
+    }
+
+    #[test]
+    fn mrope_rejects_interleaved() {
+        // The doubled-section split is meaningless for the GPT-J interleaved layout.
+        let rope = Rope::partial(QWEN_HEAD_DIM, QWEN_THETA, true);
+        let positions = [0, 1, 2];
+        let err = rope
+            .mrope_cos_sin([&positions, &positions, &positions], QWEN_SECTIONS, Dtype::Float32)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
     }
 }
