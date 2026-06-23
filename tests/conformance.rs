@@ -124,6 +124,27 @@ fn real_qwen3_passes_core_llm_conformance() {
     );
 }
 
+#[test]
+#[ignore = "needs the Qwen3.6-27B (hybrid, thinking) snapshot via MLX_LLM_QWEN35_MODEL"]
+fn real_qwen35_passes_core_llm_conformance() {
+    // The full generic suite against the hybrid Gated-DeltaNet / gated-full-attention decoder
+    // (sc-7629): streaming, seed determinism, and thinking conformance on real Qwen3.6-27B weights —
+    // the contract-level acceptance that the hybrid decoder behaves as a first-class text provider.
+    let dir = std::env::var("MLX_LLM_QWEN35_MODEL").expect("set MLX_LLM_QWEN35_MODEL");
+    let spec = LoadSpec::dense(dir);
+    // The `cheap()` profile ("Hello", 16 tokens) is too short and predictable for a 27B: its opening
+    // reasoning tokens are near-argmax, so two seeds sample identically and the determinism check
+    // false-flags the seed as ignored (the sampler is the same one Qwen3-0.6B passes with). Tune the
+    // profile — an open-ended prompt and a larger budget — so seed divergence is actually observable.
+    let mut profile = TextLlmProfile::cheap();
+    profile.prompt = "Tell me a short story about a robot who learns to paint.".to_string();
+    profile.max_new_tokens = 96;
+    textllm_conformance(
+        || Box::new(LlamaProvider::load(&spec).expect("load real Qwen3.6 provider")),
+        &profile,
+    );
+}
+
 // --- story 7406: model-first resolution (core_llm::load_for_model) over the weightless probe ---
 
 /// A `config.json`-only snapshot (no safetensors, no tokenizer) used to prove the `can_load` probe
