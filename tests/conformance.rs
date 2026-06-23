@@ -109,6 +109,21 @@ fn real_model_passes_core_llm_conformance() {
     );
 }
 
+#[test]
+#[ignore = "needs a real Qwen3 (thinking) snapshot via MLX_LLM_QWEN3_MODEL"]
+fn real_qwen3_passes_core_llm_conformance() {
+    // The full generic suite against a *thinking* model: exercises the thinking-aware
+    // check_streaming / check_seed_determinism / check_thinking (sc-7595) on real reasoning output —
+    // a short greedy run stays inside <think>, so the answer is empty and the reasoning is split
+    // into output.thinking. Regression lock for the engine being fully verifiable on a thinking model.
+    let dir = std::env::var("MLX_LLM_QWEN3_MODEL").expect("set MLX_LLM_QWEN3_MODEL");
+    let spec = LoadSpec::dense(dir);
+    textllm_conformance(
+        || Box::new(LlamaProvider::load(&spec).expect("load real Qwen3 provider")),
+        &TextLlmProfile::cheap(),
+    );
+}
+
 // --- story 7406: model-first resolution (core_llm::load_for_model) over the weightless probe ---
 
 /// A `config.json`-only snapshot (no safetensors, no tokenizer) used to prove the `can_load` probe
