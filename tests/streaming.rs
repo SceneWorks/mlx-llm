@@ -32,6 +32,13 @@ fn tiny_config() -> ModelConfig {
         architecture: mlx_llm::config::Architecture::Llama,
         max_position_embeddings: 0,
         quantization: None,
+        moe: None,
+        attn_logit_softcap: None,
+        final_logit_softcap: None,
+        query_pre_attn_scalar: None,
+        partial_rotary_factor: 1.0,
+        mla: None,
+        yarn: None,
     }
 }
 
