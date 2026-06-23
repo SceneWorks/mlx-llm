@@ -471,9 +471,10 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// Weightless model-first probe (story 7406): can the `mlx-llama` provider serve the snapshot at
 /// `spec.source`? Reads **only** `config.json` and runs the same [`Architecture::from_config`]
 /// dispatch the loader uses — it never opens a safetensors shard, so `core-llm`'s `load_for_model`
-/// can resolve a provider by model without loading weights. A multimodal snapshot (one carrying a
-/// `vision_config` block — including a VLM whose `model_type` substring-matches a text family, e.g.
-/// `mllama`) is declined here so the vision provider claims it instead.
+/// can resolve a provider by model without loading weights. A VLM wrapper (one carrying a
+/// `vision_config`) is served **text-only** here unless a dedicated vision provider claims it: a
+/// LLaVA snapshot is ceded to `mlx-joycaption`, while a Qwen-VL (`qwen3_5`) wrapper is claimed here
+/// (its nested text decoder) so it no longer misroutes to JoyCaption (sc-7626).
 pub fn can_load(spec: &LoadSpec) -> bool {
     let dir = Path::new(&spec.source);
     let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
@@ -483,8 +484,51 @@ pub fn can_load(spec: &LoadSpec) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
-    if v.get("vision_config").is_some() {
+    can_load_value(&v)
+}
+
+/// Pure architecture/routing decision over a parsed `config.json` (split out for unit testing without
+/// a snapshot on disk).
+fn can_load_value(v: &serde_json::Value) -> bool {
+    // A VLM wrapper carries a `vision_config`. Cede it to the dedicated vision provider when that
+    // provider claims it (LLaVA → `mlx-joycaption`); otherwise serve the nested text decoder
+    // text-only (a Qwen-VL `qwen3_5` wrapper).
+    if v.get("vision_config").is_some() && crate::joycaption::can_load_value(v) {
         return false;
     }
-    Architecture::from_config(&v).is_ok()
+    Architecture::from_config(v).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn qwen36_wrapper() -> serde_json::Value {
+        json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": { "model_type": "qwen3_5_text" },
+            "vision_config": { "model_type": "qwen3_5", "depth": 27 }
+        })
+    }
+    fn llava_wrapper() -> serde_json::Value {
+        json!({
+            "architectures": ["LlavaForConditionalGeneration"],
+            "model_type": "llava",
+            "text_config": { "model_type": "llama" },
+            "vision_config": { "model_type": "siglip_vision_model" }
+        })
+    }
+
+    #[test]
+    fn text_provider_claims_qwen36_but_cedes_llava() {
+        // Qwen3.6 (Qwen-VL wrapper): claimed by the text provider, served text-only.
+        assert!(can_load_value(&qwen36_wrapper()));
+        // LLaVA: ceded to the JoyCaption vision provider.
+        assert!(!can_load_value(&llava_wrapper()));
+        // Plain text models (no vision_config) are unaffected.
+        assert!(can_load_value(&json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })));
+        assert!(can_load_value(&json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })));
+    }
 }
