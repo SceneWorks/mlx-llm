@@ -34,8 +34,14 @@ impl QuantSpec {
 /// A linear projection weight, dense or quantized.
 #[derive(Debug)]
 pub enum Projection {
-    /// A dense `[out, in]` weight.
-    Dense(Array),
+    /// A dense `[out, in]` weight with an optional `[out]` bias.
+    Dense {
+        /// The `[out, in]` weight (HF layout).
+        weight: Array,
+        /// Optional additive `[out]` bias (Qwen2 / GLM-4 attention carry q/k/v bias; Llama / Qwen3 /
+        /// Phi-3 do not).
+        bias: Option<Array>,
+    },
     /// A group-wise quantized weight.
     Quantized(QuantizedLinear),
 }
@@ -43,13 +49,23 @@ pub enum Projection {
 impl Projection {
     /// Load from a dense `[out, in]` weight, quantizing it if `quant` is set.
     pub fn load(weight: Array, quant: Option<QuantSpec>) -> Result<Self> {
+        Self::load_with_bias(weight, None, quant)
+    }
+
+    /// Load from a dense `[out, in]` weight plus an optional `[out]` bias (Qwen2 / GLM-4 attention
+    /// carry q/k/v bias), quantizing the weight if `quant` is set. The bias is always applied dense.
+    pub fn load_with_bias(
+        weight: Array,
+        bias: Option<Array>,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
         match quant {
-            None => Ok(Projection::Dense(weight)),
+            None => Ok(Projection::Dense { weight, bias }),
             Some(q) => Ok(Projection::Quantized(QuantizedLinear::quantize(
                 &weight,
                 q.group_size,
                 q.bits,
-                None,
+                bias,
             )?)),
         }
     }
@@ -73,10 +89,10 @@ impl Projection {
         })
     }
 
-    /// `x @ weightᵀ`.
+    /// `x @ weightᵀ (+ bias)`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
         match self {
-            Projection::Dense(w) => linear(x, w, None),
+            Projection::Dense { weight, bias } => linear(x, weight, bias.as_ref()),
             Projection::Quantized(q) => q.forward(x),
         }
     }
