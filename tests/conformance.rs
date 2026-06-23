@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use mlx_rs::Array;
 
-use core_llm::LoadSpec;
+use core_llm::{load_for_model, LoadSpec, Message, TextLlmRequest};
 use core_llm_testkit::{textllm_conformance, TextLlmProfile};
 use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
 use mlx_llm::provider::PROVIDER_ID;
@@ -107,4 +107,117 @@ fn real_model_passes_core_llm_conformance() {
         || Box::new(LlamaProvider::load(&spec).expect("load real provider")),
         &TextLlmProfile::cheap(),
     );
+}
+
+// --- story 7406: model-first resolution (core_llm::load_for_model) over the weightless probe ---
+
+/// A `config.json`-only snapshot (no safetensors, no tokenizer) used to prove the `can_load` probe
+/// is weightless and architecture-aware.
+fn write_config_only(name: &str, config: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("mlx-llm-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), config).unwrap();
+    dir
+}
+
+#[test]
+fn can_load_is_weightless_and_architecture_aware() {
+    // A directory with ONLY config.json (no shards): if the probe read weights this would fail.
+    let llama = write_config_only(
+        "canload-llama",
+        r#"{"architectures":["LlamaForCausalLM"],"model_type":"llama","hidden_size":8}"#,
+    );
+    let lspec = LoadSpec::dense(llama.to_str().unwrap().to_string());
+    assert!(mlx_llm::provider::can_load(&lspec), "text provider must claim a Llama snapshot");
+    assert!(!mlx_llm::joycaption::can_load(&lspec), "vision provider must decline a text snapshot");
+    let _ = std::fs::remove_dir_all(&llama);
+
+    // An unsupported architecture is declined (no panic, no silent default).
+    let unknown = write_config_only(
+        "canload-unknown",
+        r#"{"architectures":["BertModel"],"model_type":"bert"}"#,
+    );
+    let uspec = LoadSpec::dense(unknown.to_str().unwrap().to_string());
+    assert!(!mlx_llm::provider::can_load(&uspec));
+    let _ = std::fs::remove_dir_all(&unknown);
+
+    // A multimodal snapshot: the text provider declines (a `vision_config` is present even though
+    // the nested text arch is llama), the vision provider claims it.
+    let vlm = write_config_only(
+        "canload-vlm",
+        r#"{"architectures":["LlavaForConditionalGeneration"],"model_type":"llava",
+            "text_config":{"architectures":["LlamaForCausalLM"],"model_type":"llama"},
+            "vision_config":{"hidden_size":16}}"#,
+    );
+    let vspec = LoadSpec::dense(vlm.to_str().unwrap().to_string());
+    assert!(!mlx_llm::provider::can_load(&vspec), "text provider must decline a VLM");
+    assert!(mlx_llm::joycaption::can_load(&vspec), "vision provider must claim a VLM");
+    let _ = std::fs::remove_dir_all(&vlm);
+
+    // A nonexistent path is declined gracefully.
+    assert!(!mlx_llm::provider::can_load(&LoadSpec::dense("/no/such/dir")));
+}
+
+#[test]
+fn load_for_model_resolves_synthetic_snapshot_without_naming_a_provider() {
+    let dir = write_snapshot();
+    let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
+
+    // No provider id named: the resolver reads config.json, picks the mlx text provider via its
+    // can_load probe, and loads it.
+    let llm = load_for_model(&spec).expect("load_for_model resolves the synthetic snapshot");
+    assert_eq!(llm.descriptor().id, PROVIDER_ID);
+    assert_eq!(llm.descriptor().backend, "mlx");
+
+    // And it actually generates.
+    let req = TextLlmRequest::new(vec![Message::user("t1 t2 t3")], 4);
+    let out = llm.complete(&req).expect("generate");
+    assert!(!out.text.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_for_model_unknown_architecture_is_a_typed_error() {
+    let dir = write_config_only(
+        "lfm-unknown",
+        r#"{"architectures":["BertModel"],"model_type":"bert"}"#,
+    );
+    let spec = LoadSpec::dense(dir.to_str().unwrap().to_string());
+    match load_for_model(&spec) {
+        Err(core_llm::Error::Unsupported(m)) => {
+            assert!(m.contains("no registered provider can serve"), "{m}");
+            assert!(m.contains("bert"), "error should surface the model arch: {m}");
+        }
+        Err(e) => panic!("expected Unsupported, got error: {e}"),
+        Ok(_) => panic!("expected Unsupported, got a loaded provider"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "needs a real Llama snapshot via MLX_LLM_TEST_MODEL"]
+fn load_for_model_round_trips_real_llama() {
+    let dir = std::env::var("MLX_LLM_TEST_MODEL").expect("set MLX_LLM_TEST_MODEL");
+    let spec = LoadSpec::dense(dir);
+    assert!(mlx_llm::provider::can_load(&spec));
+    let llm = load_for_model(&spec).expect("resolve + load real Llama by model");
+    assert_eq!(llm.descriptor().id, PROVIDER_ID);
+    let req = TextLlmRequest::new(vec![Message::user("The capital of France is")], 8);
+    let out = llm.complete(&req).expect("generate");
+    assert!(!out.text.is_empty());
+}
+
+#[test]
+#[ignore = "needs a real Qwen3 snapshot via MLX_LLM_QWEN3_MODEL"]
+fn load_for_model_round_trips_real_qwen3() {
+    let dir = std::env::var("MLX_LLM_QWEN3_MODEL").expect("set MLX_LLM_QWEN3_MODEL");
+    let spec = LoadSpec::dense(dir);
+    let llm = load_for_model(&spec).expect("resolve + load real Qwen3 by model");
+    assert_eq!(llm.descriptor().id, PROVIDER_ID);
+    // The true family resolves post-load to qwen3 even though the static descriptor.family is
+    // "llama" — the exact case `can_load`-based resolution exists to handle.
+    assert_eq!(llm.descriptor().family, "qwen3");
+    let req = TextLlmRequest::new(vec![Message::user("The capital of France is")], 8);
+    let out = llm.complete(&req).expect("generate");
+    assert!(!out.text.is_empty());
 }
