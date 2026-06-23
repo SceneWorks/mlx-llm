@@ -502,11 +502,28 @@ inventory::submit! {
     core_llm::TextLlmRegistration {
         descriptor,
         load: load_registered,
+        can_load,
     }
 }
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(JoyCaptionProvider::load(spec)?))
+}
+
+/// Weightless model-first probe (story 7406): can the `mlx-joycaption` vision provider serve the
+/// snapshot at `spec.source`? Reads **only** `config.json` and keys on the LLaVA structural
+/// signature — a nested `text_config` (the language decoder) plus a `vision_config` (the SigLIP
+/// tower) — which `JoyCaptionModel::from_dir` requires. Never opens a safetensors shard.
+pub fn can_load(spec: &LoadSpec) -> bool {
+    let dir = Path::new(&spec.source);
+    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    v.get("text_config").is_some() && v.get("vision_config").is_some()
 }
 
 #[cfg(test)]
