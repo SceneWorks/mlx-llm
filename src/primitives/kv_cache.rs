@@ -56,6 +56,11 @@ pub trait KvCache {
 
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
     fn reset(&mut self);
+
+    /// Downcast hook so a decoder can recover its concrete cache from a `&mut dyn KvCache` — the
+    /// hybrid Qwen3.6 cache (recurrent linear-attention state + KV) is driven natively rather than
+    /// through the softmax-only [`KvCache::update`] path.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Growing-concat KV cache: one `Option<(K, V)>` slot per layer, concatenated along the sequence
@@ -164,6 +169,10 @@ impl KvCache for ContiguousKvCache {
         for slot in &mut self.layers {
             *slot = None;
         }
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

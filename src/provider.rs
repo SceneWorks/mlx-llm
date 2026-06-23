@@ -21,19 +21,56 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
-use crate::decode::{generate_with, ConstraintMask, FinishReason, GenerationConfig, StreamEvent};
-use crate::models::CausalLm;
+use crate::decode::{
+    generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig, StreamEvent,
+};
+use crate::models::{CausalLm, Qwen35Config, Qwen35Model};
+use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::Weights;
+use mlx_rs::Array;
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "mlx-llama";
 
+/// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
+/// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
+/// implement [`Decode`], so the generation loop is identical.
+enum Decoder {
+    Causal(CausalLm),
+    Qwen35(Qwen35Model),
+}
+
+impl Decode for Decoder {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        match self {
+            Decoder::Causal(m) => m.make_cache(),
+            Decoder::Qwen35(m) => m.make_cache(),
+        }
+    }
+
+    fn step(&self, input_ids: &Array, cache: &mut dyn KvCache, offset: i32) -> crate::error::Result<Array> {
+        match self {
+            Decoder::Causal(m) => m.step(input_ids, cache, offset),
+            Decoder::Qwen35(m) => m.step(input_ids, cache, offset),
+        }
+    }
+}
+
+impl Decoder {
+    fn is_quantized(&self) -> bool {
+        match self {
+            Decoder::Causal(m) => m.is_quantized(),
+            Decoder::Qwen35(m) => m.is_quantized(),
+        }
+    }
+}
+
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
-    model: CausalLm,
+    model: Decoder,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
@@ -48,14 +85,30 @@ impl LlamaProvider {
     /// quantizes the projections on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
         let dir = Path::new(&spec.source);
-        let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
         let quant = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
         });
-        let mut descriptor = descriptor_for(&cfg);
+        // Read config.json once to dispatch the architecture: the hybrid Qwen3.6 (`qwen3_5`) decoder
+        // has its own config/weights path (and `ModelConfig` deliberately rejects it).
+        let cfg_value = read_config_value(dir)?;
+        let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
         let weights = Weights::from_dir(dir).map_err(to_core)?;
-        let model = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+
+        let (model, mut descriptor) = if arch == Architecture::Qwen35 {
+            let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
+            let descriptor = descriptor_for_qwen35(&qcfg);
+            // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
+            let m = Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, quant)
+                .map_err(to_core)?;
+            (Decoder::Qwen35(m), descriptor)
+        } else {
+            let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
+            let descriptor = descriptor_for(&cfg);
+            let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+            (Decoder::Causal(m), descriptor)
+        };
+
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
         let (template, supports_thinking) = load_chat_template(dir);
@@ -80,7 +133,7 @@ impl LlamaProvider {
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         Self {
             descriptor: provider_descriptor(),
-            model,
+            model: Decoder::Causal(model),
             tokenizer,
             template: Box::new(Llama3Template),
             stop_tokens,
@@ -201,6 +254,18 @@ impl TextLlm for LlamaProvider {
         // a non-thinking provider stays on the original single-channel path.
         let thinking_active = self.descriptor.capabilities.supports_thinking;
         let mut segmenter = thinking_active.then(ThinkingSegmenter::default);
+        // Some chat templates open the reasoning block *in the prompt* — e.g. Qwen3.6 ends the
+        // generation prompt with `<|im_start|>assistant\n<think>\n`, so the model generates inside
+        // the block and only emits the closing `</think>`. Prime the segmenter into the Thinking
+        // channel by feeding it that already-rendered opening marker (stripped, so it emits nothing);
+        // otherwise the reasoning would be misclassified as answer. Disabled mode renders a *closed*
+        // `<think>\n\n</think>`, so this correctly does not prime.
+        if let Some(seg) = segmenter.as_mut() {
+            if prompt_opens_thinking(&prompt) {
+                let _ = seg.push("<think>");
+                debug_assert!(seg.in_thinking());
+            }
+        }
 
         // Drive the internal loop; translate token-id events to contract text-delta events via
         // incremental detokenization (re-decode the running sequence, emit the new suffix). The
@@ -399,27 +464,71 @@ fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
     d
 }
 
+/// The loaded-model descriptor for the hybrid Qwen3.6 (`qwen3_5`) decoder (parsed via
+/// [`Qwen35Config`], which `ModelConfig` does not represent).
+fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
+    let mut d = provider_descriptor();
+    d.family = Architecture::Qwen35.family().to_string();
+    d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    d
+}
+
+/// Read and parse `config.json` from a snapshot directory into a JSON value (used to dispatch the
+/// architecture before constructing the architecture-specific config).
+fn read_config_value(dir: &Path) -> CoreResult<serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| CoreError::Load(format!("read {}: {e}", dir.join("config.json").display())))?;
+    serde_json::from_str(&text)
+        .map_err(|e| CoreError::Load(format!("parse {}: {e}", dir.join("config.json").display())))
+}
+
 /// Read `eos_token_id` (int or array) from `config.json`; falls back to the Llama-3 stop ids.
 pub fn eos_token_ids(dir: &Path) -> Vec<i32> {
     let fallback = vec![128001, 128008, 128009]; // <|end_of_text|>, <|eom_id|>, <|eot_id|>
-    let Ok(text) = std::fs::read_to_string(dir.join("config.json")) else {
-        return fallback;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return fallback;
-    };
-    match v.get("eos_token_id") {
-        Some(serde_json::Value::Number(n)) => n.as_i64().map(|x| vec![x as i32]).unwrap_or(fallback),
-        Some(serde_json::Value::Array(a)) => {
-            let ids: Vec<i32> = a.iter().filter_map(|x| x.as_i64().map(|x| x as i32)).collect();
-            if ids.is_empty() {
-                fallback
-            } else {
-                ids
-            }
-        }
-        _ => fallback,
+
+    // Prefer `generation_config.json` — HF's canonical "how to generate" source, where models put
+    // the *generation* EOS set (Qwen3.6's `<|im_end|>` turn-end lives only here, not in config.json).
+    if let Some(ids) = read_json(dir, "generation_config.json")
+        .as_ref()
+        .and_then(|v| parse_token_ids(v.get("eos_token_id")))
+    {
+        return ids;
     }
+    // Otherwise fall back to `config.json` — top-level, then the VLM-nested `text_config`.
+    if let Some(v) = read_json(dir, "config.json") {
+        if let Some(ids) = parse_token_ids(v.get("eos_token_id"))
+            .or_else(|| parse_token_ids(v.get("text_config").and_then(|t| t.get("eos_token_id"))))
+        {
+            return ids;
+        }
+    }
+    fallback
+}
+
+/// Whether a rendered prompt ends with an **unclosed** `<think>` block — i.e. the chat template
+/// opened reasoning in the prompt (Qwen3.6's thinking/auto generation prompt) so the model generates
+/// inside it. True iff the last `<think>` occurs after the last `</think>` (or there is no close).
+fn prompt_opens_thinking(prompt: &str) -> bool {
+    match prompt.rfind("<think>") {
+        None => false,
+        Some(open) => prompt.rfind("</think>").is_none_or(|close| open > close),
+    }
+}
+
+/// Read and parse a JSON file from a snapshot dir, or `None` if missing/invalid.
+fn read_json(dir: &Path, name: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join(name)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Parse an `eos_token_id`-style field — a single int or an array of ints — into a non-empty id list.
+fn parse_token_ids(v: Option<&serde_json::Value>) -> Option<Vec<i32>> {
+    let ids = match v? {
+        serde_json::Value::Number(n) => vec![n.as_i64()? as i32],
+        serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_i64().map(|x| x as i32)).collect(),
+        _ => return None,
+    };
+    (!ids.is_empty()).then_some(ids)
 }
 
 fn map_sampling(s: &Sampling) -> SamplingParams {
@@ -530,5 +639,17 @@ mod tests {
         // Plain text models (no vision_config) are unaffected.
         assert!(can_load_value(&json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })));
         assert!(can_load_value(&json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })));
+    }
+
+    #[test]
+    fn prompt_opens_thinking_matches_template_modes() {
+        // Qwen3.6 thinking/auto generation prompt: opens the block, leaves it unclosed.
+        assert!(prompt_opens_thinking("<|im_start|>assistant\n<think>\n"));
+        // Disabled mode renders a *closed* empty block: must not prime.
+        assert!(!prompt_opens_thinking("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        // A prior closed reasoning turn followed by a fresh open block still opens.
+        assert!(prompt_opens_thinking("<think>\nold\n</think>\n\nq<|im_start|>assistant\n<think>\n"));
+        // No reasoning markers at all (non-thinking template).
+        assert!(!prompt_opens_thinking("<|im_start|>assistant\n"));
     }
 }

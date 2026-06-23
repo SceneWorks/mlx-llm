@@ -498,6 +498,10 @@ impl KvCache for PagedKvCache {
         self.frozen_k = vec![None; self.num_layers];
         self.frozen_v = vec![None; self.num_layers];
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 impl Drop for PagedKvCache {
