@@ -34,6 +34,7 @@
 
 use std::time::Instant;
 
+use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::memory;
 use mlx_rs::random::normal;
 use mlx_rs::transforms::eval;
@@ -42,7 +43,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_llm::config::ModelConfig;
 use mlx_llm::models::CausalLm;
 use mlx_llm::primitives::attention::{sdpa, AttnMask};
-use mlx_llm::primitives::{BlockPool, KvCache, PagedKvCache, Weights};
+use mlx_llm::primitives::{BlockPool, ContiguousKvCache, KvCache, PagedKvCache, Weights};
 
 /// Realistic paged block size (the `ContinuousConfig` default).
 const BLOCK: usize = 16;
@@ -231,6 +232,165 @@ fn breakdown(name: &str, model: &CausalLm) {
             100.0 * at2k / (a + at2k)
         );
     }
+}
+
+// ============================================================================================
+// Prefill throughput: before vs after the sc-7455 chunked-SDPA mitigation (story 7469).
+// ============================================================================================
+//
+// sc-7455 made [`sdpa`] split a `q_len > 8` prefill (multi-head × pow2 head_dim) into `ceil(q_len/8)`
+// fused calls. This measured the throughput cost (correctness is gated in `attention.rs`) and drove
+// the sc-7469 fixes now in `sdpa_chunked_prefill`: the original per-chunk `eval` was ~95% of prefill
+// (a GPU sync per chunk × layer), and the causal K/V `take_axis` gathers eagerly copied the growing
+// prefix — both gone (lazy chunks + strided slice views), recovering ~8.5–9× at S=512.
+//
+// Run ONE model per process — libtest spawns a fresh thread per test and MLX's default GPU stream is
+// thread-local, so a second GPU test in the same run dies with "no Stream(gpu, 1)". E.g.:
+//   MLX_LLM_TEST_MODEL=/tmp/smollm2-135m  cargo test --test throughput_breakdown -- --ignored \
+//     --nocapture prefill_throughput_llama
+//   MLX_LLM_QWEN3_MODEL=/tmp/qwen3-0.6b   cargo test --test throughput_breakdown -- --ignored \
+//     --nocapture prefill_throughput_qwen3
+//
+// The ONLY thing that differs between pre- and post-mitigation is the per-layer SDPA call — embed,
+// projections, RoPE, MLP, lm_head and the cache append are byte-identical. So the before/after delta
+// for a whole prefill is exactly `Σ_layers (chunked_sdpa − fused_sdpa)` at the model's real attention
+// shape, which the SDPA-isolated sweep below measures directly. Two cross-checking views per prompt
+// length `S`:
+//   - **Model-level** absolute prefill `tok/s` of the shipping (chunked) path: a real
+//     `decode_logits` over an `S`-token prompt on a fresh cache — the number a user sees ("after").
+//   - **SDPA-isolated** `fused` (raw `scaled_dot_product_attention`, the pre-mitigation path — wrong
+//     numerics per sc-7430 but timed for throughput) vs `chunked` ([`sdpa`]), summed over all layers
+//     = one prefill's worth of attention. `Δ = chunked − fused` is the per-prefill cost the mitigation
+//     adds; the model-level "before" is then `S / (T_after − Δ)`.
+//
+// `S = 1` and `S = 8` rows are below the chunk gate (`q_len > 8`), so `sdpa` IS the raw fused call
+// there — their `slowdown ≈ 1.0×` is the in-table proof that **decode (q_len=1) is untouched**.
+
+/// Prompt lengths swept: `1` = decode (gate proof), `8` = chunk-boundary (still fused), then
+/// short / medium / long chunked prefills. All single-sequence, so resident KV stays well under a GB
+/// even at `S = 512` (≈0.5 GB for the hd128 model) — no per-cell footprint guard needed.
+const PREFILL_LENS: &[usize] = &[1, 8, 32, 128, 512];
+/// Prefill is heavier per call than a decode step, so fewer timed iterations (the chunked long-`S`
+/// cells run thousands of per-chunk evals); still enough to average out scheduler jitter.
+const PREFILL_WARMUP: usize = 2;
+const PREFILL_ITERS: usize = 4;
+
+/// One fused causal SDPA per layer over `q/k/v` (decode/prefill attention shape), evaluated — the
+/// **pre-sc-7455** path. Calls the raw kernel directly: for `q_len > 8 × multi-head × pow2 head_dim`
+/// this is the miscompiling kernel (sc-7430), timed only to recover the pre-mitigation throughput.
+fn fused_sdpa_sweep(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize) {
+    let mut outs = Vec::with_capacity(layers);
+    for _ in 0..layers {
+        outs.push(
+            scaled_dot_product_attention(q, k, v, scale, Some(ScaledDotProductAttentionMask::Causal), None)
+                .unwrap(),
+        );
+    }
+    eval(outs.iter()).unwrap();
+}
+
+/// One [`sdpa`] (the shipping, chunked-on-the-broken-envelope wrapper) per layer — the **post-sc-7455**
+/// path. The chunked branch `eval`s each ≤8-row chunk internally, so this faithfully carries the
+/// per-chunk serialization the model pays; the trailing `eval` is then near-free.
+fn chunked_sdpa_sweep(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize) {
+    let mut outs = Vec::with_capacity(layers);
+    for _ in 0..layers {
+        outs.push(sdpa(q, k, v, scale, AttnMask::Causal).unwrap());
+    }
+    eval(outs.iter()).unwrap();
+}
+
+/// One real prefill of an `S`-token prompt: a fresh contiguous cache, `decode_logits(ids[1,S], …, 0)`,
+/// evaluated. This is the shipping (chunked) path end-to-end.
+fn prefill_step(model: &CausalLm, cache: &mut ContiguousKvCache, ids: &Array) {
+    cache.reset();
+    let logits = model.decode_logits(ids, cache, 0).unwrap();
+    eval(std::iter::once(&logits)).unwrap();
+}
+
+/// Mean ms over `PREFILL_ITERS` calls of `f`, after `PREFILL_WARMUP` untimed calls.
+fn timed_prefill(mut f: impl FnMut()) -> f64 {
+    for _ in 0..PREFILL_WARMUP {
+        f();
+    }
+    let t = Instant::now();
+    for _ in 0..PREFILL_ITERS {
+        f();
+    }
+    t.elapsed().as_secs_f64() * 1000.0 / PREFILL_ITERS as f64
+}
+
+/// Run and print the prefill before/after breakdown for one loaded model.
+fn prefill_breakdown(name: &str, model: &CausalLm) {
+    memory::set_memory_limit(MLX_MEMORY_LIMIT);
+    memory::set_cache_limit(MLX_CACHE_LIMIT);
+    let cfg = model.config();
+    let (h, kvh, hd, layers, scale) =
+        (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.num_layers, cfg.attn_scale());
+    println!(
+        "\n================ {name}: {layers} layers, {h} heads / {kvh} kv (groups {}), head_dim {hd} ================",
+        h / kvh
+    );
+    println!("Prefill throughput before (raw fused, pre-sc-7455) vs after (chunked sdpa). chunks = ceil(S/8) on the broken envelope.");
+    println!("S=1,8 are below the chunk gate (q_len>8) ⇒ sdpa==fused ⇒ slowdown≈1.0 = decode/short prefill untouched.");
+    println!(
+        "    {:>5} | {:>7} | {:>9} | {:>9} | {:>9} | {:>8} | {:>8} | {:>10} | {:>10} | {:>7}",
+        "S", "chunks", "T_after", "fused", "chunked", "ΔSDPA", "slow×", "tok/s_aft", "tok/s_bef", "regr%"
+    );
+
+    let mut cache = ContiguousKvCache::new(layers);
+    for &s in PREFILL_LENS {
+        let si = s as i32;
+        let chunks = s.div_ceil(8);
+        // Model-level real prefill (shipping/chunked path).
+        let ids = Array::from_slice(&vec![1i32; s], &[1, si]);
+        let t_after = timed_prefill(|| prefill_step(model, &mut cache, &ids));
+        cache.reset();
+
+        // SDPA-isolated before vs after at the real prefill attention shape, summed over all layers.
+        let q = synth(&[1, h, si, hd]);
+        let k = synth(&[1, kvh, si, hd]);
+        let v = synth(&[1, kvh, si, hd]);
+        let fused = timed(|| fused_sdpa_sweep(&q, &k, &v, scale, layers));
+        let chunked = timed(|| chunked_sdpa_sweep(&q, &k, &v, scale, layers));
+        drop((q, k, v));
+
+        let delta = chunked - fused;
+        let slow = if fused > 0.0 { chunked / fused } else { 1.0 };
+        let toks_after = si as f64 * 1000.0 / t_after;
+        // Derived "before" prefill time: same step minus the attention delta the mitigation added.
+        let t_before = (t_after - delta).max(1e-6);
+        let toks_before = si as f64 * 1000.0 / t_before;
+        let regr = 100.0 * (toks_before - toks_after) / toks_before;
+        memory::clear_cache();
+        println!(
+            "    {s:>5} | {chunks:>7} | {t_after:>7.3} | {fused:>9.4} | {chunked:>9.4} | {delta:>8.4} | {slow:>7.2}× | {toks_after:>10.0} | {toks_before:>10.0} | {regr:>6.1}%"
+        );
+    }
+    println!(
+        "  T_after/fused/chunked/ΔSDPA in ms (ΔSDPA = per-prefill attention cost the chunking adds, summed over layers).\n  \
+         tok/s columns are model-level S/T; tok/s_bef = S/(T_after − ΔSDPA). regr% = throughput lost vs before."
+    );
+}
+
+#[test]
+#[ignore = "needs a real snapshot via MLX_LLM_TEST_MODEL; perf"]
+fn prefill_throughput_llama() {
+    let Some(model) = load("MLX_LLM_TEST_MODEL") else {
+        eprintln!("skip: set MLX_LLM_TEST_MODEL");
+        return;
+    };
+    prefill_breakdown("SmolLM2-135M (GQA g=3, hd=64)", &model);
+}
+
+#[test]
+#[ignore = "needs a real snapshot via MLX_LLM_QWEN3_MODEL; perf"]
+fn prefill_throughput_qwen3() {
+    let Some(model) = load("MLX_LLM_QWEN3_MODEL") else {
+        eprintln!("skip: set MLX_LLM_QWEN3_MODEL");
+        return;
+    };
+    prefill_breakdown("Qwen3-0.6B (GQA g=2, hd=128)", &model);
 }
 
 #[test]
