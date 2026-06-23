@@ -86,6 +86,12 @@ impl Weights {
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(|s| s.as_str())
     }
+
+    /// Consume into the underlying `name → Array` map (used by the snapshot writer, which drains the
+    /// loaded tensor set into its safetensors output).
+    pub fn into_map(self) -> HashMap<String, Array> {
+        self.tensors
+    }
 }
 
 #[cfg(test)]
