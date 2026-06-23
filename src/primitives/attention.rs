@@ -7,6 +7,7 @@
 //! (decode) and an explicit [`AttnMask::Additive`] mask (the block-causal / bidirectional paths).
 
 use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis};
 use mlx_rs::{Array, Dtype};
 
@@ -113,13 +114,21 @@ fn range_index(start: i32, end: i32) -> Array {
 /// - **Causal**: chunk rows `[c0, c1)` (with `offset = k_len − q_len`) attend keys `0..(offset+c1)`;
 ///   slice K/V to that prefix and use the implicit causal mask, which then bottom-right-aligns the
 ///   chunk correctly (`offset' = (offset+c1) − (c1−c0) = offset+c0`). Caps the score matrix at
-///   `[·, ·, 8, k_len]` — no full `[·, ·, q_len, k_len]` materialization.
+///   `[·, ·, 8, k_len]` — no full `[·, ·, q_len, k_len]` materialization. The prefix is taken with a
+///   strided **slice view** (`index`, `mlx_slice`), not a `take_axis` gather — no index-vector alloc
+///   and no eager copy of the growing prefix per chunk (sc-7469).
 /// - **None**: every query attends all keys — pass the full K/V.
 /// - **Additive**: the mask already encodes visibility, so pass full K/V and slice the mask's query
 ///   axis to `[c0, c1)` (when that axis isn't broadcast).
 ///
-/// Each chunk output is `eval`'d before the next so the per-chunk K/V gathers don't accumulate across
-/// the prefill/layer graph into an out-of-memory (the very failure mode `mlx-benchmarks` warns of).
+/// The chunk outputs stay **lazy** and are concatenated into one graph for the caller to `eval` — the
+/// same contract as [`sdpa_fused`]. sc-7469 measured the original per-chunk `eval` (a GPU sync every
+/// chunk × every layer, ~1900 syncs for a 512-token 30-layer prefill) at **~95% of total prefill
+/// time**, collapsing a 135M prefill from ~57k to ~1.1k tok/s. It bounded nothing the single forward
+/// `eval` doesn't already bound: MLX frees each chunk's K/V gather as it streams the graph, so peak
+/// transient is one chunk's key prefix, not the sum — exactly as the pre-mitigation fused prefill
+/// (which never OOM'd) behaved ([[mlx-benchmarks-must-bound-memory]] is about unbounded *multi-eval*
+/// sweeps, not one forward's intermediates).
 fn sdpa_chunked_prefill(
     queries: &Array,
     keys: &Array,
@@ -135,13 +144,13 @@ fn sdpa_chunked_prefill(
     let mut c0 = 0;
     while c0 < q_len {
         let c1 = (c0 + SDPA_MAX_FUSED_QLEN).min(q_len);
-        let q_chunk = queries.take_axis(range_index(c0, c1), 2)?;
+        let q_chunk = queries.try_index((.., .., c0..c1, ..))?; // [·, ·, c1−c0, hd] view
         let out = match mask {
             AttnMask::None => sdpa_fused(&q_chunk, keys, values, scale, AttnMask::None)?,
             AttnMask::Causal => {
-                let key_prefix = range_index(0, offset + c1);
-                let k_chunk = keys.take_axis(&key_prefix, 2)?;
-                let v_chunk = values.take_axis(&key_prefix, 2)?;
+                let end = offset + c1;
+                let k_chunk = keys.try_index((.., .., 0..end, ..))?; // [·, ·, end, hd] prefix view
+                let v_chunk = values.try_index((.., .., 0..end, ..))?;
                 sdpa_fused(&q_chunk, &k_chunk, &v_chunk, scale, AttnMask::Causal)?
             }
             AttnMask::Additive(a) => {
@@ -154,8 +163,8 @@ fn sdpa_chunked_prefill(
                 }
             }
         };
-        out.eval()?; // bound memory: don't let chunk K/V gathers pile up in the lazy graph
-        outs.push(out);
+        outs.push(out); // stay lazy: the caller's single forward `eval` streams + frees each chunk's
+                        // K/V prefix slice, so peak transient is one chunk (sc-7469 — no per-chunk sync)
         c0 = c1;
     }
     let refs: Vec<&Array> = outs.iter().collect();
