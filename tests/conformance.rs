@@ -217,7 +217,14 @@ fn load_for_model_round_trips_real_qwen3() {
     // The true family resolves post-load to qwen3 even though the static descriptor.family is
     // "llama" — the exact case `can_load`-based resolution exists to handle.
     assert_eq!(llm.descriptor().family, "qwen3");
+    // Qwen3 is a thinking model (sc-7585): its template gates enable_thinking → supports_thinking on.
+    assert!(llm.descriptor().capabilities.supports_thinking);
     let req = TextLlmRequest::new(vec![Message::user("The capital of France is")], 8);
     let out = llm.complete(&req).expect("generate");
-    assert!(!out.text.is_empty());
+    // A short greedy run is still inside the <think> block, so the answer (out.text) may be empty
+    // while reasoning streams — assert it produced text on either channel.
+    assert!(
+        !out.text.is_empty() || out.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        "expected text on the answer or reasoning channel"
+    );
 }

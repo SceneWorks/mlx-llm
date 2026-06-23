@@ -13,10 +13,11 @@ use std::cell::OnceCell;
 use std::path::Path;
 
 use core_llm::{
-    ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError, FinishReason as CoreFinish,
-    JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec, Quantize, Result as CoreResult,
-    Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
+    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Error as CoreError,
+    FinishReason as CoreFinish, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
+    Quantize, RenderOptions, Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent,
+    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, Usage,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -52,16 +53,18 @@ impl LlamaProvider {
             Quantize::Q4 => QuantSpec::q4(),
             Quantize::Q8 => QuantSpec::q8(),
         });
-        let descriptor = descriptor_for(&cfg);
+        let mut descriptor = descriptor_for(&cfg);
         let weights = Weights::from_dir(dir).map_err(to_core)?;
         let model = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
+        let (template, supports_thinking) = load_chat_template(dir);
+        descriptor.capabilities.supports_thinking = supports_thinking;
         Ok(Self {
             descriptor,
             model,
             tokenizer,
-            template: load_chat_template(dir),
+            template,
             stop_tokens,
             constraint_table: OnceCell::new(),
         })
@@ -99,11 +102,16 @@ impl ConstraintMask for JsonMask<'_> {
 }
 
 /// Use the model's own Jinja `chat_template` (from `tokenizer_config.json`, story 7164) when
-/// present; otherwise fall back to the typed Llama-3 template.
-fn load_chat_template(dir: &Path) -> Box<dyn ChatTemplate> {
+/// present; otherwise fall back to the typed Llama-3 template. Also reports whether the template
+/// exposes a controllable reasoning mode — true iff its source gates an `enable_thinking` kwarg (the
+/// transformers convention used by Qwen3, FLUX.2, z-image, … — detected by source, not by family).
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool) {
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
-        Ok(t) => Box::new(t),
-        Err(_) => Box::new(Llama3Template),
+        Ok(t) => {
+            let supports_thinking = t.source().contains("enable_thinking");
+            (Box::new(t), supports_thinking)
+        }
+        Err(_) => (Box::new(Llama3Template), false),
     }
 }
 
@@ -129,8 +137,16 @@ impl TextLlm for LlamaProvider {
         }
 
         // Render the conversation and tokenize. The template already includes BOS, so encode
-        // without auto special tokens.
-        let prompt = self.template.render(&req.messages, true)?;
+        // without auto special tokens. `enable_thinking` (sc-7585) flows into the template kwarg so
+        // a no-think (Disabled) request injects the model's empty `<think></think>` generation
+        // prompt; Auto omits the kwarg (template default).
+        let prompt = self.template.render_with(
+            &req.messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.enable_thinking_kwarg(),
+            },
+        )?;
         let prompt_ids: Vec<i32> = self
             .tokenizer
             .encode(&prompt, false)?
@@ -169,37 +185,91 @@ impl TextLlm for LlamaProvider {
         // A single-threaded latch the detok sink trips on a stop hit; the decode loop reads it after
         // each token via `should_stop` and halts with `FinishReason::Stopped`.
         let halt = std::cell::Cell::new(false);
-        // The emitted text, accumulated as the matcher releases it — the truncated result when stop
-        // strings are active (the no-stop path keeps decoding all tokens, exactly as before).
+        // Content emitted as the matchers release it — the result text when stop strings or thinking
+        // are active (the plain path still decodes all tokens, byte-identical to before).
         let mut streamed = String::new();
-        let mut last_emit: Option<(u32, usize)> = None; // (id, index) of the last emitted token
+        // Reasoning text, accumulated from the Thinking channel (sc-7585).
+        let mut thinking_buf = String::new();
+        // Contract token index: a running counter over *emitted* events, not the raw decode step —
+        // detok hold-backs and stripped `<think>`/`</think>` marker tokens produce no event, so this
+        // stays gap-free (and equals the step in the common one-delta-per-token case).
+        let mut emit_index = 0usize;
+        let mut last_id = 0u32; // id of the last emitted token, for flushed-tail events
+
+        // A reasoning segmenter when the model advertises a thinking mode: it splits the decoded
+        // stream into `<think>…</think>` reasoning vs answer (markers stripped). `None` otherwise, so
+        // a non-thinking provider stays on the original single-channel path.
+        let thinking_active = self.descriptor.capabilities.supports_thinking;
+        let mut segmenter = thinking_active.then(ThinkingSegmenter::default);
 
         // Drive the internal loop; translate token-id events to contract text-delta events via
-        // incremental detokenization (re-decode the running sequence, emit the new suffix), feeding
-        // each delta through the stop matcher so a stop string is trimmed and halts generation.
+        // incremental detokenization (re-decode the running sequence, emit the new suffix). The
+        // segmenter (when active) splits each delta into reasoning vs answer; answer text then feeds
+        // the stop matcher so a stop string is trimmed and halts generation.
         let tokenizer = &self.tokenizer;
         let out = {
             let mut acc: Vec<u32> = Vec::new();
             let mut shown = 0usize;
             let mut sink = |ev: StreamEvent| {
-                if let StreamEvent::Token { id, step } = ev {
-                    acc.push(id as u32);
+                if let StreamEvent::Token { id, .. } = ev {
+                    let id = id as u32;
+                    acc.push(id);
                     if let Ok(text) = tokenizer.decode(&acc, true) {
                         if text.len() > shown {
                             let delta = text[shown..].to_string();
                             shown = text.len();
-                            let chunk = stop_matcher.push(&delta);
-                            if !chunk.emit.is_empty() {
-                                streamed.push_str(&chunk.emit);
-                                last_emit = Some((id as u32, step));
-                                on_event(CoreEvent::Token {
-                                    id: id as u32,
-                                    text: chunk.emit,
-                                    index: step,
-                                });
-                            }
-                            if chunk.stop {
-                                halt.set(true);
+                            match segmenter.as_mut() {
+                                Some(seg) => {
+                                    for span in seg.push(&delta) {
+                                        match span.channel {
+                                            Channel::Thinking => {
+                                                thinking_buf.push_str(&span.text);
+                                                last_id = id;
+                                                on_event(CoreEvent::Token {
+                                                    id,
+                                                    text: span.text,
+                                                    index: emit_index,
+                                                    channel: Channel::Thinking,
+                                                });
+                                                emit_index += 1;
+                                            }
+                                            Channel::Content => {
+                                                let chunk = stop_matcher.push(&span.text);
+                                                if !chunk.emit.is_empty() {
+                                                    streamed.push_str(&chunk.emit);
+                                                    last_id = id;
+                                                    on_event(CoreEvent::Token {
+                                                        id,
+                                                        text: chunk.emit,
+                                                        index: emit_index,
+                                                        channel: Channel::Content,
+                                                    });
+                                                    emit_index += 1;
+                                                }
+                                                if chunk.stop {
+                                                    halt.set(true);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {
+                                    let chunk = stop_matcher.push(&delta);
+                                    if !chunk.emit.is_empty() {
+                                        streamed.push_str(&chunk.emit);
+                                        last_id = id;
+                                        on_event(CoreEvent::Token {
+                                            id,
+                                            text: chunk.emit,
+                                            index: emit_index,
+                                            channel: Channel::Content,
+                                        });
+                                        emit_index += 1;
+                                    }
+                                    if chunk.stop {
+                                        halt.set(true);
+                                    }
+                                }
                             }
                         }
                     }
@@ -221,26 +291,65 @@ impl TextLlm for LlamaProvider {
             .map_err(to_core)?
         };
 
-        // If generation ended for any reason other than a stop string, flush the matcher's
-        // held-back tail (a partial stop-prefix that never completed) — it is real output that must
-        // still be streamed and returned.
+        // End-of-generation tails. First the segmenter's held-back partial marker (it turned out not
+        // to begin a marker) as current-channel text; then the stop matcher's held-back partial stop.
+        if let Some(seg) = segmenter.as_mut() {
+            for span in seg.flush() {
+                match span.channel {
+                    Channel::Thinking => {
+                        thinking_buf.push_str(&span.text);
+                        on_event(CoreEvent::Token {
+                            id: last_id,
+                            text: span.text,
+                            index: emit_index,
+                            channel: Channel::Thinking,
+                        });
+                        emit_index += 1;
+                    }
+                    Channel::Content => {
+                        let chunk = stop_matcher.push(&span.text);
+                        if !chunk.emit.is_empty() {
+                            streamed.push_str(&chunk.emit);
+                            on_event(CoreEvent::Token {
+                                id: last_id,
+                                text: chunk.emit,
+                                index: emit_index,
+                                channel: Channel::Content,
+                            });
+                            emit_index += 1;
+                        }
+                        if chunk.stop {
+                            halt.set(true);
+                        }
+                    }
+                }
+            }
+        }
+        // If generation ended for any reason other than a stop string, flush the stop matcher's
+        // held-back tail (a partial stop-prefix that never completed) — real output to stream/return.
         if stop_active && !halt.get() {
             let tail = stop_matcher.flush();
             if !tail.is_empty() {
-                let (id, index) = last_emit.unwrap_or((0, out.tokens.len().saturating_sub(1)));
                 streamed.push_str(&tail);
-                on_event(CoreEvent::Token { id, text: tail, index });
+                on_event(CoreEvent::Token {
+                    id: last_id,
+                    text: tail,
+                    index: emit_index,
+                    channel: Channel::Content,
+                });
             }
         }
 
-        // With stop strings active the result is the trimmed streamed text; otherwise keep the
-        // existing decode-the-tokens path (byte-identical to before this change).
-        let text = if stop_active {
+        // Result text: the streamed answer when stop strings or thinking are active; otherwise the
+        // original decode-all-tokens path (byte-identical to before). Reasoning, if the model
+        // produced any, is reported separately (markers excluded from both).
+        let text = if stop_active || thinking_active {
             streamed
         } else {
             let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
             tokenizer.decode(&gen_u32, true)?
         };
+        let thinking = (!thinking_buf.is_empty()).then_some(thinking_buf);
         let finish = map_finish(out.finish_reason);
         let usage = Usage {
             prompt_tokens: prompt_len as u32,
@@ -252,6 +361,7 @@ impl TextLlm for LlamaProvider {
         });
         Ok(TextLlmOutput {
             text,
+            thinking,
             usage,
             finish_reason: Some(finish),
         })
@@ -271,6 +381,9 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             // Text-only today; the VLM path (sc-7157) flips this on for a vision provider.
             supports_vision: false,
+            // Weightless default: conservative. The load path (descriptor_for + load) flips this on
+            // when the loaded model's own chat template gates an `enable_thinking` kwarg (sc-7585).
+            supports_thinking: false,
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![Constraint::Json],
         },
