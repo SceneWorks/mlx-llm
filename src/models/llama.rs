@@ -419,8 +419,8 @@ impl LlamaAttention {
         }
 
         // RoPE on q,k (cos/sin broadcast over the head axis), then -> [b, heads, s, head_dim].
-        let q = apply_rope(&q, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
-        let k = apply_rope(&k, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
+        let q = apply_rope(&q, cos, sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
+        let k = apply_rope(&k, cos, sin, false)?.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
         Ok((q, k, v))
     }
