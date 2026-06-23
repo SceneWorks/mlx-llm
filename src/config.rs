@@ -38,6 +38,14 @@ pub enum Architecture {
     /// implementation rather than GQA — plus a fine-grained MoE FFN (many routed experts, several
     /// shared experts, the first layers dense) and YaRN RoPE on the `qk_rope_head_dim` sub-vector.
     DeepseekV2,
+    /// Qwen3.5/3.6 family (`model_type` `qwen3_5` / `qwen3_5_text`): a VLM-wrapped **hybrid
+    /// linear-attention** decoder — 3-of-4 layers are Gated DeltaNet (linear attention) and 1-of-4 is
+    /// gated full attention with partial RoPE; the 35B variant is MoE. **Dispatch + routing only
+    /// today** (sc-7626) so it no longer misroutes to the JoyCaption vision provider; the hybrid
+    /// decoder itself is built in sc-7627 (DeltaNet primitive + recurrent cache), sc-7628 (decoder),
+    /// sc-7629 (27B), and sc-7630 (35B MoE). The decoder-shape predicates below stay at their
+    /// defaults until then.
+    Qwen35,
 }
 
 impl Architecture {
@@ -45,18 +53,24 @@ impl Architecture {
     /// `model_type` (e.g. a minimal synthetic config) defaults to [`Architecture::Llama`]; a config
     /// that names an unrecognized architecture is rejected.
     pub fn from_config(v: &Value) -> Result<Self> {
-        let arch = v
+        // A VLM wrapper (LLaVA / Qwen-VL) nests the language decoder under `text_config`; dispatch on
+        // that nested decoder when present, else the top-level config.
+        let cfg = v.get("text_config").unwrap_or(v);
+        let arch = cfg
             .get("architectures")
             .and_then(|a| a.as_array())
             .and_then(|a| a.first())
             .and_then(|s| s.as_str());
-        let model_type = v.get("model_type").and_then(|s| s.as_str());
+        let model_type = cfg.get("model_type").and_then(|s| s.as_str());
         let hay = format!(
             "{} {}",
             arch.unwrap_or("").to_lowercase(),
             model_type.unwrap_or("").to_lowercase()
         );
-        if hay.contains("qwen3") {
+        // `qwen3_5` must be tested before `qwen3` (the latter is a substring of the former).
+        if hay.contains("qwen3_5") || hay.contains("qwen35") {
+            Ok(Architecture::Qwen35)
+        } else if hay.contains("qwen3") {
             Ok(Architecture::Qwen3)
         } else if hay.contains("qwen2_moe") || hay.contains("qwen2moe") {
             Ok(Architecture::Qwen2Moe)
@@ -94,6 +108,7 @@ impl Architecture {
             Architecture::Gemma2 => "gemma2",
             Architecture::Glm4 => "glm4",
             Architecture::DeepseekV2 => "deepseek_v2",
+            Architecture::Qwen35 => "qwen3_5",
         }
     }
 
@@ -271,6 +286,18 @@ pub struct ModelConfig {
 impl ModelConfig {
     /// Parse from an already-decoded `config.json` value.
     pub fn from_json(v: &Value) -> Result<Self> {
+        let architecture = Architecture::from_config(v)?;
+        // Recognized for routing (so it no longer misroutes to the JoyCaption vision provider —
+        // sc-7626), but the hybrid Gated-DeltaNet / gated-full-attention decoder is not built yet.
+        // Fail clearly rather than mis-parsing the VLM-wrapped config as a dense decoder.
+        if architecture == Architecture::Qwen35 {
+            return Err(Error::Unsupported(
+                "Qwen3.6 (model_type `qwen3_5`) is a hybrid linear-attention (Gated DeltaNet + gated \
+                 full attention) decoder; text generation is not yet implemented (tracked: sc-7627 \
+                 DeltaNet primitive, sc-7628 decoder, sc-7629 27B, sc-7630 35B MoE)"
+                    .to_string(),
+            ));
+        }
         let int = |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
         let req_int = |key: &str| -> Result<i32> {
             int(key).ok_or_else(|| Error::Config(format!("config.json missing integer `{key}`")))
@@ -308,7 +335,6 @@ impl ModelConfig {
             .and_then(|x| x.as_f64())
             .map(|x| x as f32)
             .unwrap_or(500_000.0);
-        let architecture = Architecture::from_config(v)?;
         let tie_word_embeddings = v
             .get("tie_word_embeddings")
             .and_then(|x| x.as_bool())
@@ -795,5 +821,43 @@ mod tests {
         assert_eq!(cfg.head_dim, 128); // explicit, != 1024/16
         assert_eq!(cfg.max_position_embeddings, 40960);
         assert!(cfg.rope_scaling.is_none());
+    }
+
+    #[test]
+    fn qwen35_dispatches_via_text_config_and_is_recognized_for_routing() {
+        // Qwen3.6 self-identifies as `qwen3_5`, wrapped as a VLM with the real decoder under
+        // `text_config` (`qwen3_5_text`). Dispatch descends into text_config and must NOT mistake
+        // `qwen3_5` for plain `qwen3` (a substring).
+        let v = json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": { "model_type": "qwen3_5_text" },
+            "vision_config": { "model_type": "qwen3_5", "depth": 27 }
+        });
+        assert_eq!(Architecture::from_config(&v).unwrap(), Architecture::Qwen35);
+        assert_eq!(Architecture::Qwen35.family(), "qwen3_5");
+
+        // Plain Qwen3 is unaffected (the `qwen3_5`-before-`qwen3` ordering).
+        let q3 = json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" });
+        assert_eq!(Architecture::from_config(&q3).unwrap(), Architecture::Qwen3);
+    }
+
+    #[test]
+    fn qwen35_modelconfig_fails_clearly_until_decoder_lands() {
+        // Recognized for routing, but generation isn't implemented yet — the parse must fail with a
+        // clear Unsupported message (NOT a cryptic missing-field error, NOT the JoyCaption error).
+        let v = json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": { "model_type": "qwen3_5_text", "hidden_size": 5120 },
+            "vision_config": { "model_type": "qwen3_5" }
+        });
+        match ModelConfig::from_json(&v) {
+            Err(Error::Unsupported(m)) => {
+                assert!(m.contains("qwen3_5"), "{m}");
+                assert!(m.contains("sc-7627") || m.contains("not yet implemented"), "{m}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

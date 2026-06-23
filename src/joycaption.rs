@@ -526,12 +526,57 @@ pub fn can_load(spec: &LoadSpec) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
         return false;
     };
-    v.get("text_config").is_some() && v.get("vision_config").is_some()
+    can_load_value(&v)
+}
+
+/// Pure LLaVA-signature decision over a parsed `config.json` (split out for unit testing). Requires a
+/// nested `text_config` (Llama decoder) + a `vision_config` (SigLIP tower) **and** the LLaVA / SigLIP
+/// signature, so a *non*-LLaVA VLM (e.g. a Qwen-VL `qwen3_5` wrapper) is NOT claimed here and is
+/// served text-only by `mlx-llama` instead (sc-7626).
+pub(crate) fn can_load_value(v: &Value) -> bool {
+    if v.get("text_config").is_none() || v.get("vision_config").is_none() {
+        return false;
+    }
+    let arch_is_llava = v
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_lowercase().contains("llava"))
+        .unwrap_or(false);
+    let vision_is_siglip = v
+        .get("vision_config")
+        .and_then(|vc| vc.get("model_type"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_lowercase().contains("siglip"))
+        .unwrap_or(false);
+    arch_is_llava || vision_is_siglip
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn can_load_claims_llava_not_qwen_vl() {
+        // Real LLaVA (JoyCaption) signature: claimed.
+        let llava = json!({
+            "architectures": ["LlavaForConditionalGeneration"], "model_type": "llava",
+            "text_config": { "model_type": "llama" },
+            "vision_config": { "model_type": "siglip_vision_model" }
+        });
+        assert!(can_load_value(&llava));
+        // Qwen-VL wrapper (Qwen3.6): NOT a LLaVA snapshot — declined so it routes to mlx-llama.
+        let qwen_vl = json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
+            "text_config": { "model_type": "qwen3_5_text" },
+            "vision_config": { "model_type": "qwen3_5", "depth": 27 }
+        });
+        assert!(!can_load_value(&qwen_vl));
+        // A plain text model (no vision_config) is never a JoyCaption candidate.
+        assert!(!can_load_value(&json!({ "model_type": "qwen3" })));
+    }
 
     #[test]
     fn chat_text_matches_llava_format() {
