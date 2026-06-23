@@ -32,8 +32,8 @@ use serde_json::{json, Map, Value};
 use crate::error::{Error, Result};
 use crate::gguf::reader::GgufFile;
 use crate::gguf::tokenizer::{self, TokenizerOutcome};
-use crate::primitives::quant::QuantizedLinear;
 use crate::primitives::QuantSpec;
+use crate::snapshot::{write_snapshot, SnapshotTokenizer};
 
 /// Compute/storage dtype for dense tensors — bf16, the engine's load dtype, so a dense conversion
 /// reloads with no extra rounding.
@@ -89,7 +89,6 @@ pub fn convert_file(
 /// Convert an already-parsed GGUF file into an MLX snapshot directory.
 pub fn convert(g: &GgufFile, out_dir: impl AsRef<Path>, opts: ConvertOptions) -> Result<ConvertReport> {
     let out_dir = out_dir.as_ref();
-    std::fs::create_dir_all(out_dir)?;
 
     let arch = g
         .meta_str("general.architecture")
@@ -146,74 +145,50 @@ pub fn convert(g: &GgufFile, out_dir: impl AsRef<Path>, opts: ConvertOptions) ->
         )));
     }
 
-    // --- reconstruct config.json from GGUF metadata ---
-    let config = reconstruct_config(g, &arch, model_type, hf_arch, &dense, opts.quantize)?;
-    std::fs::write(
-        out_dir.join("config.json"),
-        serde_json::to_string_pretty(&config)
-            .map_err(|e| Error::Msg(format!("gguf: serialize config.json: {e}")))?,
-    )?;
+    // --- reconstruct config.json from GGUF metadata (the writer adds any `quantization` block) ---
+    let config = reconstruct_config(g, &arch, model_type, hf_arch, &dense)?;
 
-    // --- build the safetensors tensor set (dense, with projections optionally requantized) ---
-    let projection_suffixes = [
-        "self_attn.q_proj.weight",
-        "self_attn.k_proj.weight",
-        "self_attn.v_proj.weight",
-        "self_attn.o_proj.weight",
-        "mlp.gate_proj.weight",
-        "mlp.up_proj.weight",
-        "mlp.down_proj.weight",
-    ];
-    let is_projection = |key: &str| projection_suffixes.iter().any(|s| key.ends_with(s));
-
-    let mut tensors: Vec<(String, Array)> = Vec::new();
+    // --- dense tensor set (bf16), remapped to the transformer key layout; the shared writer does
+    // any projection requant ---
+    let mut tensors: Vec<(String, Array)> = Vec::with_capacity(dense.len());
     for (key, (data, shape)) in &dense {
         let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let arr = Array::from_slice(data, &shape_i32).as_dtype(STORE_DTYPE)?;
-        match opts.quantize {
-            Some(spec) if is_projection(key) => {
-                let q = QuantizedLinear::quantize(&arr, spec.group_size, spec.bits, None)?;
-                let base = key.strip_suffix(".weight").unwrap_or(key);
-                tensors.push((format!("{base}.weight"), q.weight));
-                tensors.push((format!("{base}.scales"), q.scales));
-                tensors.push((format!("{base}.biases"), q.biases));
-            }
-            _ => tensors.push((key.clone(), arr)),
-        }
+        tensors.push((key.clone(), arr));
     }
-    let num_tensors = tensors.len();
-
-    Array::save_safetensors(tensors.iter().map(|(k, v)| (k.as_str(), v)), None, out_dir.join("model.safetensors"))
-        .map_err(|e| Error::Msg(format!("gguf: write model.safetensors: {e}")))?;
 
     // --- reconstruct tokenizer.json / tokenizer_config.json from the GGUF tokenizer metadata ---
-    let tokenizer = match tokenizer::reconstruct(g)? {
-        TokenizerOutcome::Reconstructed(t) => {
-            write_json(out_dir.join("tokenizer.json"), &t.tokenizer_json)?;
-            write_json(out_dir.join("tokenizer_config.json"), &t.tokenizer_config_json)?;
-            TokenizerStatus::Reconstructed(t.kind)
+    let (snapshot_tokenizer, tokenizer) = match tokenizer::reconstruct(g)? {
+        TokenizerOutcome::Reconstructed(t) => (
+            SnapshotTokenizer {
+                tokenizer_json: Some(to_pretty(&t.tokenizer_json)?),
+                tokenizer_config_json: Some(to_pretty(&t.tokenizer_config_json)?),
+            },
+            TokenizerStatus::Reconstructed(t.kind),
+        ),
+        TokenizerOutcome::Unsupported(reason) => {
+            (SnapshotTokenizer::default(), TokenizerStatus::Unsupported(reason))
         }
-        TokenizerOutcome::Unsupported(reason) => TokenizerStatus::Unsupported(reason),
-        TokenizerOutcome::Absent => TokenizerStatus::Absent,
+        TokenizerOutcome::Absent => (SnapshotTokenizer::default(), TokenizerStatus::Absent),
     };
+
+    // --- write the snapshot through the shared writer (requant + config + safetensors + tokenizer) ---
+    let report = write_snapshot(out_dir, tensors, config, &snapshot_tokenizer, opts.quantize)?;
 
     Ok(ConvertReport {
         architecture: arch,
         model_type: model_type.to_string(),
-        num_tensors,
-        quantized: opts.quantize,
+        num_tensors: report.num_tensors,
+        quantized: report.quantized,
         tokenizer,
-        out_dir: out_dir.to_path_buf(),
+        out_dir: report.out_dir,
     })
 }
 
-/// Write a JSON value to `path`, pretty-printed.
-fn write_json(path: PathBuf, value: &Value) -> Result<()> {
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|e| Error::Msg(format!("gguf: serialize {}: {e}", path.display())))?;
-    std::fs::write(&path, text)
-        .map_err(|e| Error::Msg(format!("gguf: write {}: {e}", path.display())))?;
-    Ok(())
+/// Serialize a reconstructed tokenizer JSON value to a pretty string for the snapshot writer.
+fn to_pretty(value: &Value) -> Result<String> {
+    serde_json::to_string_pretty(value)
+        .map_err(|e| Error::Msg(format!("gguf: serialize tokenizer json: {e}")))
 }
 
 /// Map a GGML tensor name to the transformer (HF) key the engine loads, or `None` if it is not a
@@ -293,7 +268,6 @@ fn reconstruct_config(
     model_type: &str,
     hf_arch: &str,
     dense: &HashMap<String, (Vec<f32>, Vec<usize>)>,
-    quantize: Option<QuantSpec>,
 ) -> Result<Value> {
     let key = |suffix: &str| format!("{arch}.{suffix}");
     let req_u64 = |suffix: &str| -> Result<u64> {
@@ -351,12 +325,6 @@ fn reconstruct_config(
     }
     if let Some(scaling) = reconstruct_rope_scaling(g, arch) {
         cfg.insert("rope_scaling".into(), scaling);
-    }
-    if let Some(spec) = quantize {
-        cfg.insert(
-            "quantization".into(),
-            json!({ "group_size": spec.group_size, "bits": spec.bits }),
-        );
     }
     Ok(Value::Object(cfg))
 }

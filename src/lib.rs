@@ -27,6 +27,12 @@
 //! `{config.json, model.safetensors}` snapshot the loader consumes (story 7165), optionally
 //! re-quantizing to MLX Q4/Q8.
 //!
+//! [`snapshot`] is the shared persisted-snapshot writer both ingest paths funnel through
+//! ([`snapshot::write_snapshot`], story 7660): it (optionally) re-quantizes the attention/MLP
+//! projections and writes the loadable snapshot directory. [`snapshot::write_hf_snapshot`] is the
+//! Hugging Face leaf — load a dense HF safetensors directory and persist it as a snapshot, dense or
+//! Q4/Q8 (the backend half of `core_llm::SnapshotPreparer`'s HF case).
+//!
 //! [`joycaption`] is the **text + vision** path (story 7157): a SigLIP vision tower
 //! ([`models::SiglipVisionTower`]) + LLaVA projector + image splice in front of the reused
 //! [`CausalLm`] decode, served as a multimodal [`core_llm::TextLlm`] provider (`mlx-joycaption`).
@@ -43,6 +49,7 @@ pub mod joycaption;
 pub mod models;
 pub mod primitives;
 pub mod provider;
+pub mod snapshot;
 
 // Re-export the contract crate so consumers can reach it as `mlx_llm::core_llm::…`.
 pub use core_llm;
@@ -58,3 +65,4 @@ pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
+pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
