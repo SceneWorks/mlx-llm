@@ -114,6 +114,51 @@ fn qwen3_passes_check_thinking_conformance() {
 }
 
 #[test]
+#[ignore = "needs Qwen3 via MLX_LLM_QWEN3_MODEL"]
+fn qwen3_multi_turn_carries_reasoning() {
+    // End-to-end multi-turn round-trip (sc-7586): generate a turn, feed the assistant turn back
+    // carrying its reasoning via Message::with_thinking, then continue. The prior reasoning renders
+    // into the prompt (Qwen3's template strips it for the now-earlier turn) without breaking the
+    // conversation — the next turn still produces a coherent answer.
+    let dir = std::env::var("MLX_LLM_QWEN3_MODEL").expect("set MLX_LLM_QWEN3_MODEL");
+    let p = LlamaProvider::load(&LoadSpec::dense(dir)).expect("load qwen3");
+
+    let q1 = "What is 2+2? Reply briefly.";
+    let (out1, _t, _c, _) = run(&p, &req(q1, ThinkingMode::Auto, 256));
+    assert!(
+        out1.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        "turn 1 should reason"
+    );
+
+    let mut assistant = Message::assistant(out1.text.clone());
+    if let Some(t) = &out1.thinking {
+        assistant = assistant.with_thinking(t.clone());
+    }
+    let req2 = TextLlmRequest {
+        messages: vec![
+            Message::user(q1),
+            assistant,
+            Message::user("And 3+3? Reply briefly."),
+        ],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 256,
+        seed: Some(0),
+        thinking: ThinkingMode::Auto,
+        ..Default::default()
+    };
+    let (out2, _t2, _c2, indices2) = run(&p, &req2);
+    println!("\n=== Qwen3 turn 2 ===\n[answer]\n{}\n", out2.text);
+    assert!(
+        !out2.text.trim().is_empty() || out2.thinking.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        "turn 2 must produce an answer or reasoning"
+    );
+    assert!(
+        indices2.iter().enumerate().all(|(i, &x)| i == x),
+        "turn 2 token indices must be contiguous: {indices2:?}"
+    );
+}
+
+#[test]
 #[ignore = "needs a non-thinking model (e.g. SmolLM2) via MLX_LLM_TEST_MODEL"]
 fn non_thinking_model_rejects_enable() {
     let dir = std::env::var("MLX_LLM_TEST_MODEL").expect("set MLX_LLM_TEST_MODEL");

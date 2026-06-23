@@ -142,6 +142,7 @@ fn joycaption_provider_streams_caption_through_contract() {
                 Content::Image(ImageRef::new(w, h, pixels).unwrap()),
                 Content::text("Write a very short caption."),
             ],
+            thinking: None,
         }],
         sampling: Sampling::greedy(),
         max_new_tokens: 16,
