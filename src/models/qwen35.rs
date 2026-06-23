@@ -35,8 +35,19 @@ use crate::primitives::Weights;
 /// f32 (matching the reference GPU kernel) for stability.
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
 
-/// Parsed Qwen3.6 (`qwen3_5`) text-decoder configuration. Read from the nested `text_config` of the
-/// VLM wrapper (or the top-level config if not wrapped).
+/// Mixture-of-Experts FFN parameters (`qwen3_5_moe`, the 35B-A3B). Every layer's dense MLP is
+/// replaced by a sparse MoE block: a softmax router over `num_experts` experts (top-`experts_per_tok`
+/// per token, weights renormalized to sum to 1) plus a sigmoid-gated always-on shared expert.
+#[derive(Clone, Copy, Debug)]
+pub struct MoeParams {
+    pub num_experts: i32,
+    pub experts_per_tok: usize,
+    pub moe_intermediate_size: i32,
+    pub shared_expert_intermediate_size: i32,
+}
+
+/// Parsed Qwen3.6 (`qwen3_5` / `qwen3_5_moe`) text-decoder configuration. Read from the nested
+/// `text_config` of the VLM wrapper (or the top-level config if not wrapped).
 #[derive(Clone, Debug)]
 pub struct Qwen35Config {
     pub hidden_size: i32,
@@ -59,6 +70,9 @@ pub struct Qwen35Config {
     pub linear_key_head_dim: i32,
     pub linear_value_head_dim: i32,
     pub linear_conv_kernel_dim: i32,
+    /// MoE FFN parameters when this is the MoE variant (`qwen3_5_moe`, 35B-A3B); `None` ⇒ dense MLP
+    /// (`qwen3_5`, 27B).
+    pub moe: Option<MoeParams>,
 }
 
 impl Qwen35Config {
@@ -82,10 +96,15 @@ impl Qwen35Config {
 
         let hidden_size = req("hidden_size")?;
         let num_heads = req("num_attention_heads")?;
+        // The MoE variant (`qwen3_5_moe`) has no dense `intermediate_size` — every layer is MoE —
+        // so fall back to the per-expert width (unused on the MoE path, but keeps the field valid).
+        let intermediate_size = int("intermediate_size")
+            .or_else(|| int("moe_intermediate_size"))
+            .unwrap_or(0);
         Ok(Self {
             hidden_size,
             num_layers: req("num_hidden_layers")? as usize,
-            intermediate_size: req("intermediate_size")?,
+            intermediate_size,
             num_heads,
             num_kv_heads: int("num_key_value_heads").unwrap_or(num_heads),
             head_dim: int("head_dim").unwrap_or(hidden_size / num_heads),
@@ -104,6 +123,14 @@ impl Qwen35Config {
             linear_key_head_dim: req("linear_key_head_dim")?,
             linear_value_head_dim: req("linear_value_head_dim")?,
             linear_conv_kernel_dim: int("linear_conv_kernel_dim").unwrap_or(4),
+            // MoE variant (`qwen3_5_moe`, 35B-A3B) iff `num_experts` is present.
+            moe: int("num_experts").map(|num_experts| MoeParams {
+                num_experts,
+                experts_per_tok: int("num_experts_per_tok").unwrap_or(8).max(1) as usize,
+                moe_intermediate_size: int("moe_intermediate_size").unwrap_or(intermediate_size),
+                shared_expert_intermediate_size: int("shared_expert_intermediate_size")
+                    .unwrap_or(intermediate_size),
+            }),
         })
     }
 
@@ -274,7 +301,7 @@ impl Qwen35Attention {
     }
 }
 
-/// Dense SwiGLU MLP (`Qwen3NextMLP`). The 35B MoE bank is wired in sc-7630.
+/// Dense SwiGLU MLP (`Qwen3_5MLP`) — the 27B FFN and each 35B expert / shared expert.
 #[derive(Debug)]
 struct Mlp {
     gate: Projection,
@@ -290,6 +317,93 @@ impl Mlp {
     }
 }
 
+/// Sparse Mixture-of-Experts FFN (`Qwen3_5MoeSparseMoeBlock`, the 35B-A3B): a softmax router over
+/// `experts` (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
+/// **sigmoid-gated** shared expert. Each expert runs only on its routed tokens (gathered, then
+/// scatter-added back), so active compute scales with `experts_per_tok` (≈3B of 35B). The fused
+/// checkpoint tensors (`experts.gate_up_proj` / `experts.down_proj`) are un-fused into per-expert
+/// [`Mlp`]s at load.
+#[derive(Debug)]
+struct MoeFfn {
+    router: Array, // [num_experts, hidden]
+    experts: Vec<Mlp>,
+    shared: Mlp,
+    shared_gate: Array, // [1, hidden] sigmoid gate
+    experts_per_tok: usize,
+}
+
+impl MoeFfn {
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let sh = x.shape();
+        let (b, s, h) = (sh[0], sh[1], sh[2]);
+        let t = b * s;
+        let dtype = x.dtype();
+        let xf = x.reshape(&[t, h])?;
+        let num_experts = self.experts.len();
+        let k = self.experts_per_tok.min(num_experts).max(1);
+
+        // Router probabilities (f32 softmax on the host, for a stable top-k), then invert the
+        // per-token top-k into per-expert (token, weight) lists with the weights renormalized to 1.
+        let logits = linear(&xf, &self.router, None)?; // [t, num_experts]
+        let logits = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+        let mut routed: Vec<Vec<(i32, f32)>> = vec![Vec::new(); num_experts];
+        for ti in 0..t as usize {
+            let row = &logits[ti * num_experts..(ti + 1) * num_experts];
+            let m = row.iter().copied().fold(f32::MIN, f32::max);
+            let exps: Vec<f32> = row.iter().map(|&x| (x - m).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+            let mut idx: Vec<usize> = (0..num_experts).collect();
+            idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+            let top = &idx[..k];
+            let denom = top.iter().map(|&e| probs[e]).sum::<f32>().max(f32::MIN_POSITIVE);
+            for &e in top {
+                routed[e].push((ti as i32, probs[e] / denom));
+            }
+        }
+
+        // Each expert runs on just its tokens; scatter the weighted outputs back.
+        let mut out = zeros3(t, 1, h, dtype)?.reshape(&[t, h])?;
+        for (e, toks) in routed.iter().enumerate() {
+            if toks.is_empty() {
+                continue;
+            }
+            let n = toks.len() as i32;
+            let idx_i: Vec<i32> = toks.iter().map(|&(ti, _)| ti).collect();
+            let idx_u: Vec<u32> = toks.iter().map(|&(ti, _)| ti as u32).collect();
+            let wts: Vec<f32> = toks.iter().map(|&(_, w)| w).collect();
+            let idx = Array::from_slice(&idx_i, &[n]);
+            let idx_u = Array::from_slice(&idx_u, &[n]);
+            let wts = Array::from_slice(&wts, &[n, 1]).as_dtype(dtype)?;
+            let xe = xf.take_axis(&idx, 0)?; // [n, h]
+            let ye = multiply(&self.experts[e].forward(&xe)?, &wts)?.reshape(&[n, 1, h])?;
+            out = mlx_rs::ops::indexing::scatter_add_single(&out, &idx_u, &ye, 0)?;
+        }
+
+        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
+        let shared = self.shared.forward(&xf)?;
+        let sg = sigmoid(&linear(&xf, &self.shared_gate, None)?)?; // [t, 1]
+        let shared = multiply(&shared, &sg)?;
+        Ok(add(&out, &shared)?.reshape(&[b, s, h])?)
+    }
+}
+
+/// The per-layer FFN: a dense SwiGLU (27B) or a sparse MoE block (35B-A3B).
+#[derive(Debug)]
+enum Ffn {
+    Dense(Mlp),
+    Moe(MoeFfn),
+}
+
+impl Ffn {
+    fn forward(&self, x: &Array) -> Result<Array> {
+        match self {
+            Ffn::Dense(m) => m.forward(x),
+            Ffn::Moe(m) => m.forward(x),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Mixer {
     Delta(GatedDeltaNet),
@@ -301,7 +415,7 @@ struct DecoderLayer {
     input_ln: Array,
     post_ln: Array,
     mixer: Mixer,
-    mlp: Mlp,
+    ffn: Ffn,
     eps: f32,
 }
 
@@ -320,7 +434,7 @@ impl DecoderLayer {
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
         let h = add(x, &r)?;
-        let m = self.mlp.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
+        let m = self.ffn.forward(&rms_norm(&h, &self.post_ln, self.eps)?)?;
         Ok(add(&h, &m)?)
     }
 }
@@ -551,15 +665,52 @@ impl Qwen35Model {
                     eps,
                 })
             };
+            let ffn = match &cfg.moe {
+                // Dense SwiGLU (27B).
+                None => Ffn::Dense(Mlp {
+                    gate: proj_q(lp("mlp.gate_proj.weight"))?,
+                    up: proj_q(lp("mlp.up_proj.weight"))?,
+                    down: proj_q(lp("mlp.down_proj.weight"))?,
+                }),
+                // Sparse MoE (35B-A3B): un-fuse the stacked expert tensors into per-expert SwiGLUs.
+                // `experts.gate_up_proj` is [E, 2·moe_inter, hidden] (gate rows ‖ up rows, matching
+                // the reference `linear(x, gate_up_proj[e]).chunk(2, -1)`); `experts.down_proj` is
+                // [E, hidden, moe_inter].
+                Some(moe) => {
+                    let h = cfg.hidden_size;
+                    let mi = moe.moe_intermediate_size;
+                    let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
+                    let down = req(lp("mlp.experts.down_proj"))?;
+                    let mut experts = Vec::with_capacity(moe.num_experts as usize);
+                    for e in 0..moe.num_experts {
+                        let sel = Array::from_slice(&[e], &[1]);
+                        let gu = gate_up.take_axis(&sel, 0)?.reshape(&[2 * mi, h])?;
+                        let parts = split_sections(&gu, &[mi], 0)?; // [gate_w, up_w]
+                        let dn = down.take_axis(&sel, 0)?.reshape(&[h, mi])?;
+                        experts.push(Mlp {
+                            gate: Projection::load(parts[0].clone(), quant)?,
+                            up: Projection::load(parts[1].clone(), quant)?,
+                            down: Projection::load(dn, quant)?,
+                        });
+                    }
+                    Ffn::Moe(MoeFfn {
+                        router: req(lp("mlp.gate.weight"))?,
+                        experts,
+                        shared: Mlp {
+                            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
+                            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
+                            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
+                        },
+                        shared_gate: req(lp("mlp.shared_expert_gate.weight"))?,
+                        experts_per_tok: moe.experts_per_tok,
+                    })
+                }
+            };
             layers.push(DecoderLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
                 mixer,
-                mlp: Mlp {
-                    gate: proj_q(lp("mlp.gate_proj.weight"))?,
-                    up: proj_q(lp("mlp.up_proj.weight"))?,
-                    down: proj_q(lp("mlp.down_proj.weight"))?,
-                },
+                ffn,
                 eps,
             });
         }
@@ -683,9 +834,24 @@ mod tests {
             let lp = |s: &str| format!("{pfx}.layers.{i}.{s}");
             t(&mut m, &lp("input_layernorm.weight"), &[h]);
             t(&mut m, &lp("post_attention_layernorm.weight"), &[h]);
-            t(&mut m, &lp("mlp.gate_proj.weight"), &[cfg.intermediate_size, h]);
-            t(&mut m, &lp("mlp.up_proj.weight"), &[cfg.intermediate_size, h]);
-            t(&mut m, &lp("mlp.down_proj.weight"), &[h, cfg.intermediate_size]);
+            match &cfg.moe {
+                None => {
+                    t(&mut m, &lp("mlp.gate_proj.weight"), &[cfg.intermediate_size, h]);
+                    t(&mut m, &lp("mlp.up_proj.weight"), &[cfg.intermediate_size, h]);
+                    t(&mut m, &lp("mlp.down_proj.weight"), &[h, cfg.intermediate_size]);
+                }
+                Some(moe) => {
+                    let mi = moe.moe_intermediate_size;
+                    let si = moe.shared_expert_intermediate_size;
+                    t(&mut m, &lp("mlp.experts.gate_up_proj"), &[moe.num_experts, 2 * mi, h]);
+                    t(&mut m, &lp("mlp.experts.down_proj"), &[moe.num_experts, h, mi]);
+                    t(&mut m, &lp("mlp.gate.weight"), &[moe.num_experts, h]);
+                    t(&mut m, &lp("mlp.shared_expert.gate_proj.weight"), &[si, h]);
+                    t(&mut m, &lp("mlp.shared_expert.up_proj.weight"), &[si, h]);
+                    t(&mut m, &lp("mlp.shared_expert.down_proj.weight"), &[h, si]);
+                    t(&mut m, &lp("mlp.shared_expert_gate.weight"), &[1, h]);
+                }
+            }
             if cfg.is_linear(i) {
                 // 4-way split projections (real qwen3_5 layout).
                 t(&mut m, &lp("linear_attn.in_proj_qkv.weight"), &[conv_dim, h]);
@@ -865,5 +1031,102 @@ mod tests {
         let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         // Both bf16 paths; allow small per-op bf16 reorder noise, far below any structural error.
         assert!(md < 5e-2, "prefill vs stepwise last-token logits diverged: max abs diff {md}");
+    }
+
+    /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
+    /// expert. Same 4-layer 3:1 mixer schedule as [`cfg_json`].
+    fn cfg_json_moe() -> serde_json::Value {
+        let mut v = cfg_json();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("model_type".into(), json!("qwen3_5_moe_text"));
+        tc.insert("num_experts".into(), json!(6));
+        tc.insert("num_experts_per_tok".into(), json!(2));
+        tc.insert("moe_intermediate_size".into(), json!(16));
+        tc.insert("shared_expert_intermediate_size".into(), json!(16));
+        v
+    }
+
+    /// The MoE FFN block, validated against a numeric oracle from the exact
+    /// `Qwen3_5MoeSparseMoeBlock.forward` reference: softmax router → top-k → renormalize → per-expert
+    /// SwiGLU (gathered/scattered) → sigmoid-gated shared expert. Builds the block via the same
+    /// un-fuse path as the loader (`experts.gate_up_proj` → per-expert gate/up). Single token (S=1) so
+    /// MLX runs the exact GEMV path and the match is tight; regenerate with `/tmp/gen_moe.py`.
+    #[test]
+    fn moe_ffn_matches_qwen3_5_moe_reference() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
+        let arr = |k: &str| -> Vec<f32> {
+            json[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+        };
+        let (h, e, k, mi) = (8i32, 6i32, 2usize, 4i32);
+        let mk = |key: &str, shape: &[i32]| Array::from_slice(&arr(key), shape);
+        let proj = |a: Array| Projection::load(a, None).unwrap();
+
+        // Un-fuse experts.gate_up_proj / down_proj into per-expert SwiGLUs (mirrors the loader).
+        let gate_up = mk("gate_up", &[e, 2 * mi, h]);
+        let down = mk("down", &[e, h, mi]);
+        let mut experts = Vec::new();
+        for ei in 0..e {
+            let sel = Array::from_slice(&[ei], &[1]);
+            let gu = gate_up.take_axis(&sel, 0).unwrap().reshape(&[2 * mi, h]).unwrap();
+            let parts = split_sections(&gu, &[mi], 0).unwrap();
+            let dn = down.take_axis(&sel, 0).unwrap().reshape(&[h, mi]).unwrap();
+            experts.push(Mlp { gate: proj(parts[0].clone()), up: proj(parts[1].clone()), down: proj(dn) });
+        }
+        let moe = MoeFfn {
+            router: mk("router", &[e, h]),
+            experts,
+            shared: Mlp {
+                gate: proj(mk("sh_gate", &[mi, h])),
+                up: proj(mk("sh_up", &[mi, h])),
+                down: proj(mk("sh_down", &[h, mi])),
+            },
+            shared_gate: mk("sh_gatew", &[1, h]),
+            experts_per_tok: k,
+        };
+
+        let out = moe.forward(&mk("x", &[1, 1, h])).unwrap();
+        assert_eq!(out.shape(), &[1, 1, h]);
+        let got = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let exp = arr("expected_output");
+        let md = got.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(md < 2e-4, "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}");
+    }
+
+    #[test]
+    fn moe_model_forward_and_prefill_equals_stepwise() {
+        let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
+        assert!(cfg.moe.is_some());
+        assert_eq!(cfg.moe.unwrap().num_experts, 6);
+        let model =
+            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg.clone())
+                .unwrap();
+
+        // Multi-token prefill exercises routing/scatter across tokens; logits are finite + shaped.
+        let toks = [1i32, 7, 3, 42, 9];
+        let mut c_pre = model.new_cache();
+        let logits = model
+            .forward(&Array::from_slice(&toks, &[1, toks.len() as i32]), &mut c_pre, 0)
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, toks.len() as i32, cfg.vocab_size]);
+        for x in logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>() {
+            assert!(x.is_finite(), "non-finite MoE logit");
+        }
+
+        // Prefill == stepwise decode over the hybrid cache, with the MoE FFN in the loop.
+        let pre_last = model
+            .decode_logits(&Array::from_slice(&toks, &[1, toks.len() as i32]), &mut model.new_cache(), 0)
+            .unwrap();
+        let mut c_step = model.new_cache();
+        let mut last = None;
+        for (i, &tok) in toks.iter().enumerate() {
+            last = Some(
+                model.decode_logits(&Array::from_slice(&[tok], &[1, 1]), &mut c_step, i as i32).unwrap(),
+            );
+        }
+        let a = pre_last.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let b = last.unwrap().as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(md < 5e-2, "MoE prefill vs stepwise diverged: max abs diff {md}");
     }
 }
