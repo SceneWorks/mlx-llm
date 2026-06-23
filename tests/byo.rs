@@ -6,7 +6,9 @@
 //!   cargo test --test byo -- --ignored --nocapture
 //! ```
 
-use core_llm::{LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm, TextLlmRequest};
+use core_llm::{
+    LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm, TextLlmOutput, TextLlmRequest,
+};
 
 use mlx_llm::provider::PROVIDER_ID;
 use mlx_llm::LlamaProvider;
@@ -21,7 +23,7 @@ fn greedy_req(prompt: &str, n: u32) -> TextLlmRequest {
     }
 }
 
-fn run(provider: &LlamaProvider, prompt: &str, n: u32) -> (String, usize) {
+fn run(provider: &LlamaProvider, prompt: &str, n: u32) -> (TextLlmOutput, usize) {
     let mut tokens = 0usize;
     let out = provider
         .generate(&greedy_req(prompt, n), &mut |ev| {
@@ -30,7 +32,7 @@ fn run(provider: &LlamaProvider, prompt: &str, n: u32) -> (String, usize) {
             }
         })
         .unwrap();
-    (out.text, tokens)
+    (out, tokens)
 }
 
 #[test]
@@ -45,9 +47,15 @@ fn qwen3_dense_dispatch_and_stream() {
     assert!(provider.descriptor().capabilities.max_context_tokens > 0); // context length reported
     assert!(!provider.is_quantized());
 
-    let (text, n) = run(&provider, "The capital of France is", 16);
-    println!("\n[qwen3 dense] {text}\n");
-    assert!(n > 0 && !text.trim().is_empty());
+    // Qwen3 is a thinking model (sc-7585): in its default (Auto) mode a short budget is still inside
+    // the <think> block, so the answer (out.text) may be empty while reasoning streams. Assert the
+    // model streamed coherent text on *either* channel — the reasoning/answer split itself is
+    // covered by tests/thinking.rs.
+    let (out, n) = run(&provider, "The capital of France is", 16);
+    println!("\n[qwen3 dense] answer={:?} thinking={:?}\n", out.text, out.thinking);
+    let produced =
+        !out.text.trim().is_empty() || out.thinking.as_deref().is_some_and(|t| !t.trim().is_empty());
+    assert!(n > 0 && produced);
 }
 
 #[test]
@@ -65,9 +73,9 @@ fn llama_quantize_on_load_q8() {
     .unwrap();
     assert!(q8.is_quantized());
 
-    let (qtext, qn) = run(&q8, "The capital of France is", 16);
-    println!("\n[llama Q8] {qtext}\n");
-    assert!(qn > 0 && !qtext.trim().is_empty());
+    let (qout, qn) = run(&q8, "The capital of France is", 16);
+    println!("\n[llama Q8] {}\n", qout.text);
+    assert!(qn > 0 && !qout.text.trim().is_empty());
 }
 
 #[test]
@@ -80,7 +88,7 @@ fn llama_quantize_on_load_q4() {
     })
     .unwrap();
     assert!(q4.is_quantized());
-    let (text, n) = run(&q4, "The capital of France is", 16);
-    println!("\n[llama Q4] {text}\n");
-    assert!(n > 0 && !text.trim().is_empty());
+    let (out, n) = run(&q4, "The capital of France is", 16);
+    println!("\n[llama Q4] {}\n", out.text);
+    assert!(n > 0 && !out.text.trim().is_empty());
 }

@@ -22,7 +22,7 @@ use mlx_rs::{Array, Dtype};
 use serde_json::Value;
 
 use core_llm::{
-    Content, Error as CoreError, FinishReason as CoreFinish, LoadSpec, Result as CoreResult,
+    Channel, Content, Error as CoreError, FinishReason as CoreFinish, LoadSpec, Result as CoreResult,
     Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
     TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
@@ -413,6 +413,7 @@ impl TextLlm for JoyCaptionProvider {
                         id: id as u32,
                         text: delta,
                         index: step,
+                        channel: Channel::Content, // captioner: no reasoning mode
                     });
                 }
             }
@@ -444,6 +445,7 @@ impl TextLlm for JoyCaptionProvider {
         });
         Ok(TextLlmOutput {
             text,
+            thinking: None,
             usage,
             finish_reason: Some(finish),
         })
@@ -461,6 +463,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             max_new_tokens: 0,
             supports_system_prompt: true,
             supports_vision: true,
+            supports_thinking: false,
             supported_constraints: Vec::new(),
         },
     }
