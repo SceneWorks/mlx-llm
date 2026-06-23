@@ -7,10 +7,15 @@
 //! (decode) and an explicit [`AttnMask::Additive`] mask (the block-causal / bidirectional paths).
 
 use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
-use mlx_rs::ops::{broadcast_to, concatenate_axis};
-use mlx_rs::Array;
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis};
+use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
+use crate::primitives::nn::soft_cap;
+
+/// Disallowed-attention fill for the eager additive mask: a large finite negative (matching the
+/// reference slices — avoids `-inf` propagating through the softmax).
+const MASK_NEG: f32 = -1e30;
 
 /// Max query rows per fused SDPA call (sc-7430 / sc-7455). The pinned pmetal mlx-rs fork's fused
 /// `scaled_dot_product_attention` **GPU** kernel miscompiles its `q_len > 8` "full/steel" path for
@@ -162,6 +167,103 @@ pub fn sdpa_causal(queries: &Array, keys: &Array, values: &Array, scale: f32) ->
     sdpa(queries, keys, values, scale, AttnMask::Causal)
 }
 
+/// Scaled-dot-product attention with optional Gemma-2 score soft-cap, dispatching to the fused MLX
+/// kernel when it can serve the case and an explicit eager path otherwise.
+///
+/// The fused [`sdpa`] cannot express two things the breadth architectures need: Gemma-2's
+/// attention-score soft-cap (`c·tanh(scores/c)` before the softmax), and DeepSeek-V2 MLA's mismatched
+/// query/key head dim (192) vs value head dim (128). When `softcap` is `None` **and** q/v share a
+/// head dim, this is exactly the fused native-GQA hot path (unchanged — `softcap.is_none()` callers
+/// pay nothing). Otherwise it runs the f32-precise eager `softmax(scale·QKᵀ [+softcap] +mask)·V`, with
+/// K/V GQA-expanded inside (see [`repeat_kv`]).
+pub fn sdpa_capped(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    softcap: Option<f32>,
+    mask: AttnMask<'_>,
+) -> Result<Array> {
+    let q_hd = queries.shape()[3];
+    let v_hd = values.shape()[3];
+    if softcap.is_none() && q_hd == v_hd {
+        return sdpa(queries, keys, values, scale, mask);
+    }
+    sdpa_eager(queries, keys, values, scale, softcap, mask)
+}
+
+/// The eager `softmax(scale · QKᵀ [+ softcap] + mask) · V` path — the portable fallback
+/// [`sdpa_capped`] runs when the fused kernel can't serve the case. Computed in f32 (the scores,
+/// soft-cap, and softmax all upcast), then cast back to the queries' dtype, so bf16 decoders stay
+/// numerically stable through the score soft-cap. K/V are GQA-expanded here (`groups = q_heads /
+/// kv_heads`); the value head dim may differ from the query/key head dim (MLA).
+fn sdpa_eager(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    softcap: Option<f32>,
+    mask: AttnMask<'_>,
+) -> Result<Array> {
+    let out_dtype = queries.dtype();
+    let groups = queries.shape()[1] / keys.shape()[1];
+    let q = queries.as_dtype(Dtype::Float32)?;
+    let k = repeat_kv(&keys.as_dtype(Dtype::Float32)?, groups)?;
+    let v = repeat_kv(&values.as_dtype(Dtype::Float32)?, groups)?;
+    let (b, nh) = (q.shape()[0], q.shape()[1]);
+    let q_len = q.shape()[2];
+    let k_len = k.shape()[2];
+
+    // scores = (q @ kᵀ) * scale → [b, heads, q_len, k_len]. MLX's batched 4-D `matmul` misreads the
+    // `[b, heads]` leading dims on this fork (wrong results for multi-head/large shapes — the fused
+    // SDPA avoids raw matmul), so fold `[b, heads]` into one batch axis and run 3-D batched matmuls.
+    let kt = k.transpose_axes(&[0, 1, 3, 2])?;
+    let scores = bmm(&q, &kt, b * nh)?; // [b, heads, q_len, k_len]
+    let mut scores = multiply(&scores, Array::from_f32(scale))?;
+    if let Some(c) = softcap {
+        scores = soft_cap(&scores, c)?;
+    }
+    let scores = match mask {
+        AttnMask::None => scores,
+        AttnMask::Causal => add(&scores, &causal_mask(q_len, k_len)?)?,
+        AttnMask::Additive(a) => add(&scores, &a.as_dtype(Dtype::Float32)?)?,
+    };
+    let last_axis = scores.ndim() as i32 - 1;
+    let weights = softmax_axis(&scores, last_axis, None)?;
+    let out = bmm(&weights, &v, b * nh)?; // [b, heads, q_len, v_head_dim]
+    Ok(out.as_dtype(out_dtype)?)
+}
+
+/// Batched matrix multiply `a @ b` over 4-D `[lead0, lead1, m, k] @ [lead0, lead1, k, n]` tensors,
+/// run as a **3-D** batched matmul over a single folded batch axis (`batch = lead0 · lead1`). MLX's
+/// 4-D batched `matmul` returns wrong results on this fork for multi-batch/large shapes; folding to
+/// 3-D sidesteps it. Reshape materializes any transposed/broadcast operand into row-major storage.
+fn bmm(a: &Array, b: &Array, batch: i32) -> Result<Array> {
+    let sa = a.shape();
+    let sb = b.shape();
+    let (lead0, lead1, m, k) = (sa[0], sa[1], sa[2], sa[3]);
+    let n = sb[3];
+    let a3 = a.reshape(&[batch, m, k])?;
+    let b3 = b.reshape(&[batch, k, n])?;
+    Ok(matmul(&a3, &b3)?.reshape(&[lead0, lead1, m, n])?)
+}
+
+/// The additive causal mask `[1, 1, q_len, k_len]` (`0` keep / [`MASK_NEG`] block) for keys that
+/// include `offset = k_len - q_len` cached positions before the new queries — bottom-right aligned, so
+/// query row `r` attends keys `0..=offset+r` (matching the fused kernel's implicit causal convention).
+fn causal_mask(q_len: i32, k_len: i32) -> Result<Array> {
+    let offset = k_len - q_len;
+    let mut data = vec![0f32; (q_len * k_len) as usize];
+    for r in 0..q_len {
+        for j in 0..k_len {
+            if j > offset + r {
+                data[(r * k_len + j) as usize] = MASK_NEG;
+            }
+        }
+    }
+    Ok(Array::from_slice(&data, &[1, 1, q_len, k_len]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,9 +358,10 @@ mod tests {
     }
 
     /// From-scratch host attention `softmax(scale·QKᵀ [+causal])·V` over `[1, h, ·, hd]` GQA tensors
-    /// (kv expanded to `h`), f64 accumulation — the ground truth the fused kernel is gated against.
-    /// Causal aligns the `ql` queries to the bottom-right of the `kl` keys (offset = kl − ql).
-    fn host_attn(q: &Array, k: &Array, v: &Array, groups: i32, scale: f32, causal: bool) -> Vec<f32> {
+    /// (kv expanded to `h`), f64 accumulation — the ground truth the chunked-prefill mitigation is
+    /// gated against. Causal aligns the `ql` queries to the bottom-right of the `kl` keys
+    /// (offset = kl − ql), so it also covers a cached prefix.
+    fn host_attn_gqa(q: &Array, k: &Array, v: &Array, groups: i32, scale: f32, causal: bool) -> Vec<f32> {
         let kx = repeat_kv(k, groups).unwrap();
         let vx = repeat_kv(v, groups).unwrap();
         let (qs, ks) = (q.shape(), kx.shape());
@@ -286,6 +389,44 @@ mod tests {
                 for d in 0..hd {
                     let acc: f64 = (0..=jmax).map(|j| logits[j] / denom * vh[kb + j * hd + d] as f64).sum();
                     out[(head * ql + i) * hd + d] = acc as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// The eager path (no soft-cap, equal head dims) must match the fused kernel within a small
+    /// tolerance — across decode/prefill/GQA shapes and the causal + no-mask cases. This is the
+    /// correctness gate that lets Gemma-2 (which forces eager via soft-cap) and MLA (mismatched dims)
+    /// trust the eager softmax against the same reference the rest of the engine uses.
+    /// Host reference: per-head softmax(scale·q·kᵀ [+causal])·v over `[1, h, s, *]` MHA tensors. The
+    /// value head dim (`vhd`) may differ from the q/k head dim (`hd`) — the DeepSeek MLA case.
+    fn host_attn(q: &Array, k: &Array, v: &Array, scale: f32, causal: bool) -> Vec<f32> {
+        let (qs, vs) = (q.shape(), v.shape());
+        let (h, s, hd) = (qs[1] as usize, qs[2] as usize, qs[3] as usize);
+        let vhd = vs[3] as usize;
+        let (qh, kh, vh) = (q.as_slice::<f32>(), k.as_slice::<f32>(), v.as_slice::<f32>());
+        let qk_at = |t: &[f32], head: usize, i: usize, d: usize| t[(head * s + i) * hd + d];
+        let v_at = |head: usize, j: usize, d: usize| vh[(head * s + j) * vhd + d];
+        let mut out = vec![0f32; h * s * vhd];
+        for head in 0..h {
+            for i in 0..s {
+                let mut logits = vec![0f32; s];
+                for (j, lj) in logits.iter_mut().enumerate() {
+                    let dot: f32 = (0..hd).map(|d| qk_at(qh, head, i, d) * qk_at(kh, head, j, d)).sum();
+                    *lj = dot * scale;
+                }
+                let jmax = if causal { i } else { s - 1 };
+                let m = (0..=jmax).map(|j| logits[j]).fold(f32::MIN, f32::max);
+                let mut denom = 0f32;
+                let mut w = vec![0f32; s];
+                for j in 0..=jmax {
+                    w[j] = (logits[j] - m).exp();
+                    denom += w[j];
+                }
+                for d in 0..vhd {
+                    let acc: f32 = (0..=jmax).map(|j| w[j] / denom * v_at(head, j, d)).sum();
+                    out[(head * s + i) * vhd + d] = acc;
                 }
             }
         }
@@ -322,9 +463,42 @@ mod tests {
             let groups = nh / nkv;
             for (causal, mask) in [(false, AttnMask::None), (true, AttnMask::Causal)] {
                 let out = sdpa(&q, &k, &v, scale, mask).unwrap();
-                let host = host_attn(&q, &k, &v, groups, scale, causal);
+                let host = host_attn_gqa(&q, &k, &v, groups, scale, causal);
                 let e = rel_err(out.as_slice::<f32>(), &host);
                 assert!(e < 2e-3, "fused sdpa wrong on a SAFE shape {nh}/{nkv}/{ql}/{kl}/{hd} causal={causal}: rel={e}");
+            }
+        }
+    }
+
+    /// The eager path must match a from-scratch host attention (the ground truth) — across GQA / MHA
+    /// shapes, both masks, GQA expansion, and a mismatched value head dim (MLA). This is the
+    /// correctness gate for Gemma-2 (forced eager by its score soft-cap) and DeepSeek-V2 MLA, pinning
+    /// the eager f32 path directly to truth.
+    #[test]
+    fn sdpa_eager_matches_host_reference() {
+        // (b, n_heads, n_kv_heads, seq, qk_head_dim, v_head_dim)
+        let cases = [
+            (1, 8, 2, 16, 64, 64), // prefill, groups=4
+            (1, 2, 2, 16, 64, 64), // MHA big s/hd
+            (1, 4, 4, 7, 32, 32),  // MHA small
+            (1, 2, 2, 5, 6, 4),    // MLA-style: q/k head_dim 6, v head_dim 4
+        ];
+        let maxdiff = |a: &[f32], b: &[f32]| {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        };
+        for (b, nh, nkv, s, hd, vhd) in cases {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let q = randf(&[b, nh, s, hd], 1);
+            let k = randf(&[b, nkv, s, hd], 2);
+            let v = randf(&[b, nkv, s, vhd], 3);
+            let groups = nh / nkv;
+            let kx = repeat_kv(&k, groups).unwrap(); // [1, nh, s, hd] for the host reference
+            let vx = repeat_kv(&v, groups).unwrap();
+            for (causal, mask) in [(false, AttnMask::None), (true, AttnMask::Causal)] {
+                let href = host_attn(&q, &kx, &vx, scale, causal);
+                let eager = sdpa_eager(&q, &k, &v, scale, None, mask).unwrap();
+                let de = maxdiff(&href, eager.as_slice::<f32>());
+                assert!(de < 2e-3, "eager {b}/{nh}/{nkv}/{s}/{hd}/{vhd} causal={causal}: max|Δ| vs host = {de}");
             }
         }
     }
@@ -347,7 +521,7 @@ mod tests {
                 &q, &k, &v, scale, Some(ScaledDotProductAttentionMask::Causal), None,
             )
             .unwrap();
-            let host = host_attn(&q, &k, &v, 1, scale, true);
+            let host = host_attn_gqa(&q, &k, &v, 1, scale, true);
             if rel_err(raw.as_slice::<f32>(), &host) > 0.1 {
                 broken += 1;
             }
@@ -382,7 +556,7 @@ mod tests {
             for (causal, mask) in [(false, AttnMask::None), (true, AttnMask::Causal)] {
                 let out = sdpa(&q, &k, &v, scale, mask).unwrap();
                 assert_eq!(out.shape(), &[1, nh, ql, hd]);
-                let host = host_attn(&q, &k, &v, groups, scale, causal);
+                let host = host_attn_gqa(&q, &k, &v, groups, scale, causal);
                 let e = rel_err(out.as_slice::<f32>(), &host);
                 assert!(e < 2e-3, "chunked sdpa wrong {nh}/{nkv}/{ql}/{kl}/{hd} causal={causal}: rel={e}");
             }
@@ -410,8 +584,40 @@ mod tests {
         }
         let m = Array::from_slice(&md, &[1, 1, ql, ql]);
         let out = sdpa(&q, &k, &v, scale, AttnMask::Additive(&m)).unwrap();
-        let host = host_attn(&q, &k, &v, 1, scale, true);
+        let host = host_attn_gqa(&q, &k, &v, 1, scale, true);
         let e = rel_err(out.as_slice::<f32>(), &host);
         assert!(e < 2e-3, "chunked additive-mask sdpa wrong: rel={e}");
+    }
+
+    /// `sdpa_capped` routes a mismatched query/value head dim (DeepSeek-V2 MLA: q/k=6, v=4) through the
+    /// eager path and produces finite `[b, heads, s, v_head_dim]` output.
+    #[test]
+    fn sdpa_capped_handles_mla_head_dims() {
+        let (b, h, s, qk_hd, v_hd) = (1, 2, 3, 6, 4);
+        let scale = 1.0 / (qk_hd as f32).sqrt();
+        let q = randf(&[b, h, s, qk_hd], 1);
+        let k = randf(&[b, h, s, qk_hd], 2);
+        let v = randf(&[b, h, s, v_hd], 3);
+        let out = sdpa_capped(&q, &k, &v, scale, None, AttnMask::Causal).unwrap();
+        assert_eq!(out.shape(), &[b, h, s, v_hd]);
+        assert!(out.as_slice::<f32>().iter().all(|x| x.is_finite()));
+    }
+
+    /// A dominant soft-cap pulls extreme scores toward `±cap`, so the attention distribution over a
+    /// peaked key set is flatter than the uncapped one (the Gemma-2 effect).
+    #[test]
+    fn softcap_flattens_attention() {
+        // One query, three keys with very different alignments → uncapped attention is peaky.
+        let (b, h, s) = (1, 1, 1);
+        let q = Array::from_slice(&[1.0f32, 0.0], &[b, h, s, 2]);
+        let k = Array::from_slice(&[10.0f32, 0.0, 0.0, 10.0, 5.0, 5.0], &[b, h, 3, 2]);
+        let v = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[b, h, 3, 2]);
+        let uncapped = sdpa_capped(&q, &k, &v, 1.0, None, AttnMask::None).unwrap();
+        let capped = sdpa_capped(&q, &k, &v, 1.0, Some(2.0), AttnMask::None).unwrap();
+        // With a tight cap the output moves toward the mean of the values (a flatter mix).
+        let mean = 3.0f32; // mean of v[:,0] = (1+3+5)/3
+        let u = uncapped.as_slice::<f32>()[0];
+        let c = capped.as_slice::<f32>()[0];
+        assert!((c - mean).abs() < (u - mean).abs(), "capped {c} should be nearer mean {mean} than uncapped {u}");
     }
 }

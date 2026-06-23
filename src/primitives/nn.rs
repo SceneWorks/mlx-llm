@@ -62,6 +62,17 @@ pub fn gelu_tanh(x: &Array) -> Result<Array> {
     Ok(mlx_rs::nn::gelu_approximate(x)?)
 }
 
+/// Logit soft-cap `cap · tanh(x / cap)` (Gemma-2 caps attention scores and final logits). A no-op as
+/// `cap → ∞`; it squashes extremes toward `±cap` while staying ~linear near 0. Dtype-preserving (the
+/// scalars are cast to `x`'s dtype), so the caller controls precision — pass f32 where it matters.
+pub fn soft_cap(x: &Array, cap: f32) -> Result<Array> {
+    use mlx_rs::ops::{multiply, tanh};
+    let inv = Array::from_f32(1.0 / cap).as_dtype(x.dtype())?;
+    let c = Array::from_f32(cap).as_dtype(x.dtype())?;
+    let capped = tanh(&multiply(x, &inv)?)?;
+    Ok(multiply(&capped, &c)?)
+}
+
 /// SwiGLU MLP block: `down( silu(gate(x)) * up(x) )`. All weights `[out, in]`, bias-free.
 pub fn swiglu(x: &Array, gate_w: &Array, up_w: &Array, down_w: &Array) -> Result<Array> {
     let gate = silu(&linear(x, gate_w, None)?)?;

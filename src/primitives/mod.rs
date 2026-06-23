@@ -23,9 +23,9 @@ pub mod rope;
 pub mod sampler;
 pub mod weights;
 
-pub use attention::{repeat_kv, sdpa, sdpa_causal, AttnMask};
+pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, AttnMask};
 pub use kv_cache::{ContiguousKvCache, KvCache};
-pub use nn::{conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm};
+pub use nn::{conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, soft_cap};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{Projection, QuantSpec};
 pub use quant::QuantizedLinear;
