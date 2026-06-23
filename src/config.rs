@@ -2,7 +2,9 @@
 //!
 //! Value-based parsing (no `serde` derive) matching the mlx-gen provider convention, so config keys
 //! can vary and default gracefully. Story 7156 covers the Llama family; BYO architecture dispatch
-//! (story 7163) layers on top.
+//! (story 7163) layers Qwen3 on top; model breadth (story 7173) adds Phi-3, Qwen2-MoE, Gemma-2,
+//! GLM-4, and DeepSeek-V2 (MLA) behind the same single generic decoder. Mirrors candle-llm's
+//! `config.rs` (the cross-backend blueprint) so the two backends dispatch identically.
 
 use std::path::Path;
 
@@ -14,10 +16,28 @@ use crate::primitives::{QuantSpec, Rope};
 /// The decoder architecture, dispatched from `config.json` (`architectures` / `model_type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
-    /// Llama family (also Mistral — same decoder shape: no q/k norm, no QKV bias).
+    /// Llama family (also Mistral, and dense Qwen2 — same decoder shape: no q/k norm; Qwen2 only
+    /// adds q/k/v bias, auto-detected by weight-key presence).
     Llama,
     /// Qwen3 family: adds per-head q/k RMSNorm in attention.
     Qwen3,
+    /// Phi-3 family: the Llama decoder shape, but with a **packed** `qkv_proj` (q‖k‖v) and a packed
+    /// `gate_up_proj` (gate‖up) — split at load into the standard projections.
+    Phi3,
+    /// Qwen2-MoE family: Qwen2 attention (GQA **with q/k/v bias**, no q/k norm) + a sparse
+    /// mixture-of-experts FFN (router + top-k experts + a shared expert).
+    Qwen2Moe,
+    /// Gemma-2 family: `(1 + weight)` RMSNorm, embedding ×√hidden, GeGLU, a `query_pre_attn_scalar`
+    /// attention scale, attention- and final-logit soft-capping, and a 4-norm "sandwich" block.
+    Gemma2,
+    /// GLM-4 family: a 4-norm sandwich block (standard RMSNorm), q/k/v bias, a packed `gate_up_proj`,
+    /// and **partial, interleaved** RoPE (only `head_dim · partial_rotary_factor` dims are rotated).
+    Glm4,
+    /// DeepSeek-V2 family: **Multi-head Latent Attention (MLA)** — a low-rank compressed KV path
+    /// (`kv_a`/`kv_b` projections, a decoupled RoPE key sub-vector) that is a distinct attention
+    /// implementation rather than GQA — plus a fine-grained MoE FFN (many routed experts, several
+    /// shared experts, the first layers dense) and YaRN RoPE on the `qk_rope_head_dim` sub-vector.
+    DeepseekV2,
 }
 
 impl Architecture {
@@ -38,11 +58,24 @@ impl Architecture {
         );
         if hay.contains("qwen3") {
             Ok(Architecture::Qwen3)
+        } else if hay.contains("qwen2_moe") || hay.contains("qwen2moe") {
+            Ok(Architecture::Qwen2Moe)
+        } else if hay.contains("gemma2") {
+            Ok(Architecture::Gemma2)
+        } else if hay.contains("glm4") {
+            Ok(Architecture::Glm4)
+        } else if hay.contains("deepseek") {
+            Ok(Architecture::DeepseekV2)
+        } else if hay.contains("phi3") {
+            Ok(Architecture::Phi3)
         } else if hay.contains("llama")
             || hay.contains("mistral")
+            || hay.contains("qwen2")
             || (arch.is_none() && model_type.is_none())
         {
-            // Llama/Mistral share the decoder shape; a minimal config (no arch fields) defaults here.
+            // Llama / Mistral / dense Qwen2 share the decoder shape — Qwen2 only adds q/k/v bias,
+            // which the projection loader auto-detects by weight-key presence (no q/k norm, standard
+            // RoPE, SwiGLU). A minimal config (no arch fields) also defaults here.
             Ok(Architecture::Llama)
         } else {
             Err(Error::Unsupported(format!(
@@ -51,12 +84,41 @@ impl Architecture {
         }
     }
 
-    /// The model-family tag (`"llama"` / `"qwen3"`).
+    /// The model-family tag.
     pub fn family(self) -> &'static str {
         match self {
             Architecture::Llama => "llama",
             Architecture::Qwen3 => "qwen3",
+            Architecture::Phi3 => "phi3",
+            Architecture::Qwen2Moe => "qwen2_moe",
+            Architecture::Gemma2 => "gemma2",
+            Architecture::Glm4 => "glm4",
+            Architecture::DeepseekV2 => "deepseek_v2",
         }
+    }
+
+    /// Whether this is a Gemma-2 decoder (drives `(1+weight)` norms, embedding scaling, GeGLU, the
+    /// sandwich-norm block, and logit soft-capping).
+    pub fn is_gemma2(self) -> bool {
+        matches!(self, Architecture::Gemma2)
+    }
+
+    /// Whether the block uses the 4-norm "sandwich" residual (Gemma-2, GLM-4) rather than the plain
+    /// Llama pre-norm.
+    pub fn is_sandwich(self) -> bool {
+        matches!(self, Architecture::Gemma2 | Architecture::Glm4)
+    }
+
+    /// Whether RoPE uses the interleaved (GPT-J-style) pairing rather than NeoX half-split (GLM-4,
+    /// and the DeepSeek MLA rope sub-vector — DeepSeek's de-interleave-then-rotate is equivalent to
+    /// the interleaved convention applied to the raw projection).
+    pub fn rope_interleaved(self) -> bool {
+        matches!(self, Architecture::Glm4 | Architecture::DeepseekV2)
+    }
+
+    /// Whether attention uses Multi-head Latent Attention (DeepSeek-V2) rather than GQA.
+    pub fn is_mla(self) -> bool {
+        matches!(self, Architecture::DeepseekV2)
     }
 
     /// Whether attention applies per-head q/k RMSNorm (Qwen3).
@@ -78,7 +140,85 @@ pub struct RopeScaling {
     pub original_context: f32,
 }
 
-/// Configuration for a Llama-family decoder.
+/// Mixture-of-Experts FFN parameters (Qwen2-MoE, DeepSeek-V2). Present when a layer's dense MLP is
+/// replaced by a router + routed expert bank + shared expert(s).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeConfig {
+    /// Total number of routed experts (`num_experts` / `n_routed_experts`).
+    pub num_experts: usize,
+    /// Experts activated per token (top-k routing).
+    pub num_experts_per_tok: usize,
+    /// Inner width of each routed expert's SwiGLU.
+    pub moe_intermediate_size: i32,
+    /// Inner width of the always-on shared expert's SwiGLU (DeepSeek packs `n_shared_experts` shared
+    /// experts into one MLP, so this is `n_shared_experts · moe_intermediate_size`).
+    pub shared_expert_intermediate_size: i32,
+    /// Whether the top-k routing weights are renormalized to sum to 1.
+    pub norm_topk_prob: bool,
+    /// Multiplier applied to the routed-expert weights when they are *not* renormalized (DeepSeek's
+    /// `routed_scaling_factor`; `1.0` for Qwen2-MoE).
+    pub routed_scaling_factor: f32,
+    /// Number of leading layers that stay a dense MLP before the MoE layers begin (DeepSeek's
+    /// `first_k_dense_replace`; `0` for Qwen2-MoE — every layer is MoE).
+    pub first_k_dense_replace: usize,
+}
+
+/// Multi-head Latent Attention parameters (DeepSeek-V2). Present when attention uses a low-rank
+/// compressed KV path instead of GQA.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MlaConfig {
+    /// Low-rank dimension of the query down-projection (`q_a_proj`); `None` ⇒ a full `q_proj`
+    /// (DeepSeek-V2-Lite has no query LoRA).
+    pub q_lora_rank: Option<i32>,
+    /// Low-rank dimension of the shared KV down-projection (`kv_a_proj_with_mqa` → `kv_a_layernorm`).
+    pub kv_lora_rank: i32,
+    /// Per-head non-rotary (content) query/key dimension.
+    pub qk_nope_head_dim: i32,
+    /// Per-head rotary (decoupled-RoPE) query/key dimension.
+    pub qk_rope_head_dim: i32,
+    /// Per-head value dimension (may differ from the q/k head dim).
+    pub v_head_dim: i32,
+}
+
+impl MlaConfig {
+    /// The full per-head query/key dimension attended over: `qk_nope_head_dim + qk_rope_head_dim`.
+    pub fn q_head_dim(&self) -> i32 {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+}
+
+/// YaRN RoPE-scaling parameters (DeepSeek-V2). A wavelength-ramped blend of extrapolated
+/// (high-frequency) and interpolated (low-frequency, divided by `factor`) inverse frequencies, plus
+/// an attention-softmax magnitude scale (`mscale`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct YarnConfig {
+    /// Context-extension factor (interpolated frequencies are divided by this).
+    pub factor: f32,
+    /// Fast-rotation boundary (dims with shorter wavelength are extrapolated unchanged).
+    pub beta_fast: f32,
+    /// Slow-rotation boundary (dims with longer wavelength are interpolated).
+    pub beta_slow: f32,
+    /// Original (pre-extension) max context.
+    pub original_context: f32,
+    /// Magnitude scale for the cos/sin tables.
+    pub mscale: f32,
+    /// Magnitude scale applied to the attention softmax scale (`mscale_all_dim`).
+    pub mscale_all_dim: f32,
+}
+
+impl YarnConfig {
+    /// YaRN attention-softmax magnitude scale: `0.1 · mscale_all_dim · ln(factor) + 1` (`1.0` when
+    /// `factor ≤ 1`). The attention scale is multiplied by this **squared**.
+    fn softmax_mscale(&self) -> f32 {
+        if self.factor > 1.0 {
+            0.1 * self.mscale_all_dim * self.factor.ln() + 1.0
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Configuration for a generic causal decoder (Llama family + the breadth architectures).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
     /// Model/residual width.
@@ -103,7 +243,7 @@ pub struct ModelConfig {
     pub rope_scaling: Option<RopeScaling>,
     /// Whether `lm_head` is tied to the input embeddings.
     pub tie_word_embeddings: bool,
-    /// The decoder architecture (drives q/k norm and the family tag).
+    /// The decoder architecture (drives q/k norm, the family tag, and the breadth-specific paths).
     pub architecture: Architecture,
     /// Max context length (`max_position_embeddings`); `0` if unspecified.
     pub max_position_embeddings: i32,
@@ -111,6 +251,21 @@ pub struct ModelConfig {
     /// `config.json`, e.g. from the GGUF converter): the group size / bit width the stored
     /// `weight`/`scales`/`biases` tensors were packed with. `None` ⇒ a dense snapshot.
     pub quantization: Option<QuantSpec>,
+    /// Mixture-of-Experts parameters, present for an MoE decoder (Qwen2-MoE, DeepSeek-V2); `None` ⇒
+    /// dense MLP.
+    pub moe: Option<MoeConfig>,
+    /// Gemma-2 attention-score soft-cap (`attn_logit_softcapping`); `None` ⇒ no cap.
+    pub attn_logit_softcap: Option<f32>,
+    /// Gemma-2 final-logit soft-cap (`final_logit_softcapping`); `None` ⇒ no cap.
+    pub final_logit_softcap: Option<f32>,
+    /// Gemma-2 attention scale denominator (`query_pre_attn_scalar`); `None` ⇒ `head_dim`.
+    pub query_pre_attn_scalar: Option<i32>,
+    /// Fraction of `head_dim` that RoPE rotates (`partial_rotary_factor`); `1.0` ⇒ full rotary.
+    pub partial_rotary_factor: f32,
+    /// Multi-head Latent Attention parameters, present for a DeepSeek-V2 decoder; `None` ⇒ GQA.
+    pub mla: Option<MlaConfig>,
+    /// YaRN RoPE-scaling parameters (DeepSeek-V2); `None` ⇒ no YaRN.
+    pub yarn: Option<YarnConfig>,
 }
 
 impl ModelConfig {
@@ -120,10 +275,25 @@ impl ModelConfig {
         let req_int = |key: &str| -> Result<i32> {
             int(key).ok_or_else(|| Error::Config(format!("config.json missing integer `{key}`")))
         };
+        let f32_opt =
+            |key: &str| -> Option<f32> { v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32) };
 
         let hidden_size = req_int("hidden_size")?;
         let num_heads = req_int("num_attention_heads")?;
-        let head_dim = int("head_dim").unwrap_or(hidden_size / num_heads);
+        // Multi-head Latent Attention (DeepSeek-V2): present iff the KV low-rank dim is configured.
+        // `q_lora_rank` is `null` for DeepSeek-V2-Lite (a full `q_proj`), an int for the larger models.
+        let mla = int("kv_lora_rank").map(|kv_lora_rank| MlaConfig {
+            q_lora_rank: int("q_lora_rank"),
+            kv_lora_rank,
+            qk_nope_head_dim: int("qk_nope_head_dim").unwrap_or(0),
+            qk_rope_head_dim: int("qk_rope_head_dim").unwrap_or(0),
+            v_head_dim: int("v_head_dim").unwrap_or(hidden_size / num_heads),
+        });
+        // MLA attends over `qk_nope_head_dim + qk_rope_head_dim` per head (no `head_dim` config key).
+        let head_dim = match &mla {
+            Some(m) => m.q_head_dim(),
+            None => int("head_dim").unwrap_or(hidden_size / num_heads),
+        };
         let num_kv_heads = int("num_key_value_heads").unwrap_or(num_heads);
         let num_layers = req_int("num_hidden_layers")? as usize;
         let intermediate_size = req_int("intermediate_size")?;
@@ -138,12 +308,18 @@ impl ModelConfig {
             .and_then(|x| x.as_f64())
             .map(|x| x as f32)
             .unwrap_or(500_000.0);
+        let architecture = Architecture::from_config(v)?;
         let tie_word_embeddings = v
             .get("tie_word_embeddings")
             .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        let architecture = Architecture::from_config(v)?;
+            // Gemma always ties its (huge) embedding to the LM head; the config often omits the key.
+            .unwrap_or(architecture.is_gemma2());
         let max_position_embeddings = int("max_position_embeddings").unwrap_or(0);
+
+        let attn_logit_softcap = f32_opt("attn_logit_softcapping");
+        let final_logit_softcap = f32_opt("final_logit_softcapping");
+        let query_pre_attn_scalar = int("query_pre_attn_scalar");
+        let partial_rotary_factor = f32_opt("partial_rotary_factor").unwrap_or(1.0);
 
         // A `quantization` block marks a pre-quantized snapshot (the GGUF converter writes it).
         let quantization = v.get("quantization").and_then(|q| {
@@ -152,9 +328,64 @@ impl ModelConfig {
             Some(QuantSpec { group_size, bits })
         });
 
+        // Mixture-of-Experts FFN params: present iff a routed-expert count is configured
+        // (`num_experts` for Qwen2-MoE, `n_routed_experts` for DeepSeek-V2).
+        let moe = int("num_experts")
+            .or_else(|| int("n_routed_experts"))
+            .map(|num_experts| {
+                let moe_inter = int("moe_intermediate_size").unwrap_or(intermediate_size);
+                MoeConfig {
+                    num_experts: num_experts as usize,
+                    num_experts_per_tok: int("num_experts_per_tok").unwrap_or(num_experts).max(1)
+                        as usize,
+                    moe_intermediate_size: moe_inter,
+                    // Qwen2 gives the shared width directly; DeepSeek packs `n_shared_experts` of them.
+                    shared_expert_intermediate_size: int("shared_expert_intermediate_size")
+                        .or_else(|| int("n_shared_experts").map(|n| n * moe_inter))
+                        .unwrap_or(intermediate_size),
+                    norm_topk_prob: v
+                        .get("norm_topk_prob")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false),
+                    routed_scaling_factor: f32_opt("routed_scaling_factor").unwrap_or(1.0),
+                    first_k_dense_replace: int("first_k_dense_replace").unwrap_or(0).max(0) as usize,
+                }
+            });
+
+        // YaRN RoPE scaling (DeepSeek-V2): a separate `rope_scaling` block of `type: "yarn"`.
+        let yarn = v.get("rope_scaling").and_then(|rs| {
+            let ty = rs
+                .get("type")
+                .or_else(|| rs.get("rope_type"))
+                .and_then(|x| x.as_str());
+            if ty != Some("yarn") {
+                return None;
+            }
+            let f = |key: &str, default: f32| {
+                rs.get(key)
+                    .and_then(|x| x.as_f64())
+                    .map(|x| x as f32)
+                    .unwrap_or(default)
+            };
+            Some(YarnConfig {
+                factor: f("factor", 1.0),
+                beta_fast: f("beta_fast", 32.0),
+                beta_slow: f("beta_slow", 1.0),
+                original_context: f("original_max_position_embeddings", 4096.0),
+                mscale: f("mscale", 1.0),
+                mscale_all_dim: f("mscale_all_dim", 0.0),
+            })
+        });
+
         let rope_scaling = v.get("rope_scaling").and_then(|rs| {
-            // Only the "llama3" schedule is parsed; absent / other types fall back to standard RoPE.
-            let f = |key: &str, default: f32| rs.get(key).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(default);
+            // Only the "llama3" schedule is parsed here; absent / other types (e.g. yarn) fall back to
+            // standard / the dedicated yarn path.
+            let f = |key: &str, default: f32| {
+                rs.get(key)
+                    .and_then(|x| x.as_f64())
+                    .map(|x| x as f32)
+                    .unwrap_or(default)
+            };
             let is_llama3 = rs
                 .get("rope_type")
                 .or_else(|| rs.get("type"))
@@ -187,7 +418,30 @@ impl ModelConfig {
             architecture,
             max_position_embeddings,
             quantization,
+            moe,
+            attn_logit_softcap,
+            final_logit_softcap,
+            query_pre_attn_scalar,
+            partial_rotary_factor,
+            mla,
+            yarn,
         })
+    }
+
+    /// Number of head dimensions RoPE rotates (`round(head_dim · partial_rotary_factor)`, even).
+    pub fn rotary_dim(&self) -> i32 {
+        let rd = (self.head_dim as f32 * self.partial_rotary_factor).round() as i32;
+        rd & !1 // force even (RoPE rotates in pairs)
+    }
+
+    /// Whether the decoder uses a Mixture-of-Experts FFN.
+    pub fn is_moe(&self) -> bool {
+        self.moe.is_some()
+    }
+
+    /// Whether the decoder uses Multi-head Latent Attention (DeepSeek-V2).
+    pub fn is_mla(&self) -> bool {
+        self.mla.is_some()
     }
 
     /// Whether attention applies per-head q/k RMSNorm (Qwen3).
@@ -205,8 +459,28 @@ impl ModelConfig {
         Self::from_json(&v)
     }
 
-    /// Build the RoPE for this config (Llama-3 scaled when `rope_scaling` is present, else standard).
+    /// Build the RoPE for this config. DeepSeek-V2 (MLA) rotates only the `qk_rope_head_dim`
+    /// sub-vector with YaRN-scaled, interleaved frequencies; GLM-4 uses partial/interleaved RoPE;
+    /// Llama-3 scaling applies the NTK-by-parts schedule; otherwise standard full-width NeoX RoPE.
     pub fn build_rope(&self) -> Rope {
+        if let Some(mla) = self.mla {
+            let rope_dim = mla.qk_rope_head_dim;
+            return match self.yarn {
+                Some(y) => Rope::yarn(
+                    rope_dim,
+                    self.rope_theta,
+                    y.factor,
+                    y.beta_fast,
+                    y.beta_slow,
+                    y.original_context,
+                ),
+                None => Rope::partial(rope_dim, self.rope_theta, true),
+            };
+        }
+        let rotary_dim = self.rotary_dim();
+        if rotary_dim < self.head_dim || self.architecture.rope_interleaved() {
+            return Rope::partial(rotary_dim, self.rope_theta, self.architecture.rope_interleaved());
+        }
         match self.rope_scaling {
             Some(rs) => Rope::llama3(
                 self.head_dim,
@@ -225,9 +499,17 @@ impl ModelConfig {
         self.num_heads / self.num_kv_heads
     }
 
-    /// Attention scale, `head_dim^(-0.5)`.
+    /// Attention scale. MLA (DeepSeek-V2) scales by `q_head_dim^(-0.5)` multiplied by the YaRN
+    /// magnitude `mscale²`; Gemma-2 scales by `query_pre_attn_scalar^(-0.5)` (a denominator that may
+    /// differ from `head_dim`); otherwise the usual `head_dim^(-0.5)`.
     pub fn attn_scale(&self) -> f32 {
-        (self.head_dim as f32).powf(-0.5)
+        if let Some(mla) = self.mla {
+            let base = (mla.q_head_dim() as f32).powf(-0.5);
+            let mscale = self.yarn.map_or(1.0, |y| y.softmax_mscale());
+            return base * mscale * mscale;
+        }
+        let denom = self.query_pre_attn_scalar.unwrap_or(self.head_dim) as f32;
+        denom.powf(-0.5)
     }
 }
 
@@ -295,6 +577,12 @@ mod tests {
         let mistral = json!({ "architectures": ["MistralForCausalLM"] });
         assert_eq!(Architecture::from_config(&mistral).unwrap(), Architecture::Llama);
 
+        // Dense Qwen2 shares the Llama decoder shape (q/k/v bias auto-detected); routed to Llama.
+        let qwen2 = json!({ "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2" });
+        let a = Architecture::from_config(&qwen2).unwrap();
+        assert_eq!(a, Architecture::Llama);
+        assert!(!a.has_qk_norm());
+
         // Minimal config (no arch fields) defaults to Llama.
         let minimal = json!({ "hidden_size": 8 });
         assert_eq!(Architecture::from_config(&minimal).unwrap(), Architecture::Llama);
@@ -302,6 +590,176 @@ mod tests {
         // A named-but-unsupported arch is rejected.
         let unknown = json!({ "architectures": ["MambaForCausalLM"], "model_type": "mamba" });
         assert!(matches!(Architecture::from_config(&unknown), Err(Error::Unsupported(_))));
+
+        // Phi-3 (packed qkv / gate_up; otherwise the Llama shape).
+        let phi3 = json!({ "architectures": ["Phi3ForCausalLM"], "model_type": "phi3" });
+        let a = Architecture::from_config(&phi3).unwrap();
+        assert_eq!(a, Architecture::Phi3);
+        assert_eq!(a.family(), "phi3");
+        assert!(!a.has_qk_norm());
+
+        // Qwen2-MoE (sparse FFN + q/k/v bias; no q/k norm).
+        let qwen2_moe = json!({ "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe" });
+        let a = Architecture::from_config(&qwen2_moe).unwrap();
+        assert_eq!(a, Architecture::Qwen2Moe);
+        assert_eq!(a.family(), "qwen2_moe");
+        assert!(!a.has_qk_norm());
+
+        // Gemma-2 (soft-caps, sandwich norms; ties embeddings by default).
+        let gemma2 = json!({ "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2" });
+        let a = Architecture::from_config(&gemma2).unwrap();
+        assert_eq!(a, Architecture::Gemma2);
+        assert_eq!(a.family(), "gemma2");
+        assert!(a.is_gemma2());
+        assert!(a.is_sandwich());
+        assert!(!a.has_qk_norm());
+
+        // GLM-4 (sandwich norms, partial+interleaved RoPE; standard RMSNorm).
+        let glm4 = json!({ "architectures": ["Glm4ForCausalLM"], "model_type": "glm4" });
+        let a = Architecture::from_config(&glm4).unwrap();
+        assert_eq!(a, Architecture::Glm4);
+        assert_eq!(a.family(), "glm4");
+        assert!(a.is_sandwich());
+        assert!(a.rope_interleaved());
+        assert!(!a.is_gemma2());
+    }
+
+    #[test]
+    fn parses_glm4_config_partial_rotary() {
+        let v = json!({
+            "architectures": ["Glm4ForCausalLM"], "model_type": "glm4",
+            "hidden_size": 4096, "intermediate_size": 13696, "num_hidden_layers": 40,
+            "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+            "vocab_size": 151552, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5
+        });
+        let cfg = ModelConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Glm4);
+        assert_eq!(cfg.partial_rotary_factor, 0.5);
+        assert_eq!(cfg.rotary_dim(), 64); // 128 * 0.5
+        let rope = cfg.build_rope();
+        assert_eq!(rope.dim(), 64);
+        assert!(rope.interleaved());
+        // A model with no partial_rotary_factor rotates the full head_dim.
+        let full = ModelConfig::from_json(&json!({
+            "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "vocab_size": 32
+        }))
+        .unwrap();
+        assert_eq!(full.partial_rotary_factor, 1.0);
+        assert_eq!(full.rotary_dim(), full.head_dim);
+    }
+
+    #[test]
+    fn parses_gemma2_config() {
+        let v = json!({
+            "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2",
+            "hidden_size": 2304, "intermediate_size": 9216, "num_hidden_layers": 26,
+            "num_attention_heads": 8, "num_key_value_heads": 4, "head_dim": 256, "vocab_size": 256000,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "query_pre_attn_scalar": 256,
+            "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0
+            // tie_word_embeddings intentionally omitted — Gemma ties by default.
+        });
+        let cfg = ModelConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Gemma2);
+        assert_eq!(cfg.head_dim, 256); // explicit, != 2304/8
+        assert!(cfg.tie_word_embeddings, "Gemma ties by default");
+        assert_eq!(cfg.attn_logit_softcap, Some(50.0));
+        assert_eq!(cfg.final_logit_softcap, Some(30.0));
+        assert_eq!(cfg.query_pre_attn_scalar, Some(256));
+        // Attention scale uses query_pre_attn_scalar (256), not head_dim — equal here, but the path
+        // is exercised.
+        assert!((cfg.attn_scale() - (256f32).powf(-0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_qwen2_moe_config() {
+        let v = json!({
+            "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe",
+            "hidden_size": 2048, "intermediate_size": 5632, "num_hidden_layers": 24,
+            "num_attention_heads": 16, "num_key_value_heads": 16, "vocab_size": 151936,
+            "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "num_experts": 60, "num_experts_per_tok": 4, "norm_topk_prob": false,
+            "moe_intermediate_size": 1408, "shared_expert_intermediate_size": 5632
+        });
+        let cfg = ModelConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Qwen2Moe);
+        assert!(cfg.is_moe());
+        let moe = cfg.moe.unwrap();
+        assert_eq!(moe.num_experts, 60);
+        assert_eq!(moe.num_experts_per_tok, 4);
+        assert_eq!(moe.moe_intermediate_size, 1408);
+        assert_eq!(moe.shared_expert_intermediate_size, 5632);
+        assert!(!moe.norm_topk_prob);
+        // A dense (non-MoE) config has no MoE block.
+        assert!(!ModelConfig::from_json(&json!({
+            "hidden_size": 8, "intermediate_size": 16, "num_hidden_layers": 2,
+            "num_attention_heads": 2, "vocab_size": 32
+        }))
+        .unwrap()
+        .is_moe());
+    }
+
+    #[test]
+    fn parses_deepseek_v2_lite_config() {
+        // DeepSeek-V2-Lite-Chat: MLA (no query LoRA), fine-grained MoE with a leading dense layer,
+        // YaRN RoPE. The numbers are the real config's.
+        let v = json!({
+            "architectures": ["DeepseekV2ForCausalLM"], "model_type": "deepseek_v2",
+            "hidden_size": 2048, "intermediate_size": 10944, "num_hidden_layers": 27,
+            "num_attention_heads": 16, "num_key_value_heads": 16, "vocab_size": 102400,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "max_position_embeddings": 163840,
+            "tie_word_embeddings": false,
+            "q_lora_rank": null, "kv_lora_rank": 512,
+            "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+            "n_routed_experts": 64, "num_experts_per_tok": 6, "n_shared_experts": 2,
+            "moe_intermediate_size": 1408, "first_k_dense_replace": 1, "norm_topk_prob": false,
+            "routed_scaling_factor": 1.0,
+            "rope_scaling": {
+                "type": "yarn", "factor": 40, "beta_fast": 32, "beta_slow": 1,
+                "mscale": 0.707, "mscale_all_dim": 0.707,
+                "original_max_position_embeddings": 4096
+            }
+        });
+        let cfg = ModelConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::DeepseekV2);
+        assert!(cfg.is_mla());
+        assert!(cfg.architecture.rope_interleaved());
+
+        let mla = cfg.mla.unwrap();
+        assert_eq!(mla.q_lora_rank, None); // V2-Lite has a full q_proj
+        assert_eq!(mla.kv_lora_rank, 512);
+        assert_eq!(mla.qk_nope_head_dim, 128);
+        assert_eq!(mla.qk_rope_head_dim, 64);
+        assert_eq!(mla.v_head_dim, 128);
+        assert_eq!(mla.q_head_dim(), 192);
+        // head_dim is overridden to the MLA q/k head dim (no `head_dim` config key).
+        assert_eq!(cfg.head_dim, 192);
+
+        let moe = cfg.moe.unwrap();
+        assert_eq!(moe.num_experts, 64);
+        assert_eq!(moe.num_experts_per_tok, 6);
+        assert_eq!(moe.moe_intermediate_size, 1408);
+        assert_eq!(moe.shared_expert_intermediate_size, 2 * 1408); // n_shared_experts · moe_inter
+        assert_eq!(moe.first_k_dense_replace, 1);
+        assert!(!moe.norm_topk_prob);
+        assert_eq!(moe.routed_scaling_factor, 1.0);
+
+        let yarn = cfg.yarn.unwrap();
+        assert_eq!(yarn.factor, 40.0);
+        assert_eq!(yarn.original_context, 4096.0);
+        // The legacy llama3 `rope_scaling` path must not also fire for a yarn block.
+        assert!(cfg.rope_scaling.is_none());
+
+        // Attention scale folds in the YaRN mscale²: q_head_dim^-0.5 · (0.1·0.707·ln40 + 1)².
+        let mscale = 0.1 * 0.707 * 40f32.ln() + 1.0;
+        let expected = (192f32).powf(-0.5) * mscale * mscale;
+        assert!((cfg.attn_scale() - expected).abs() < 1e-6, "{}", cfg.attn_scale());
+
+        // The RoPE rotates only the 64-dim sub-vector, interleaved.
+        let rope = cfg.build_rope();
+        assert_eq!(rope.dim(), 64);
+        assert!(rope.interleaved());
     }
 
     #[test]
