@@ -217,6 +217,36 @@ pub fn generate_with_cache(
     )
 }
 
+/// Drive generation from a **caller-supplied prefill**: a `cache` already advanced over the prompt
+/// and its last-position `first_logits`. The multimodal path prefills outside this loop — it embeds
+/// the prompt, splices the encoder's image features at the image-token rows, and runs the decoder
+/// with interleaved M-RoPE — then hands the result here to sample + stream the continuation. `history`
+/// seeds the repetition-penalty window (the full, image-token-expanded prompt ids).
+///
+/// The `decoder` drives the **decode steps** only (the prompt is already cached); for the Qwen3.6
+/// multimodal path that decoder shifts the RoPE offset by `mrope_delta` so post-image text positions
+/// continue correctly. Returns [`Error::Canceled`] on an already-set cancel.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_from_prefill(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    first_logits: Array,
+    history: Vec<i32>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<GenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled); // typed pre-inference cancel
+    }
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    decode_loop(
+        decoder, cache, first_logits, rng, history, config, cancel, on_event, constraint, should_stop,
+    )
+}
+
 /// The token-by-token decode loop shared by [`generate_with`] and the prefix-cached path
 /// ([`crate::decode::generate_cached`]): given the prefill `logits`, an RNG, the seeded `history`
 /// (the prompt — the repetition-penalty window), and a `cache` already positioned past the prompt,

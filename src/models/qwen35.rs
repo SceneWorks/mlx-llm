@@ -1382,13 +1382,13 @@ mod tests {
         // embeds[1,5,hidden]: row r filled with value r.
         let mut e = Vec::new();
         for r in 0..5 {
-            e.extend(std::iter::repeat(r as f32).take(hidden));
+            e.extend(std::iter::repeat_n(r as f32, hidden));
         }
         let embeds = Array::from_slice(&e, &[1, 5, hidden as i32]).as_dtype(COMPUTE_DTYPE).unwrap();
         // feats[2,hidden]: row j filled with 100 + j.
         let mut f = Vec::new();
         for j in 0..2 {
-            f.extend(std::iter::repeat(100.0f32 + j as f32).take(hidden));
+            f.extend(std::iter::repeat_n(100.0f32 + j as f32, hidden));
         }
         let feats = Array::from_slice(&f, &[2, hidden as i32]);
 
