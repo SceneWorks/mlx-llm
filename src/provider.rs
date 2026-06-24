@@ -17,7 +17,7 @@ use core_llm::{
     FinishReason as CoreFinish, ImageRef, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
     Message, Quantize, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
     StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, Usage,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -167,6 +167,7 @@ fn substitute_image_placeholders(messages: &[Message]) -> Vec<Message> {
                 })
                 .collect(),
             thinking: m.thinking.clone(),
+            tool_calls: m.tool_calls.clone(),
         })
         .collect()
 }
@@ -276,8 +277,9 @@ impl LlamaProvider {
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
-        let (template, supports_thinking) = load_chat_template(dir);
+        let (template, supports_thinking, supports_tools) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
+        descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
             model,
@@ -372,16 +374,62 @@ impl ConstraintMask for JsonMask<'_> {
 }
 
 /// Use the model's own Jinja `chat_template` (from `tokenizer_config.json`, story 7164) when
-/// present; otherwise fall back to the typed Llama-3 template. Also reports whether the template
-/// exposes a controllable reasoning mode — true iff its source gates an `enable_thinking` kwarg (the
-/// transformers convention used by Qwen3, FLUX.2, z-image, … — detected by source, not by family).
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool) {
+/// present; otherwise fall back to the typed Llama-3 template. Also reports two template-gated
+/// capabilities, detected from the source (not the family, matching the transformers convention):
+/// - **thinking** — the template gates an `enable_thinking` kwarg (sc-7585).
+/// - **tools** — the template renders tool calls (it mentions `tool_call`), so it has a `tools`
+///   section and the model emits parseable `<tool_call>` blocks (sc-7636). Covers the Qwen3.6 XML and
+///   the Qwen2.5/Hermes JSON tool templates alike.
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
-            (Box::new(t), supports_thinking)
+            let supports_tools = t.source().contains("tool_call");
+            (Box::new(t), supports_thinking, supports_tools)
         }
-        Err(_) => (Box::new(Llama3Template), false),
+        Err(_) => (Box::new(Llama3Template), false, false),
+    }
+}
+
+/// Run a piece of answer-channel text through the tool-call segmenter when active, returning the
+/// plain-content runs to stream (tool-call blocks lifted out + parsed). With no segmenter the text
+/// passes straight through, so the non-tools path is byte-identical to before.
+fn tool_pieces(seg: &mut Option<ToolCallSegmenter>, text: &str) -> Vec<String> {
+    match seg {
+        Some(ts) => ts.push(text),
+        None => vec![text.to_string()],
+    }
+}
+
+/// Push one content piece through the stop matcher and emit the released text as a Content token
+/// event. Shared by the streaming loop and the end-of-generation tails. `*last_id` / `*emit_index`
+/// advance only when text is actually emitted, so the contract's token index stays gap-free across
+/// stripped markers and lifted-out tool-call blocks.
+#[allow(clippy::too_many_arguments)]
+fn emit_content(
+    piece: &str,
+    id: u32,
+    stop_matcher: &mut StopMatcher,
+    streamed: &mut String,
+    emit_index: &mut usize,
+    last_id: &mut u32,
+    halt: &std::cell::Cell<bool>,
+    on_event: &mut dyn FnMut(CoreEvent),
+) {
+    let chunk = stop_matcher.push(piece);
+    if !chunk.emit.is_empty() {
+        streamed.push_str(&chunk.emit);
+        *last_id = id;
+        on_event(CoreEvent::Token {
+            id,
+            text: chunk.emit,
+            index: *emit_index,
+            channel: Channel::Content,
+        });
+        *emit_index += 1;
+    }
+    if chunk.stop {
+        halt.set(true);
     }
 }
 
@@ -431,6 +479,7 @@ impl TextLlm for LlamaProvider {
             &RenderOptions {
                 add_generation_prompt: true,
                 enable_thinking: req.enable_thinking_kwarg(),
+                tools: &req.tools,
             },
         )?;
         let prompt_ids: Vec<i32> = self
@@ -508,6 +557,13 @@ impl TextLlm for LlamaProvider {
             }
         }
 
+        // A tool-call segmenter when the request offers tools and the model's template renders them:
+        // it lifts `<tool_call>` blocks out of the answer channel (markup excluded from the streamed
+        // text) and parses them into structured calls (sc-7636). `None` otherwise, so a no-tools
+        // request flows straight through `tool_pieces` unchanged.
+        let tools_active = self.descriptor.capabilities.supports_tools && !req.tools.is_empty();
+        let mut tool_seg = tools_active.then(|| ToolCallSegmenter::new(&req.tools));
+
         // Drive the internal loop; translate token-id events to contract text-delta events via
         // incremental detokenization (re-decode the running sequence, emit the new suffix). The
         // segmenter (when active) splits each delta into reasoning vs answer; answer text then feeds
@@ -540,40 +596,36 @@ impl TextLlm for LlamaProvider {
                                                 emit_index += 1;
                                             }
                                             Channel::Content => {
-                                                let chunk = stop_matcher.push(&span.text);
-                                                if !chunk.emit.is_empty() {
-                                                    streamed.push_str(&chunk.emit);
-                                                    last_id = id;
-                                                    on_event(CoreEvent::Token {
+                                                // Answer text → tool segmenter (lifts out tool-call
+                                                // blocks) → stop matcher → emit.
+                                                for piece in tool_pieces(&mut tool_seg, &span.text) {
+                                                    emit_content(
+                                                        &piece,
                                                         id,
-                                                        text: chunk.emit,
-                                                        index: emit_index,
-                                                        channel: Channel::Content,
-                                                    });
-                                                    emit_index += 1;
-                                                }
-                                                if chunk.stop {
-                                                    halt.set(true);
+                                                        &mut stop_matcher,
+                                                        &mut streamed,
+                                                        &mut emit_index,
+                                                        &mut last_id,
+                                                        &halt,
+                                                        &mut *on_event,
+                                                    );
                                                 }
                                             }
                                         }
                                     }
                                 }
                                 None => {
-                                    let chunk = stop_matcher.push(&delta);
-                                    if !chunk.emit.is_empty() {
-                                        streamed.push_str(&chunk.emit);
-                                        last_id = id;
-                                        on_event(CoreEvent::Token {
+                                    for piece in tool_pieces(&mut tool_seg, &delta) {
+                                        emit_content(
+                                            &piece,
                                             id,
-                                            text: chunk.emit,
-                                            index: emit_index,
-                                            channel: Channel::Content,
-                                        });
-                                        emit_index += 1;
-                                    }
-                                    if chunk.stop {
-                                        halt.set(true);
+                                            &mut stop_matcher,
+                                            &mut streamed,
+                                            &mut emit_index,
+                                            &mut last_id,
+                                            &halt,
+                                            &mut *on_event,
+                                        );
                                     }
                                 }
                             }
@@ -626,8 +678,11 @@ impl TextLlm for LlamaProvider {
             }
         };
 
-        // End-of-generation tails. First the segmenter's held-back partial marker (it turned out not
-        // to begin a marker) as current-channel text; then the stop matcher's held-back partial stop.
+        // End-of-generation tails, in pipeline order. First the thinking segmenter's held-back
+        // partial marker (it turned out not to begin a marker) as current-channel text — reasoning
+        // straight out, answer through the tool segmenter; then the tool segmenter's own tail (held
+        // partial `<tool_call>` / an unterminated block surfaced as content); then the stop matcher's
+        // held-back partial stop.
         if let Some(seg) = segmenter.as_mut() {
             for span in seg.flush() {
                 match span.channel {
@@ -642,22 +697,34 @@ impl TextLlm for LlamaProvider {
                         emit_index += 1;
                     }
                     Channel::Content => {
-                        let chunk = stop_matcher.push(&span.text);
-                        if !chunk.emit.is_empty() {
-                            streamed.push_str(&chunk.emit);
-                            on_event(CoreEvent::Token {
-                                id: last_id,
-                                text: chunk.emit,
-                                index: emit_index,
-                                channel: Channel::Content,
-                            });
-                            emit_index += 1;
-                        }
-                        if chunk.stop {
-                            halt.set(true);
+                        for piece in tool_pieces(&mut tool_seg, &span.text) {
+                            emit_content(
+                                &piece,
+                                last_id,
+                                &mut stop_matcher,
+                                &mut streamed,
+                                &mut emit_index,
+                                &mut last_id,
+                                &halt,
+                                &mut *on_event,
+                            );
                         }
                     }
                 }
+            }
+        }
+        if let Some(ts) = tool_seg.as_mut() {
+            for piece in ts.flush() {
+                emit_content(
+                    &piece,
+                    last_id,
+                    &mut stop_matcher,
+                    &mut streamed,
+                    &mut emit_index,
+                    &mut last_id,
+                    &halt,
+                    &mut *on_event,
+                );
             }
         }
         // If generation ended for any reason other than a stop string, flush the stop matcher's
@@ -675,16 +742,18 @@ impl TextLlm for LlamaProvider {
             }
         }
 
-        // Result text: the streamed answer when stop strings or thinking are active; otherwise the
-        // original decode-all-tokens path (byte-identical to before). Reasoning, if the model
-        // produced any, is reported separately (markers excluded from both).
-        let text = if stop_active || thinking_active {
+        // Result text: the streamed answer when stop strings, thinking, or tools are active (any of
+        // which means the streamed channel is the authoritative answer with markup removed);
+        // otherwise the original decode-all-tokens path (byte-identical to before). Reasoning and
+        // tool calls, if the model produced any, are reported separately (markup excluded from text).
+        let text = if stop_active || thinking_active || tools_active {
             streamed
         } else {
             let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
             tokenizer.decode(&gen_u32, true)?
         };
         let thinking = (!thinking_buf.is_empty()).then_some(thinking_buf);
+        let tool_calls = tool_seg.map(|mut ts| ts.take_calls()).unwrap_or_default();
         let finish = map_finish(out.finish_reason);
         let usage = Usage {
             prompt_tokens: prompt_len as u32,
@@ -697,6 +766,7 @@ impl TextLlm for LlamaProvider {
         Ok(TextLlmOutput {
             text,
             thinking,
+            tool_calls,
             usage,
             finish_reason: Some(finish),
         })
@@ -719,6 +789,9 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Weightless default: conservative. The load path (descriptor_for + load) flips this on
             // when the loaded model's own chat template gates an `enable_thinking` kwarg (sc-7585).
             supports_thinking: false,
+            // Weightless default: conservative. The load path flips this on when the loaded model's
+            // chat template renders tool calls (sc-7636).
+            supports_tools: false,
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![Constraint::Json],
         },

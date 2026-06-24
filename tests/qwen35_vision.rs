@@ -37,6 +37,7 @@ fn image_request(img: ImageRef, prompt: &str) -> TextLlmRequest {
             role: Role::User,
             content: vec![Content::Image(img), Content::text(prompt)],
             thinking: None,
+            tool_calls: Vec::new(),
         }],
         sampling: Sampling::greedy(),
         max_new_tokens: 32,
