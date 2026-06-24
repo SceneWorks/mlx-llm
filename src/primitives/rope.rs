@@ -282,6 +282,73 @@ impl Rope {
         let sin_t = concatenate_axis(&sin_sel, 2)?.as_dtype(dtype)?;
         Ok((cos_t, sin_t))
     }
+
+    /// Build the **interleaved** 3-axis multimodal-RoPE `(cos, sin)` tables — Qwen3.6's
+    /// `mrope_interleaved` (`Qwen3_5TextRotaryEmbedding` + `apply_interleaved_mrope`).
+    ///
+    /// Unlike the Qwen2.5-VL chunked layout ([`Rope::mrope_cos_sin`], where each axis owns a
+    /// contiguous block `[TTT…HHH…WWW]`), Qwen3.6 **interleaves** the axes across the `dim/2`
+    /// frequency channels — round-robin `T,H,W,T,H,W,…` truncated by `sections`: channel `c` draws its
+    /// position from axis `T` by default, from `H` for `c ∈ {1,4,7,…} ∩ [0, sections[1]·3)`, and from
+    /// `W` for `c ∈ {2,5,8,…} ∩ [0, sections[2]·3)` (`sections` sums to `dim/2`). The frequency stays
+    /// `inv_freq[c]`; only which position row feeds it changes. `emb = cat(freqs, freqs)` (NeoX), then
+    /// cos/sin — so [`apply_rope`] (half-split) rotates it.
+    ///
+    /// `position_ids` holds the temporal / height / width rows, each length `L`. With all three rows
+    /// equal (text-only) the axis choice is irrelevant and this is **bit-identical** to a plain 1D
+    /// [`Rope::cos_sin_at`] over that row — the invariant that keeps the text path unchanged.
+    pub fn mrope_interleaved_cos_sin(
+        &self,
+        position_ids: [&[i32]; 3],
+        sections: [usize; 3],
+        dtype: Dtype,
+    ) -> Result<(Array, Array)> {
+        if self.interleaved {
+            return Err(Error::Unsupported(
+                "mrope_interleaved_cos_sin requires the NeoX (half-split) convention".into(),
+            ));
+        }
+        let half = self.inv_freq.len(); // dim/2
+        let sum: usize = sections.iter().sum();
+        if sum != half {
+            return Err(Error::Msg(format!(
+                "mrope sections {sections:?} sum to {sum}, expected dim/2 = {half}"
+            )));
+        }
+        let l = position_ids[0].len();
+        if position_ids.iter().any(|row| row.len() != l) {
+            return Err(Error::Msg(format!(
+                "mrope position_ids rows must share one length, got {:?}",
+                position_ids.map(<[i32]>::len)
+            )));
+        }
+
+        // Per-channel axis assignment: T (0) by default; H (1) / W (2) on their interleaved indices.
+        let mut axis_of = vec![0usize; half];
+        for (axis, offset) in [(1usize, 1usize), (2usize, 2usize)] {
+            let length = (sections[axis] * 3).min(half);
+            let mut c = offset;
+            while c < length {
+                axis_of[c] = axis;
+                c += 3;
+            }
+        }
+
+        // emb row = cat(freqs, freqs), freqs[c] = position_ids[axis_of[c]] · inv_freq[c].
+        let mut emb = Vec::with_capacity(l * self.dim as usize);
+        #[allow(clippy::needless_range_loop)] // p cross-indexes all three position rows
+        for p in 0..l {
+            let freqs: Vec<f32> = (0..half)
+                .map(|c| position_ids[axis_of[c]][p] as f32 * self.inv_freq[c])
+                .collect();
+            emb.extend_from_slice(&freqs);
+            emb.extend_from_slice(&freqs);
+        }
+        let emb = Array::from_slice(&emb, &[1, l as i32, self.dim]);
+        let cos_t = cos(&emb)?.as_dtype(dtype)?;
+        let sin_t = sin(&emb)?.as_dtype(dtype)?;
+        Ok((cos_t, sin_t))
+    }
 }
 
 /// Apply rotary embeddings to `x`.
@@ -554,5 +621,49 @@ mod tests {
             .mrope_cos_sin([&positions, &positions, &positions], QWEN_SECTIONS, Dtype::Float32)
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    }
+
+    // Qwen3.6 interleaved M-RoPE: partial rotary_dim 64, theta 1e7, mrope_section [11,11,10].
+    const Q36_ROT: i32 = 64;
+    const Q36_THETA: f32 = 10_000_000.0;
+    const Q36_SECTIONS: [usize; 3] = [11, 11, 10];
+
+    #[test]
+    fn mrope_interleaved_text_equals_1d() {
+        // Acceptance gate: text-only (all three rows equal) must reproduce a plain 1D cos_sin_at over
+        // that row, bit-for-bit — the invariant that keeps the Qwen3.6 text path unchanged.
+        let rope = Rope::partial(Q36_ROT, Q36_THETA, false);
+        let positions: Vec<i32> = (0..6).collect();
+        let (c1, s1) = rope.cos_sin_at(&positions, Dtype::Float32).unwrap();
+        let (cm, sm) = rope
+            .mrope_interleaved_cos_sin([&positions, &positions, &positions], Q36_SECTIONS, Dtype::Float32)
+            .unwrap();
+        assert_eq!(cm.shape(), &[1, 6, Q36_ROT]);
+        assert_eq!(cm.as_slice::<f32>(), c1.as_slice::<f32>());
+        assert_eq!(sm.as_slice::<f32>(), s1.as_slice::<f32>());
+    }
+
+    #[test]
+    fn mrope_interleaved_matches_reference() {
+        // A genuinely-3D case vs the reference `apply_interleaved_mrope` (oracle from /tmp/gen_mrope.py).
+        let j: serde_json::Value =
+            serde_json::from_str(include_str!("../models/testdata/qwen35_mrope_oracle.json")).unwrap();
+        let m = &j["mrope"];
+        let row = |k: &str| -> Vec<i32> {
+            m[k].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
+        };
+        let exp = |k: &str| -> Vec<f32> {
+            m[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+        };
+        let (t, h, w) = (row("t"), row("h"), row("w"));
+        let rope = Rope::partial(Q36_ROT, Q36_THETA, false);
+        let (cos, sin) = rope
+            .mrope_interleaved_cos_sin([&t, &h, &w], Q36_SECTIONS, Dtype::Float32)
+            .unwrap();
+        let cmp = |got: &[f32], exp: &[f32]| {
+            got.iter().zip(exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+        };
+        assert!(cmp(cos.as_slice::<f32>(), &exp("cos")) < 1e-6, "interleaved mrope cos vs reference");
+        assert!(cmp(sin.as_slice::<f32>(), &exp("sin")) < 1e-6, "interleaved mrope sin vs reference");
     }
 }

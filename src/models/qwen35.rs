@@ -35,6 +35,11 @@ use crate::primitives::Weights;
 /// f32 (matching the reference GPU kernel) for stability.
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
 
+/// Interleaved M-RoPE output of [`Qwen35Model::mrope_positions`]: the temporal / height / width
+/// position rows (each length `S`) plus the `mrope_delta` (`max_position + 1 − len`) for continuing
+/// positions after the prompt.
+pub type MropePositions = (Vec<i32>, Vec<i32>, Vec<i32>, i32);
+
 /// Mixture-of-Experts FFN parameters (`qwen3_5_moe`, the 35B-A3B). Every layer's dense MLP is
 /// replaced by a sparse MoE block: a softmax router over `num_experts` experts (top-`experts_per_tok`
 /// per token, weights renormalized to sum to 1) plus a sigmoid-gated always-on shared expert.
@@ -73,6 +78,10 @@ pub struct Qwen35Config {
     /// MoE FFN parameters when this is the MoE variant (`qwen3_5_moe`, 35B-A3B); `None` ⇒ dense MLP
     /// (`qwen3_5`, 27B).
     pub moe: Option<MoeParams>,
+    /// Interleaved M-RoPE section `[t, h, w]` (`rope_parameters.mrope_section`, sums to
+    /// `rotary_dim/2`); `None` ⇒ the even split from [`Qwen35Config::mrope_section_resolved`]. Drives
+    /// the per-channel axis assignment for image (3-D) positions; irrelevant to the text path.
+    pub mrope_section: Option<[i32; 3]>,
 }
 
 impl Qwen35Config {
@@ -131,7 +140,29 @@ impl Qwen35Config {
                 shared_expert_intermediate_size: int("shared_expert_intermediate_size")
                     .unwrap_or(intermediate_size),
             }),
+            mrope_section: c
+                .get("rope_parameters")
+                .and_then(|rp| rp.get("mrope_section"))
+                .and_then(|x| x.as_array())
+                .filter(|a| a.len() == 3)
+                .map(|a| {
+                    let g = |i: usize| a[i].as_i64().unwrap_or(0) as i32;
+                    [g(0), g(1), g(2)]
+                }),
         })
+    }
+
+    /// The interleaved M-RoPE section `[t, h, w]`, defaulting to an even split of `rotary_dim/2` when
+    /// the config omits it (e.g. text-only checkpoints — where the section is moot). The order biases
+    /// the remainder toward `t` then `h` (matching the released `[11, 11, 10]` for `rotary_dim/2 = 32`).
+    pub fn mrope_section_resolved(&self) -> [usize; 3] {
+        if let Some(s) = self.mrope_section {
+            return [s[0].max(0) as usize, s[1].max(0) as usize, s[2].max(0) as usize];
+        }
+        let half = (self.rotary_dim() / 2) as usize;
+        let base = half / 3;
+        let rem = half % 3;
+        [base + (rem > 0) as usize, base + (rem > 1) as usize, base]
     }
 
     /// Whether layer `i` (0-indexed) is a linear (Gated DeltaNet) layer; otherwise full attention.
@@ -539,11 +570,25 @@ impl Qwen35Model {
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
     fn hidden(&self, input_ids: &Array, cache: &mut Qwen35Cache, offset: i32) -> Result<Array> {
-        let mut h = embed(&self.embed_tokens, input_ids)?.as_dtype(COMPUTE_DTYPE)?;
+        let h = embed(&self.embed_tokens, input_ids)?.as_dtype(COMPUTE_DTYPE)?;
         let s = h.shape()[1];
         let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        self.hidden_from_embeds(&h, &cos, &sin, cache)
+    }
+
+    /// Run the decoder stack over precomputed input `embeds` `[B, S, hidden]` with the given RoPE
+    /// tables, returning the final hidden states `[B, S, hidden]`. The token-id path ([`Self::hidden`])
+    /// and the multimodal embeds path ([`Self::decode_logits_from_embeds`]) share this.
+    fn hidden_from_embeds(
+        &self,
+        embeds: &Array,
+        cos: &Array,
+        sin: &Array,
+        cache: &mut Qwen35Cache,
+    ) -> Result<Array> {
+        let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            h = layer.forward(&h, &cos, &sin, slot)?;
+            h = layer.forward(&h, cos, sin, slot)?;
         }
         Ok(h)
     }
@@ -552,6 +597,14 @@ impl Qwen35Model {
     fn project(&self, h: &Array) -> Result<Array> {
         let normed = rms_norm(h, &self.norm, self.eps)?;
         linear(&normed, &self.lm_head, None)
+    }
+
+    /// Project the **last** position of `h` `[B, S, hidden]` → logits `[B, vocab]`.
+    fn project_last(&self, h: &Array) -> Result<Array> {
+        let s = h.shape()[1];
+        let last = h.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?; // [B,1,hidden]
+        let logits = self.project(&last)?; // [B,1,vocab]
+        Ok(logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?)
     }
 
     /// Run the decoder over `input_ids` `[B, S]` at sequence `offset`, returning logits for **every**
@@ -570,10 +623,140 @@ impl Qwen35Model {
         offset: i32,
     ) -> Result<Array> {
         let h = self.hidden(input_ids, cache, offset)?;
-        let s = h.shape()[1];
-        let last = h.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?; // [B,1,hidden]
-        let logits = self.project(&last)?; // [B,1,vocab]
-        Ok(logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?)
+        self.project_last(&h)
+    }
+
+    /// Embed token ids `[B, S]` → `[B, S, hidden]` in the compute dtype — the splice point where the
+    /// multimodal path overwrites image-token rows with the encoder's projected patch features
+    /// ([`Self::splice_image_features`]).
+    pub fn embed_input_ids(&self, input_ids: &Array) -> Result<Array> {
+        Ok(embed(&self.embed_tokens, input_ids)?.as_dtype(COMPUTE_DTYPE)?)
+    }
+
+    /// Replace the `image_token_id` rows of `embeds` `[1, S, hidden]` with `image_features`
+    /// `[num_image_tokens, hidden]` (the vision encoder's projected, merged patch rows), in sequence
+    /// order. The number of image-token positions must equal the feature-row count.
+    pub fn splice_image_features(
+        &self,
+        embeds: &Array,
+        input_ids: &[i32],
+        image_features: &Array,
+        image_token_id: i32,
+    ) -> Result<Array> {
+        let hidden = self.cfg.hidden_size;
+        let s = embeds.shape()[1] as usize;
+        let feats = image_features.as_dtype(COMPUTE_DTYPE)?;
+        let num_img = input_ids.iter().filter(|&&x| x == image_token_id).count() as i32;
+        if num_img != feats.shape()[0] {
+            return Err(Error::Msg(format!(
+                "qwen3_5 splice: {num_img} image tokens != {} feature rows",
+                feats.shape()[0]
+            )));
+        }
+        if num_img == 0 {
+            return Ok(embeds.clone());
+        }
+        // Stitch text spans (from `embeds`) and image spans (from `feats`) in order — no scatter.
+        let mut pieces: Vec<Array> = Vec::new();
+        let mut feat_off = 0i32;
+        let mut i = 0usize;
+        while i < s {
+            let is_img = input_ids[i] == image_token_id;
+            let mut j = i;
+            while j < s && (input_ids[j] == image_token_id) == is_img {
+                j += 1;
+            }
+            let n = (j - i) as i32;
+            if is_img {
+                let idx = Array::from_slice(&(feat_off..feat_off + n).collect::<Vec<_>>(), &[n]);
+                pieces.push(feats.take_axis(&idx, 0)?.reshape(&[1, n, hidden])?);
+                feat_off += n;
+            } else {
+                let idx = Array::from_slice(&(i as i32..j as i32).collect::<Vec<_>>(), &[n]);
+                pieces.push(embeds.take_axis(&idx, 1)?);
+            }
+            i = j;
+        }
+        let refs: Vec<&Array> = pieces.iter().collect();
+        Ok(concatenate_axis(&refs, 1)?)
+    }
+
+    /// Compute the interleaved M-RoPE 3-D position rows (`get_rope_index`, B=1) for `input_ids`
+    /// containing `image_grid_thw`-described `image_token_id` runs, plus the `mrope_delta`
+    /// (`max_position + 1 − len`) the decode loop adds to continue positions after the prompt.
+    ///
+    /// Text tokens advance all three axes (t,h,w) by 1; an image run lays its tokens out over the
+    /// `(t, h/merge, w/merge)` grid (temporal constant, height = row, width = col, offset by the shared
+    /// cursor) and then advances the cursor by `max(h, w) / merge`. `spatial_merge_size` comes from the
+    /// vision config. Returns `(t_row, h_row, w_row, mrope_delta)`.
+    pub fn mrope_positions(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<MropePositions> {
+        let merge = spatial_merge_size.max(1);
+        let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
+        let mut cur = 0i32;
+        let mut gi = 0usize;
+        let mut i = 0usize;
+        while i < input_ids.len() {
+            if input_ids[i] == image_token_id {
+                let g = *image_grid_thw.get(gi).ok_or_else(|| {
+                    Error::Msg("qwen3_5 mrope: more image runs than image_grid_thw entries".into())
+                })?;
+                gi += 1;
+                let (gt, gh, gw) = (g[0], g[1] / merge, g[2] / merge);
+                if gh <= 0 || gw <= 0 || gt <= 0 {
+                    return Err(Error::Msg(format!("qwen3_5 mrope: bad image grid {g:?}")));
+                }
+                let count = (gt * gh * gw) as usize;
+                let run = input_ids[i..].iter().take_while(|&&x| x == image_token_id).count();
+                if run != count {
+                    return Err(Error::Msg(format!(
+                        "qwen3_5 mrope: image run length {run} != grid tokens {count}"
+                    )));
+                }
+                let frame = gh * gw;
+                for k in 0..count as i32 {
+                    t.push(k / frame + cur);
+                    let rem = k % frame;
+                    h.push(rem / gw + cur);
+                    w.push(rem % gw + cur);
+                }
+                cur += gh.max(gw);
+                i += count;
+            } else {
+                t.push(cur);
+                h.push(cur);
+                w.push(cur);
+                cur += 1;
+                i += 1;
+            }
+        }
+        let maxpos = t.iter().chain(h.iter()).chain(w.iter()).copied().max().unwrap_or(-1);
+        let delta = maxpos + 1 - input_ids.len() as i32;
+        Ok((t, h, w, delta))
+    }
+
+    /// Run the decoder over precomputed input `embeds` `[1, S, hidden]` (text embeds with image
+    /// features spliced in) using **interleaved M-RoPE** from the explicit 3-D `positions`
+    /// (temporal/height/width rows, each length `S`), returning last-position logits `[1, vocab]`.
+    /// With all three rows equal (text-only) this is bit-identical to [`Self::decode_logits`].
+    pub fn decode_logits_from_embeds(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+    ) -> Result<Array> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            COMPUTE_DTYPE,
+        )?;
+        let h = self.hidden_from_embeds(&embeds.as_dtype(COMPUTE_DTYPE)?, &cos, &sin, cache)?;
+        self.project_last(&h)
     }
 
     /// Build from a loaded checkpoint (dense). See [`Qwen35Model::from_weights_with`].
@@ -1128,5 +1311,115 @@ mod tests {
         let b = last.unwrap().as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
         let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         assert!(md < 5e-2, "MoE prefill vs stepwise diverged: max abs diff {md}");
+    }
+
+    fn synthetic_model() -> (Qwen35Config, Qwen35Model) {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let w = synthetic_weights(&cfg);
+        let model = Qwen35Model::from_weights(&w, "model.language_model", cfg.clone()).unwrap();
+        (cfg, model)
+    }
+
+    /// `mrope_positions` (the `get_rope_index` port) must reproduce the reference 3-D position rows +
+    /// `mrope_delta` for an image+text sequence — exact integer index math (oracle /tmp/gen_mrope.py).
+    #[test]
+    fn mrope_positions_matches_reference() {
+        let j: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/qwen35_mrope_oracle.json")).unwrap();
+        let r = &j["rope_index"];
+        let ints = |k: &str| -> Vec<i32> {
+            r[k].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
+        };
+        let ids = ints("input_ids");
+        let grid = {
+            let g = &r["image_grid_thw"][0];
+            vec![[g[0].as_i64().unwrap() as i32, g[1].as_i64().unwrap() as i32, g[2].as_i64().unwrap() as i32]]
+        };
+        let img_tok = r["image_token_id"].as_i64().unwrap() as i32;
+        let merge = r["merge"].as_i64().unwrap() as i32;
+
+        let (_cfg, model) = synthetic_model();
+        let (t, h, w, delta) = model.mrope_positions(&ids, &grid, img_tok, merge).unwrap();
+        assert_eq!(t, ints("t"));
+        assert_eq!(h, ints("h"));
+        assert_eq!(w, ints("w"));
+        assert_eq!(delta, r["delta"].as_i64().unwrap() as i32);
+    }
+
+    /// **The text-path invariant.** Feeding token embeds + equal (text) 3-D positions through
+    /// `decode_logits_from_embeds` must be **bit-identical** to the token-id `decode_logits` — the
+    /// interleaved M-RoPE collapses to 1D and the embeds path is the same compute. This is the gate
+    /// that the multimodal hook doesn't perturb the (verified) text decoder.
+    #[test]
+    fn decode_from_embeds_text_only_equals_decode_logits() {
+        let (_cfg, model) = synthetic_model();
+        let toks = [1i32, 7, 3, 42, 9, 2];
+        let ids = Array::from_slice(&toks, &[1, toks.len() as i32]);
+
+        let a = model.decode_logits(&ids, &mut model.new_cache(), 0).unwrap();
+        let embeds = model.embed_input_ids(&ids).unwrap();
+        let pos: Vec<i32> = (0..toks.len() as i32).collect();
+        let b = model
+            .decode_logits_from_embeds(&embeds, [&pos, &pos, &pos], &mut model.new_cache())
+            .unwrap();
+
+        assert_eq!(a.shape(), b.shape());
+        let (av, bv) = (
+            a.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec(),
+            b.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec(),
+        );
+        let md = av.iter().zip(&bv).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(md == 0.0, "embeds text path must equal token-id path bit-for-bit; max abs diff {md}");
+    }
+
+    /// The splice hook overwrites exactly the image-token rows (in order) with the feature rows and
+    /// leaves text rows untouched.
+    #[test]
+    fn splice_image_features_replaces_image_rows() {
+        let (cfg, model) = synthetic_model();
+        let hidden = cfg.hidden_size as usize;
+        let ids = [7i32, 49, 49, 8, 9]; // two image tokens (id 49) at positions 1,2
+        // embeds[1,5,hidden]: row r filled with value r.
+        let mut e = Vec::new();
+        for r in 0..5 {
+            e.extend(std::iter::repeat(r as f32).take(hidden));
+        }
+        let embeds = Array::from_slice(&e, &[1, 5, hidden as i32]).as_dtype(COMPUTE_DTYPE).unwrap();
+        // feats[2,hidden]: row j filled with 100 + j.
+        let mut f = Vec::new();
+        for j in 0..2 {
+            f.extend(std::iter::repeat(100.0f32 + j as f32).take(hidden));
+        }
+        let feats = Array::from_slice(&f, &[2, hidden as i32]);
+
+        let out = model.splice_image_features(&embeds, &ids, &feats, 49).unwrap();
+        assert_eq!(out.shape(), &[1, 5, hidden as i32]);
+        let v = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let row = |r: usize| v[r * hidden]; // first element of each row (whole row is constant)
+        assert_eq!([row(0), row(1), row(2), row(3), row(4)], [0.0, 100.0, 101.0, 3.0, 4.0]);
+    }
+
+    /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
+    /// decode_logits_from_embeds) runs end to end and yields finite `[1, vocab]` logits.
+    #[test]
+    fn image_text_decode_from_embeds_runs() {
+        let (cfg, model) = synthetic_model();
+        let img = 49i32; // within the synthetic vocab (50) so embed gather is in-bounds
+        let ids = [1i32, 2, img, img, img, img, 3, 4]; // 2x2 image (4 tokens) between text
+        let grid = vec![[1i32, 4, 4]];
+        let ids_arr = Array::from_slice(&ids, &[1, ids.len() as i32]);
+
+        let embeds = model.embed_input_ids(&ids_arr).unwrap();
+        let feats = Array::from_slice(
+            &(0..4 * cfg.hidden_size).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+            &[4, cfg.hidden_size],
+        );
+        let spliced = model.splice_image_features(&embeds, &ids, &feats, img).unwrap();
+        let (t, h, w, _delta) = model.mrope_positions(&ids, &grid, img, 2).unwrap();
+        let logits = model
+            .decode_logits_from_embeds(&spliced, [&t, &h, &w], &mut model.new_cache())
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, cfg.vocab_size]);
+        assert!(logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
     }
 }
