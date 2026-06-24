@@ -446,6 +446,7 @@ impl TextLlm for JoyCaptionProvider {
         Ok(TextLlmOutput {
             text,
             thinking: None,
+            tool_calls: Vec::new(),
             usage,
             finish_reason: Some(finish),
         })
@@ -464,6 +465,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             supports_vision: true,
             supports_thinking: false,
+            supports_tools: false,
             supported_constraints: Vec::new(),
         },
     }

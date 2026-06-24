@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#b26440b26fc43d5b78e04f04645d7b72b731bea4"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#75873b48246b5c65703eeaad8e51c1cf76c86ab7"
 dependencies = [
  "inventory",
  "minijinja",
@@ -148,9 +148,10 @@ dependencies = [
 [[package]]
 name = "core-llm-testkit"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#b26440b26fc43d5b78e04f04645d7b72b731bea4"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#75873b48246b5c65703eeaad8e51c1cf76c86ab7"
 dependencies = [
  "core-llm",
+ "serde_json",
 ]
 
 [[package]]
@@ -500,8 +501,10 @@ version = "2.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -943,6 +946,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

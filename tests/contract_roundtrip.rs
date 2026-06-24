@@ -182,6 +182,7 @@ fn validate_rejects_unsupported_vision_input() {
             role: core_llm::Role::User,
             content: vec![Content::Text("look".into()), Content::Image(img)],
             thinking: None,
+            tool_calls: Vec::new(),
         }],
         max_new_tokens: 4,
         ..Default::default()

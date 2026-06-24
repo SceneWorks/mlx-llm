@@ -143,6 +143,7 @@ fn joycaption_provider_streams_caption_through_contract() {
                 Content::text("Write a very short caption."),
             ],
             thinking: None,
+            tool_calls: Vec::new(),
         }],
         sampling: Sampling::greedy(),
         max_new_tokens: 16,
