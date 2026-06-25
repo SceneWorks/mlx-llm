@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use mlx_rs::Array;
 
 use core_llm::{load_for_model, LoadSpec, Message, TextLlmRequest};
-use core_llm_testkit::{textllm_conformance, TextLlmProfile};
+use core_llm_testkit::{
+    check_snapshot_preparer, textllm_conformance, SnapshotPreparerProfile, TextLlmProfile,
+};
 use mlx_llm::primitives::sampler::{SplitMix64, TokenRng};
 use mlx_llm::provider::PROVIDER_ID;
 use mlx_llm::LlamaProvider;
@@ -96,6 +98,21 @@ fn llama_provider_passes_core_llm_conformance() {
     // Sanity: the provider id the suite checked is the registered one.
     assert_eq!(PROVIDER_ID, "mlx-llama");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "needs an HF/GGUF model source via MLX_LLM_PREPARE_SOURCE"]
+fn real_snapshot_preparer_passes_core_llm_conformance() {
+    let source = std::env::var("MLX_LLM_PREPARE_SOURCE").expect("set MLX_LLM_PREPARE_SOURCE");
+    let out_dir = std::env::temp_dir().join(format!("mlx-llm-prepare-conformance-{}", std::process::id()));
+    std::fs::remove_dir_all(&out_dir).ok();
+    check_snapshot_preparer(&SnapshotPreparerProfile {
+        source: PathBuf::from(source),
+        out_dir: out_dir.clone(),
+        quantize: Some(core_llm::Quantize::Q4),
+    })
+    .expect("snapshot preparer conformance");
+    std::fs::remove_dir_all(&out_dir).ok();
 }
 
 #[test]
