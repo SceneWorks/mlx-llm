@@ -22,7 +22,11 @@ members = ["server"]
 # the command-buffer-recoverable patch). Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
 # Crates.io publish (a later epic-7153 story) will swap this for a registry/patch arrangement;
 # during development it is the fork so the engine actually runs correctly on-device.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "44929a001ab8a8837403a71c65cf064224de0cdc" }
+# SHA 38e1cc17 = 44929a00 + sc-7898: metallib resolver (device.cpp) now prefers the build's own
+# compiled-in metallib (METAL_PATH) over the shared ~/.cache/pmetal user cache, so a stale/older
+# pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
+# with mlx-gen's pin so the two still build ONE mlx-rs.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
 # The backend-neutral contract this crate implements (epic 7153). Git dep on the published repo
 # during development (crates.io publish coordination is a later story); shares its `CancelFlag`,
 # `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not two.
