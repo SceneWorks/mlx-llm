@@ -178,40 +178,6 @@ fn substitute_image_placeholders(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-/// Expand each `image_token_id` placeholder in `ids` into `counts[i]` image tokens (the i-th image's
-/// merged-patch count), in order. Errors if the placeholder count and image count disagree.
-fn expand_image_placeholders(
-    ids: &[i32],
-    image_token_id: i32,
-    counts: &[usize],
-) -> crate::error::Result<Vec<i32>> {
-    use crate::error::Error;
-    let mut out = Vec::with_capacity(ids.len());
-    let mut ci = 0usize;
-    for &id in ids {
-        if id == image_token_id {
-            let n = *counts.get(ci).ok_or_else(|| {
-                Error::Msg(format!(
-                    "qwen3.6 vision: {} image placeholders but only {} images supplied",
-                    ci + 1,
-                    counts.len()
-                ))
-            })?;
-            ci += 1;
-            out.extend(std::iter::repeat_n(image_token_id, n));
-        } else {
-            out.push(id);
-        }
-    }
-    if ci != counts.len() {
-        return Err(Error::Msg(format!(
-            "qwen3.6 vision: {ci} image placeholders rendered but {} images supplied",
-            counts.len()
-        )));
-    }
-    Ok(out)
-}
-
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
@@ -359,7 +325,9 @@ impl LlamaProvider {
             }
         }
 
-        let expanded = expand_image_placeholders(prompt_ids, vision.image_token_id, &counts).map_err(to_core)?;
+        let expanded =
+            crate::models::qwen35::expand_vision_placeholders(prompt_ids, vision.image_token_id, &counts)
+                .map_err(to_core)?;
         let visual_pos_mask: Vec<bool> = expanded.iter().map(|&id| id == vision.image_token_id).collect();
         let refs: Vec<&Array> = feats.iter().collect();
         let all_features = match refs.as_slice() {
