@@ -229,6 +229,164 @@ fn glm4_prefills_and_decodes() {
     assert_prefills_and_decodes(cfg, m, "glm4");
 }
 
+/// Qwen3-VL (`qwen3_vl`): the VLM-wrapped standard full-attention Qwen3 decoder. Exercises the
+/// VLM-nested weight prefix (`model.language_model.*` with `lm_head.weight` at the root), the
+/// per-head q/k norm, the 256K interleaved-M-RoPE config, the multimodal splice, and the
+/// interleaved-M-RoPE + DeepStack prefill seam — all on tiny synthetic weights (no snapshot).
+#[test]
+fn qwen3vl_prefills_decodes_and_fuses_deepstack() {
+    let (heads, kv, inter) = (4, 2, 64);
+    let (qd, kvd) = (heads * HEAD_DIM, kv * HEAD_DIM);
+    let cfg_v = json!({
+        "architectures": ["Qwen3VLForConditionalGeneration"], "model_type": "qwen3_vl",
+        "image_token_id": 40, "video_token_id": 41,
+        "vision_start_token_id": 42, "vision_end_token_id": 43,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": "qwen3_vl_text",
+            "hidden_size": HIDDEN, "intermediate_size": inter, "num_hidden_layers": LAYERS,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": HEAD_DIM,
+            "vocab_size": VOCAB, "rms_norm_eps": 1e-6, "rope_theta": 5000000.0,
+            "max_position_embeddings": 262144,
+            "rope_scaling": { "mrope_interleaved": true, "mrope_section": [2, 1, 1], "rope_type": "default" }
+        },
+        "vision_config": { "model_type": "qwen3_vl", "depth": 2 }
+    });
+    let cfg = ModelConfig::from_json(&cfg_v).unwrap();
+    assert_eq!(cfg.architecture.family(), "qwen3_vl");
+    assert_eq!(cfg.rope_theta, 5_000_000.0);
+    assert_eq!(cfg.max_position_embeddings, 262144);
+    assert_eq!(cfg.mrope_section, Some([2, 1, 1])); // sums to head_dim/2 = 4
+
+    let mut rng = SplitMix64::new(0x9617_3006);
+    let mut m = HashMap::new();
+    // VLM-nested layout: decoder under `model.language_model.*`, `lm_head.weight` at the root.
+    m.insert("model.language_model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert("model.language_model.norm.weight".into(), ones(HIDDEN));
+    m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    for i in 0..LAYERS {
+        let p = |s: &str| format!("model.language_model.layers.{i}.{s}");
+        m.insert(p("input_layernorm.weight"), ones(HIDDEN));
+        m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
+        m.insert(p("self_attn.q_proj.weight"), randn(&[qd, HIDDEN], &mut rng));
+        m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, HIDDEN], &mut rng));
+        m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, qd], &mut rng));
+        m.insert(p("self_attn.q_norm.weight"), ones(HEAD_DIM)); // per-head q/k norm (Qwen3)
+        m.insert(p("self_attn.k_norm.weight"), ones(HEAD_DIM));
+        m.insert(p("mlp.gate_proj.weight"), randn(&[inter, HIDDEN], &mut rng));
+        m.insert(p("mlp.up_proj.weight"), randn(&[inter, HIDDEN], &mut rng));
+        m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, inter], &mut rng));
+    }
+    let model = CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap();
+
+    // (a) Plain text prefill + cached decode works through the VLM-nested decoder.
+    let prompt = [1i32, 2, 3, 4, 5];
+    let ids = input_ids(&prompt);
+    let mut cache = model.new_cache();
+    let logits = model.decode_logits(&ids, &mut cache, 0).unwrap();
+    assert_eq!(logits.shape(), &[1, VOCAB], "qwen3_vl prefill logits shape");
+    assert!(logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
+
+    // (b) Text-only invariant: the interleaved-M-RoPE + DeepStack prefill with **equal** t/h/w rows
+    // and an **empty** deepstack must be bit-identical to the plain 1-D-RoPE prefill.
+    let s = prompt.len() as i32;
+    let pos: Vec<i32> = (0..s).collect();
+    let embeds = model.embed_input_ids(&ids).unwrap();
+    let mut cache_a = model.new_cache();
+    let plain = model.decode_logits_from_embeds(&embeds, &mut cache_a, 0).unwrap();
+    let mut cache_b = model.new_cache();
+    let visual_mask = vec![false; s as usize];
+    let mrope = model
+        .decode_logits_from_embeds_mrope_deepstack(
+            &embeds,
+            [pos.as_slice(), pos.as_slice(), pos.as_slice()],
+            &mut cache_b,
+            &visual_mask,
+            &[],
+        )
+        .unwrap();
+    let pa = plain.as_dtype(Dtype::Float32).unwrap();
+    let mb = mrope.as_dtype(Dtype::Float32).unwrap();
+    let max_diff = pa
+        .as_slice::<f32>()
+        .iter()
+        .zip(mb.as_slice::<f32>())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_diff < 1e-4, "text-only M-RoPE must equal plain RoPE, max diff {max_diff}");
+
+    // (c) Image path: expand a single image placeholder to its merged-token count, splice synthetic
+    // features, compute interleaved-M-RoPE 3-D positions, and run the DeepStack-fused prefill. A 2×2
+    // patch grid (merge 2 ⇒ 1 token... use a 4×4 grid ⇒ 4 tokens) checked end to end.
+    let img_id = 40;
+    let grid = [1i32, 4, 4]; // t,h,w in patch units; merge 2 ⇒ 1·2·2 = 4 merged tokens
+    let merge = 2;
+    let count = mlx_llm::models::qwen35::vision_merged_token_count(grid, merge);
+    assert_eq!(count, 4);
+    // Prompt: [text, <vision_start>, <img>, <vision_end>, text]; expand the single <img> to `count`.
+    let raw = [1i32, 42, img_id, 43, 9];
+    let expanded =
+        mlx_llm::models::qwen35::expand_vision_placeholders(&raw, img_id, &[count]).unwrap();
+    assert_eq!(expanded.len(), raw.len() - 1 + count);
+    let visual_pos_mask: Vec<bool> = expanded.iter().map(|&id| id == img_id).collect();
+
+    let features = randn(&[count as i32, HIDDEN], &mut rng).as_dtype(Dtype::Bfloat16).unwrap();
+    let exp_ids = input_ids(&expanded);
+    let img_embeds = model.embed_input_ids(&exp_ids).unwrap();
+    let spliced = model.splice_image_features(&img_embeds, &expanded, &features, img_id).unwrap();
+    let (t, h, w, delta) = model.mrope_positions(&expanded, &[grid], img_id, merge).unwrap();
+    assert_eq!(t.len(), expanded.len());
+
+    // Two synthetic DeepStack taps (one per decoder layer), each [count, hidden].
+    let deepstack = vec![
+        randn(&[count as i32, HIDDEN], &mut rng).as_dtype(Dtype::Bfloat16).unwrap(),
+        randn(&[count as i32, HIDDEN], &mut rng).as_dtype(Dtype::Bfloat16).unwrap(),
+    ];
+    let mut cache_img = model.new_cache();
+    let img_logits = model
+        .decode_logits_from_embeds_mrope_deepstack(
+            &spliced,
+            [t.as_slice(), h.as_slice(), w.as_slice()],
+            &mut cache_img,
+            &visual_pos_mask,
+            &deepstack,
+        )
+        .unwrap();
+    assert_eq!(img_logits.shape(), &[1, VOCAB], "qwen3_vl image prefill logits shape");
+    assert!(img_logits.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
+
+    // DeepStack fusion must change the output vs. an empty deepstack (the features are added in).
+    let mut cache_nods = model.new_cache();
+    let no_ds = model
+        .decode_logits_from_embeds_mrope_deepstack(
+            &spliced,
+            [t.as_slice(), h.as_slice(), w.as_slice()],
+            &mut cache_nods,
+            &visual_pos_mask,
+            &[],
+        )
+        .unwrap();
+    let diff = img_logits
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .iter()
+        .zip(no_ds.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(diff > 1e-3, "DeepStack fusion must change the logits, max diff {diff}");
+
+    // The continuation decode uses `cache_len + mrope_delta` as the M-RoPE position (image tokens
+    // compress the cursor, so `delta` may be negative). It must run and yield finite logits.
+    let next = input_ids(&[7]);
+    let cont = model
+        .decode_logits(&next, &mut cache_img, expanded.len() as i32 + delta)
+        .unwrap();
+    assert_eq!(cont.shape(), &[1, VOCAB], "qwen3_vl continuation logits shape");
+    assert!(cont.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().iter().all(|x| x.is_finite()));
+}
+
 /// DeepSeek-V2: Multi-head Latent Attention (full `q_proj`, low-rank KV path, decoupled YaRN RoPE)
 /// and a fine-grained MoE FFN with a leading dense layer and an ungated shared expert.
 #[test]

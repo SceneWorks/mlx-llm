@@ -17,6 +17,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::config::{Architecture, ModelConfig};
 use crate::error::{Error, Result};
+use crate::models::deepstack::deepstack_fused_decoder_layers;
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::{embed, gelu_tanh, linear, rms_norm, silu, soft_cap, to_f32_host};
@@ -59,7 +60,14 @@ impl CausalLm {
         cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        let p = |suffix: &str| join(prefix, suffix);
+        // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
+        // norm, and `layers.{i}.*`) — there is no second `model.` segment — while `lm_head.weight`
+        // lives at the checkpoint root (untied). A plain `*ForCausalLM` keeps the historical
+        // `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight` layout.
+        let vlm_nested = cfg.architecture.is_qwen3_vl();
+        let decoder_root = if vlm_nested { "model.language_model".to_string() } else { join(prefix, "model") };
+        let p = |suffix: &str| join(&decoder_root, suffix);
+        let head_key = if vlm_nested { "lm_head.weight".to_string() } else { join(prefix, "lm_head.weight") };
         let req_bf16 = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
 
         // A snapshot may store pre-quantized projections (the GGUF converter's MLX-requant output);
@@ -98,7 +106,9 @@ impl CausalLm {
             load_proj(&wkey, bias)
         };
         // Gemma's norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
-        // `rms_norm` applies it. (Llama / Qwen3 / GLM-4 norm weights are used verbatim.)
+        // `rms_norm` applies it. (Llama / Qwen3 / Qwen3-VL / GLM-4 norm weights are standard RMSNorm
+        // — used verbatim, including Qwen3-VL's `Qwen3VLTextRMSNorm`, which is plain `weight · x`;
+        // its small early-layer block-norm weights are genuine, verified by real-weights coherence.)
         let gemma = cfg.architecture.is_gemma2();
         let norm_w = |key: String| -> Result<Array> {
             let t = req_bf16(key)?;
@@ -109,12 +119,12 @@ impl CausalLm {
             }
         };
 
-        let embed_tokens = req_bf16(p("model.embed_tokens.weight"))?;
-        let norm = norm_w(p("model.norm.weight"))?;
+        let embed_tokens = req_bf16(p("embed_tokens.weight"))?;
+        let norm = norm_w(p("norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
             embed_tokens.clone()
         } else {
-            req_bf16(p("lm_head.weight"))?
+            req_bf16(head_key)?
         };
 
         let qk_norm = cfg.has_qk_norm();
@@ -129,7 +139,7 @@ impl CausalLm {
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let lp = |suffix: &str| join(prefix, &format!("model.layers.{i}.{suffix}"));
+            let lp = |suffix: &str| join(&decoder_root, &format!("layers.{i}.{suffix}"));
 
             // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention.
             let attn = if cfg.architecture.is_mla() {
@@ -358,6 +368,87 @@ impl CausalLm {
         let s = input_embeds.shape()[1];
         let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
         self.forward_to_last_logits(input_embeds, cache, &cos, &sin, AttnMask::Causal)
+    }
+
+    /// Embed token ids `[1, S]` → `[1, S, hidden]` in the compute dtype — the Qwen3-VL multimodal
+    /// splice point (image-token rows are overwritten with the vision tower's merged patch features).
+    pub fn embed_input_ids(&self, input_ids: &Array) -> Result<Array> {
+        Ok(self.embed(input_ids)?.as_dtype(COMPUTE_DTYPE)?)
+    }
+
+    /// Replace the `image_token_id` rows of `embeds` `[1, S, hidden]` with the vision tower's merged
+    /// patch features `[num_image_tokens, hidden]`, in sequence order (the Qwen3-VL splice).
+    pub fn splice_image_features(
+        &self,
+        embeds: &Array,
+        input_ids: &[i32],
+        image_features: &Array,
+        image_token_id: i32,
+    ) -> Result<Array> {
+        crate::models::deepstack::splice_image_features(
+            embeds,
+            input_ids,
+            image_features,
+            image_token_id,
+            self.cfg.hidden_size,
+            COMPUTE_DTYPE,
+        )
+    }
+
+    /// Compute the interleaved M-RoPE 3-D position rows (`get_rope_index`, B=1) for `input_ids`
+    /// containing `image_grid_thw`-described `image_token_id` runs, plus the `mrope_delta`. The
+    /// image-only entry point; see [`crate::models::deepstack::mrope_positions_mm`] for image+video.
+    pub fn mrope_positions(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<crate::models::deepstack::MropePositions> {
+        crate::models::deepstack::mrope_positions_mm(
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            &[],
+            image_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    /// Run the decoder over precomputed input `embeds` `[1, S, hidden]` (text embeds with image
+    /// features spliced in) using **interleaved multimodal RoPE** from explicit 3-D `positions`
+    /// (temporal/height/width rows, each length `S`) **and DeepStack feature fusion**: after decoder
+    /// layer `i`, for `i < deepstack.len()`, the `i`-th tapped/merged ViT feature set is added to the
+    /// visual-token rows (`visual_pos_mask[p]` marks an image-token position). Returns last-position
+    /// logits `[1, vocab]`. This is the Qwen3-VL prefill seam (`Qwen3VLTextModel.forward` +
+    /// `_deepstack_process`); with all three position rows equal and an empty `deepstack` it is
+    /// bit-identical to a plain 1-D-RoPE prefill.
+    pub fn decode_logits_from_embeds_mrope_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<Array> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            COMPUTE_DTYPE,
+        )?;
+        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let s = h0.shape()[1];
+        let layers = &self.layers;
+        let h = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            layers.len(),
+            |i, h| layers[i].forward(h, &cos, &sin, AttnMask::Causal, cache, i),
+        )?;
+        let last_h = take_last(&h, s)?;
+        let logits = self.project_logits(&last_h)?;
+        Ok(logits.reshape(&[logits.shape()[0], self.cfg.vocab_size])?)
     }
 
     /// Run a forward step over token ids and return logits for **every** position,
