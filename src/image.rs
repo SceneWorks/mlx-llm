@@ -207,6 +207,10 @@ pub struct Qwen35ImageProcessor {
     /// Smart-resize pixel bounds (`size.shortest_edge` / `size.longest_edge`).
     pub min_pixels: usize,
     pub max_pixels: usize,
+    /// Video-path smart-resize pixel bounds (`video_preprocessor_config.json`
+    /// `size.shortest_edge` / `size.longest_edge`), distinct from the image bounds.
+    pub video_min_pixels: usize,
+    pub video_max_pixels: usize,
     pub mean: [f32; 3],
     pub std: [f32; 3],
 }
@@ -218,8 +222,10 @@ impl Default for Qwen35ImageProcessor {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,
-            min_pixels: 65536,    // size.shortest_edge (256²)
-            max_pixels: 16777216, // size.longest_edge (4096²)
+            min_pixels: 65536,    // image size.shortest_edge (256²)
+            max_pixels: 16777216, // image size.longest_edge (4096²)
+            video_min_pixels: 4096, // video_preprocessor_config size.shortest_edge
+            video_max_pixels: 25165824, // video_preprocessor_config size.longest_edge
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
         }
@@ -230,8 +236,23 @@ impl Qwen35ImageProcessor {
     /// Smart-resize: round each dimension to a multiple of `patch_size·merge_size` while keeping the
     /// total pixel count within `[min_pixels, max_pixels]` and the aspect ratio as close as possible
     /// (`Qwen2VL.smart_resize`). The initial round is **half-to-even** (Python `round`), which the
-    /// min/max-pixels branches then override via floor/ceil.
+    /// min/max-pixels branches then override via floor/ceil. Uses the image processor's pixel bounds.
     pub fn smart_resize(&self, height: usize, width: usize) -> Result<(usize, usize)> {
+        self.smart_resize_with(height, width, 1, self.min_pixels, self.max_pixels)
+    }
+
+    /// The general smart-resize with explicit pixel bounds and a temporal multiplier. The pixel budget
+    /// is over `temporal · h_bar · w_bar` (the video reference folds the temporal axis into the
+    /// budget; for images `temporal = 1` this reduces to the standard 2-D smart-resize). `min_pixels`
+    /// / `max_pixels` come from the image vs video preprocessor config.
+    pub fn smart_resize_with(
+        &self,
+        height: usize,
+        width: usize,
+        temporal: usize,
+        min_pixels: usize,
+        max_pixels: usize,
+    ) -> Result<(usize, usize)> {
         let factor = self.patch_size * self.merge_size;
         let (hi, lo) = (height.max(width), height.min(width));
         if lo == 0 {
@@ -248,12 +269,15 @@ impl Qwen35ImageProcessor {
         };
         let (mut hb, mut wb) = (round_factor(height), round_factor(width));
         let (hw, fac) = ((height * width) as f64, factor as f64);
-        if hb * wb > self.max_pixels {
-            let beta = (hw / self.max_pixels as f64).sqrt();
+        let t = temporal.max(1) as f64;
+        let budget = t * (hb * wb) as f64;
+        // Pixel budget includes the temporal factor (video reference); `beta` divides out `temporal`.
+        if budget > max_pixels as f64 {
+            let beta = (t * hw / max_pixels as f64).sqrt();
             hb = factor.max((height as f64 / beta / fac).floor() as usize * factor);
             wb = factor.max((width as f64 / beta / fac).floor() as usize * factor);
-        } else if hb * wb < self.min_pixels {
-            let beta = (self.min_pixels as f64 / hw).sqrt();
+        } else if budget < min_pixels as f64 {
+            let beta = (min_pixels as f64 / (t * hw)).sqrt();
             hb = (height as f64 * beta / fac).ceil() as usize * factor;
             wb = (width as f64 * beta / fac).ceil() as usize * factor;
         }
@@ -310,6 +334,112 @@ impl Qwen35ImageProcessor {
             vec![[1, grid_h as i32, grid_w as i32]],
         ))
     }
+
+    /// Preprocess a sampled **video** — a list of already-decoded RGB8 frames (each
+    /// `width*height*3` bytes, all the same size) — into the `(pixel_values_videos, video_grid_thw)`
+    /// the [`crate::models::Qwen35VisionModel`] consumes, mirroring `Qwen3VLVideoProcessor._preprocess`.
+    ///
+    /// **Temporal patching (the video-vs-image difference).** The vision encoder folds
+    /// `temporal_patch_size` (2) consecutive frames into one temporal patch, so the frame count is
+    /// padded up to a multiple of `temporal_patch_size` (the reference repeats the last frame) and
+    /// `grid_t = padded_frames / temporal_patch_size`. Each row's inner feature is
+    /// `(channel, temporal, patch_row, patch_col)` flattened — but where an *image* replicates its
+    /// single frame across the temporal axis, a video carries the **two distinct frames** of the
+    /// temporal patch. The spatial layout (`smart_resize`, merge-block patch order) is identical to
+    /// [`Self::preprocess`].
+    ///
+    /// Returns `pixel_values_videos` `[grid_t·grid_h·grid_w, C·T·P·P]` plus the single
+    /// `video_grid_thw` `[grid_t, grid_h, grid_w]` (patch units). One video → one grid entry; the
+    /// per-frame timestamp tokens are rendered separately by the provider (Text–Timestamp Alignment).
+    pub fn preprocess_video(
+        &self,
+        frames: &[(&[u8], usize, usize)],
+    ) -> Result<(Array, [i32; 3])> {
+        if frames.is_empty() {
+            return Err(Error::Msg("qwen3.6 video preprocess: no frames".into()));
+        }
+        let (_, w0, h0) = frames[0];
+        for (i, &(px, w, h)) in frames.iter().enumerate() {
+            if w != w0 || h != h0 {
+                return Err(Error::Msg(format!(
+                    "qwen3.6 video preprocess: frame {i} is {w}x{h}, expected {w0}x{h0} (all frames must match)"
+                )));
+            }
+            if px.len() != w * h * 3 {
+                return Err(Error::Msg(format!(
+                    "qwen3.6 video preprocess: frame {i} expected {} RGB bytes for {w}x{h}, got {}",
+                    w * h * 3,
+                    px.len()
+                )));
+            }
+        }
+
+        let (p, m, t) = (self.patch_size, self.merge_size, self.temporal_patch_size);
+        // Video smart-resize uses the video pixel bounds and folds the (padded) frame count into the
+        // pixel budget (`t_bar = ceil(n / temporal) * temporal`), matching `Qwen3VLVideoProcessor`.
+        let t_bar = frames.len().div_ceil(t) * t;
+        let (rh, rw) =
+            self.smart_resize_with(h0, w0, t_bar, self.video_min_pixels, self.video_max_pixels)?;
+        let (grid_h, grid_w) = (rh / p, rw / p);
+
+        // Resize every frame to the common `(rh, rw)` (HWC f32 in [0, 255]).
+        let mut resized_frames: Vec<Vec<f32>> = Vec::with_capacity(frames.len());
+        for &(px, w, h) in frames {
+            let r: Vec<f32> = if rh == h && rw == w {
+                px.iter().map(|&v| v as f32).collect()
+            } else {
+                resize_bicubic_u8(px, h, w, rh, rw)?
+            };
+            resized_frames.push(r);
+        }
+
+        // Pad the frame count up to a multiple of `temporal_patch_size` by repeating the last frame
+        // (matching `Qwen3VLVideoProcessor`), then `grid_t = padded / temporal_patch_size`.
+        let mut n_frames = resized_frames.len();
+        while !n_frames.is_multiple_of(t) {
+            let last = resized_frames.last().unwrap().clone();
+            resized_frames.push(last);
+            n_frames += 1;
+        }
+        let grid_t = n_frames / t;
+
+        let feat = 3 * t * p * p;
+        let mut out = Vec::with_capacity(grid_t * grid_h * grid_w * feat);
+        // Merge-block patch order (gt, bh, bw, ih, iw) with the inner feature
+        // `(channel, temporal, patch_row, patch_col)` — temporal now indexes the two **distinct**
+        // frames of the temporal patch (`gt*t + tt`), not a replicated single frame.
+        for gt in 0..grid_t {
+            for bh in 0..grid_h / m {
+                for bw in 0..grid_w / m {
+                    for ih in 0..m {
+                        for iw in 0..m {
+                            let (gh, gw) = (bh * m + ih, bw * m + iw);
+                            for c in 0..3 {
+                                for tt in 0..t {
+                                    let frame = &resized_frames[gt * t + tt];
+                                    for pr in 0..p {
+                                        for pc in 0..p {
+                                            let row = gh * p + pr;
+                                            let col = gw * p + pc;
+                                            let v = (frame[(row * rw + col) * 3 + c] / 255.0
+                                                - self.mean[c])
+                                                / self.std[c];
+                                            out.push(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let n = (grid_t * grid_h * grid_w) as i32;
+        Ok((
+            Array::from_slice(&out, &[n, feat as i32]),
+            [grid_t as i32, grid_h as i32, grid_w as i32],
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +465,61 @@ mod tests {
     #[test]
     fn preprocess_rejects_bad_buffer() {
         assert!(SiglipImageProcessor::default().preprocess(&[0u8; 3], 2, 2).is_err());
+    }
+
+    /// `preprocess_video` produces the right `video_grid_thw` (frames folded `temporal_patch_size`
+    /// per temporal patch) and feature dim, and the two **distinct** frames of a temporal patch land
+    /// at the two temporal slots of each row (unlike an image, which replicates one frame).
+    #[test]
+    fn preprocess_video_grid_and_temporal_layout() {
+        let proc = Qwen35ImageProcessor::default(); // patch 16, merge 2, temporal 2
+        // 64x64 frames → grid_h = grid_w = 4 (64/16). With the video pixel budget (t_bar=2,
+        // 2·64·64 = 8192 ∈ [4096, max]) the resize is a no-op, so the grid is exact. Two distinct
+        // solid frames so the temporal slots are distinguishable.
+        let frame0 = [10u8, 20, 30].repeat(64 * 64); // first frame color
+        let frame1 = [200u8, 210, 220].repeat(64 * 64); // second frame color
+        let frames: Vec<(&[u8], usize, usize)> = vec![(&frame0, 64, 64), (&frame1, 64, 64)];
+        let (pixels, grid) = proc.preprocess_video(&frames).unwrap();
+
+        // grid_t = ceil(2 / temporal_patch_size=2) = 1; grid_h = grid_w = 4.
+        assert_eq!(grid, [1, 4, 4], "video grid [grid_t, grid_h, grid_w]");
+        let feat = 3 * proc.temporal_patch_size * proc.patch_size * proc.patch_size; // C·T·P·P
+        assert_eq!(pixels.shape(), &[grid[0] * grid[1] * grid[2], feat as i32]);
+
+        // Inner feature layout per row is (channel, temporal, patch_row, patch_col). The first
+        // `P*P` values are channel-0 / temporal-0 (frame 0); the next `P*P` are channel-0 / temporal-1
+        // (frame 1). Frame 0's red = (10/255 - 0.5)/0.5; frame 1's red differs — proving the two
+        // distinct frames occupy the temporal axis (an image would replicate one frame here).
+        let v = host_f32(&pixels);
+        let p2 = proc.patch_size * proc.patch_size;
+        let want0 = (10.0f32 / 255.0 - 0.5) / 0.5;
+        let want1 = (200.0f32 / 255.0 - 0.5) / 0.5;
+        assert!((v[0] - want0).abs() < 1e-4, "temporal slot 0 = frame 0 red");
+        assert!((v[p2] - want1).abs() < 1e-4, "temporal slot 1 = frame 1 red (distinct frame)");
+    }
+
+    /// A frame count not divisible by `temporal_patch_size` is padded by repeating the last frame
+    /// (matching `Qwen3VLVideoProcessor`), so `grid_t = ceil(n / temporal_patch_size)`.
+    #[test]
+    fn preprocess_video_pads_odd_frame_count() {
+        let proc = Qwen35ImageProcessor::default();
+        let f = [128u8, 128, 128].repeat(64 * 64);
+        let frames: Vec<(&[u8], usize, usize)> = vec![(&f, 64, 64), (&f, 64, 64), (&f, 64, 64)];
+        let (pixels, grid) = proc.preprocess_video(&frames).unwrap();
+        assert_eq!(grid, [2, 4, 4], "3 frames pad to 4 → grid_t = 2");
+        let feat = 3 * proc.temporal_patch_size * proc.patch_size * proc.patch_size;
+        assert_eq!(pixels.shape()[0], grid[0] * grid[1] * grid[2]);
+        assert_eq!(pixels.shape()[1], feat as i32);
+    }
+
+    #[test]
+    fn preprocess_video_rejects_mismatched_frames() {
+        let proc = Qwen35ImageProcessor::default();
+        let f0 = [0u8, 0, 0].repeat(32 * 32);
+        let f1 = [0u8, 0, 0].repeat(16 * 16);
+        let frames: Vec<(&[u8], usize, usize)> = vec![(&f0, 32, 32), (&f1, 16, 16)];
+        assert!(proc.preprocess_video(&frames).is_err());
+        assert!(proc.preprocess_video(&[]).is_err());
     }
 
     #[test]

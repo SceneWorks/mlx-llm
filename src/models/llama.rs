@@ -395,6 +395,26 @@ impl CausalLm {
         )
     }
 
+    /// Replace every row whose id is any of `placeholder_tokens` (`<|image_pad|>` and/or
+    /// `<|video_pad|>`) with the next vision-feature row, in sequence order — the multimodal splice for
+    /// a mixed image+video prompt. Reduces to [`Self::splice_image_features`] for a single token.
+    pub fn splice_vision_features(
+        &self,
+        embeds: &Array,
+        input_ids: &[i32],
+        vision_features: &Array,
+        placeholder_tokens: &[i32],
+    ) -> Result<Array> {
+        crate::models::deepstack::splice_vision_features(
+            embeds,
+            input_ids,
+            vision_features,
+            placeholder_tokens,
+            self.cfg.hidden_size,
+            COMPUTE_DTYPE,
+        )
+    }
+
     /// Compute the interleaved M-RoPE 3-D position rows (`get_rope_index`, B=1) for `input_ids`
     /// containing `image_grid_thw`-described `image_token_id` runs, plus the `mrope_delta`. The
     /// image-only entry point; see [`crate::models::deepstack::mrope_positions_mm`] for image+video.
@@ -411,6 +431,30 @@ impl CausalLm {
             image_token_id,
             &[],
             image_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    /// The full image **and** video interleaved-M-RoPE entry: `input_ids` with `image_token_id` runs
+    /// (one per `image_grid_thw` entry) and `video_token_id` runs (one per frame; each `[t, h, w]`
+    /// video grid is split into `t` per-frame `[1, h, w]` blocks by the synthetic time axis). See
+    /// [`crate::models::deepstack::mrope_positions_mm`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn mrope_positions_mm(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        video_grid_thw: &[[i32; 3]],
+        video_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<crate::models::deepstack::MropePositions> {
+        crate::models::deepstack::mrope_positions_mm(
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            video_grid_thw,
+            video_token_id,
             spatial_merge_size,
         )
     }

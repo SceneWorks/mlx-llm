@@ -1,0 +1,62 @@
+{
+  "expanded_ids": [
+    27,
+    15,
+    13,
+    17,
+    6486,
+    29,
+    151652,
+    151656,
+    151656,
+    151656,
+    151656,
+    151653,
+    27,
+    16,
+    13,
+    17,
+    6486,
+    29,
+    151652,
+    151656,
+    151656,
+    151656,
+    151656,
+    151653
+  ],
+  "expected_video_tokens": 8,
+  "fps": 2.0,
+  "frame_seqlen": 4,
+  "frames_indices": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "grid_h": 4,
+  "grid_t": 2,
+  "grid_w": 4,
+  "hf_model": "Qwen/Qwen3-VL-8B-Instruct",
+  "hf_revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+  "merge": 2,
+  "merged_timestamps": [
+    0.25,
+    1.25
+  ],
+  "mode": "hf_qwen3vl_video_text_timestamp_alignment_oracle",
+  "n_video_tokens": 8,
+  "placeholder_text": "<0.2 seconds><|vision_start|><|video_pad|><|video_pad|><|video_pad|><|video_pad|><|vision_end|><1.2 seconds><|vision_start|><|video_pad|><|video_pad|><|video_pad|><|video_pad|><|vision_end|>",
+  "source": "tools/gen_qwen3vl_video_oracle.py",
+  "temporal_patch_size": 2,
+  "video_grid_thw": [
+    [
+      2,
+      4,
+      4
+    ]
+  ],
+  "video_token_id": 151656,
+  "vision_end_token_id": 151653,
+  "vision_start_token_id": 151652
+}

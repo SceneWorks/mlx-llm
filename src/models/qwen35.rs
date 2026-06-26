@@ -644,31 +644,46 @@ impl Qwen35Model {
         image_features: &Array,
         image_token_id: i32,
     ) -> Result<Array> {
+        self.splice_vision_features(embeds, input_ids, image_features, &[image_token_id])
+    }
+
+    /// Replace every row whose id is **any** of `placeholder_tokens` (`<|image_pad|>` and/or
+    /// `<|video_pad|>`) with the next `vision_features` row, in sequence order — the multimodal splice
+    /// for a mixed image+video prompt. Features must be concatenated in the same order the
+    /// placeholders appear. Reduces to [`Self::splice_image_features`] for a single token.
+    pub fn splice_vision_features(
+        &self,
+        embeds: &Array,
+        input_ids: &[i32],
+        vision_features: &Array,
+        placeholder_tokens: &[i32],
+    ) -> Result<Array> {
         let hidden = self.cfg.hidden_size;
         let s = embeds.shape()[1] as usize;
-        let feats = image_features.as_dtype(COMPUTE_DTYPE)?;
-        let num_img = input_ids.iter().filter(|&&x| x == image_token_id).count() as i32;
-        if num_img != feats.shape()[0] {
+        let feats = vision_features.as_dtype(COMPUTE_DTYPE)?;
+        let is_vis = |id: i32| placeholder_tokens.contains(&id);
+        let num_vis = input_ids.iter().filter(|&&x| is_vis(x)).count() as i32;
+        if num_vis != feats.shape()[0] {
             return Err(Error::Msg(format!(
-                "qwen3_5 splice: {num_img} image tokens != {} feature rows",
+                "qwen3_5 splice: {num_vis} vision tokens != {} feature rows",
                 feats.shape()[0]
             )));
         }
-        if num_img == 0 {
+        if num_vis == 0 {
             return Ok(embeds.clone());
         }
-        // Stitch text spans (from `embeds`) and image spans (from `feats`) in order — no scatter.
+        // Stitch text spans (from `embeds`) and vision spans (from `feats`) in order — no scatter.
         let mut pieces: Vec<Array> = Vec::new();
         let mut feat_off = 0i32;
         let mut i = 0usize;
         while i < s {
-            let is_img = input_ids[i] == image_token_id;
+            let vis = is_vis(input_ids[i]);
             let mut j = i;
-            while j < s && (input_ids[j] == image_token_id) == is_img {
+            while j < s && is_vis(input_ids[j]) == vis {
                 j += 1;
             }
             let n = (j - i) as i32;
-            if is_img {
+            if vis {
                 let idx = Array::from_slice(&(feat_off..feat_off + n).collect::<Vec<_>>(), &[n]);
                 pieces.push(feats.take_axis(&idx, 0)?.reshape(&[1, n, hidden])?);
                 feat_off += n;
