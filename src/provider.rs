@@ -17,7 +17,7 @@ use core_llm::{
     FinishReason as CoreFinish, ImageRef, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
     Message, Quantize, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
     StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage,
+    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -99,6 +99,9 @@ struct Qwen35Vision {
     tower: Qwen35VisionModel,
     processor: Qwen35ImageProcessor,
     image_token_id: i32,
+    /// The `<|video_pad|>` placeholder token id (151656 for Qwen3-VL) — the per-frame video
+    /// placeholder the processor expands to `frame_seqlen` copies.
+    video_token_id: i32,
     spatial_merge_size: i32,
 }
 
@@ -115,6 +118,23 @@ impl Qwen35Vision {
             .map_err(to_core)?;
         let out = self.tower.forward_with_deepstack(&pixels, &grid).map_err(to_core)?;
         Ok((out.pooler_output, out.deepstack_features, grid[0]))
+    }
+
+    /// Encode one **video** (sampled frames) to its merged patch rows `[grid_t·n_per_frame, hidden]`,
+    /// the per-tap DeepStack features, and the `video_grid_thw` (`[grid_t, h, w]`). The ViT tower is
+    /// modality-agnostic — it processes the `grid_t` temporal patches as a block-diagonal-masked
+    /// frame sequence exactly like multiple images — so this reuses `forward_with_deepstack`. The
+    /// per-frame timestamp tokens are rendered separately (Text–Timestamp Alignment); here we only
+    /// produce the visual features and the grid.
+    fn encode_video(&self, video: &VideoRef) -> CoreResult<(Array, Vec<Array>, [i32; 3])> {
+        let frames: Vec<(&[u8], usize, usize)> = video
+            .frames
+            .iter()
+            .map(|f| (f.pixels.as_slice(), f.width as usize, f.height as usize))
+            .collect();
+        let (pixels, grid) = self.processor.preprocess_video(&frames).map_err(to_core)?;
+        let out = self.tower.forward_with_deepstack(&pixels, &[grid]).map_err(to_core)?;
+        Ok((out.pooler_output, out.deepstack_features, grid))
     }
 }
 
@@ -179,17 +199,68 @@ fn collect_images(messages: &[Message]) -> Vec<&ImageRef> {
         .flat_map(|m| {
             m.content.iter().filter_map(|c| match c {
                 Content::Image(img) => Some(img),
-                Content::Text(_) => None,
+                Content::Text(_) | Content::Video(_) => None,
             })
         })
         .collect()
 }
 
-/// Replace each image block with the Qwen-VL placeholder text so the (text-only) chat template
-/// renders `<|vision_start|><|image_pad|><|vision_end|>`; the single `image_pad` token is expanded to
-/// the per-image token count after tokenizing. Keeps the core-llm template contract image-free.
-fn substitute_image_placeholders(messages: &[Message]) -> Vec<Message> {
-    const PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+/// Collect the video blocks of a conversation, in order.
+fn collect_videos(messages: &[Message]) -> Vec<&VideoRef> {
+    messages
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(|c| match c {
+                Content::Video(v) => Some(v),
+                Content::Text(_) | Content::Image(_) => None,
+            })
+        })
+        .collect()
+}
+
+/// Compute the Qwen3-VL **merged per-frame timestamps** for a sampled video, mirroring
+/// `Qwen3VLProcessor._calculate_timestamps`. The vision encoder folds `temporal_patch_size` frames
+/// into one temporal patch, so the per-sample timestamps are padded up to a multiple of
+/// `temporal_patch_size` (repeating the last) and then **averaged within each temporal patch**,
+/// yielding one timestamp per emitted vision frame (`grid_t = padded / temporal_patch_size`). These
+/// are the `<{t:.1f} seconds>` values the Text–Timestamp-Alignment placeholder uses.
+fn merged_frame_timestamps(timestamps: &[f32], temporal_patch_size: usize) -> Vec<f32> {
+    let tps = temporal_patch_size.max(1);
+    let mut ts: Vec<f32> = timestamps.to_vec();
+    if ts.is_empty() {
+        return ts;
+    }
+    while !ts.len().is_multiple_of(tps) {
+        ts.push(*ts.last().unwrap());
+    }
+    (0..ts.len())
+        .step_by(tps)
+        .map(|i| (ts[i] + ts[i + tps - 1]) / 2.0)
+        .collect()
+}
+
+/// The Text–Timestamp-Alignment placeholder text for one video: per merged frame, a
+/// `<{t:.1f} seconds>` timestamp tag followed by `<|vision_start|><|video_pad|><|vision_end|>`
+/// (exactly `Qwen3VLProcessor.replace_video_token`). The single `<|video_pad|>` per frame is expanded
+/// to `frame_seqlen` copies after tokenizing.
+fn video_placeholder_text(video: &VideoRef, temporal_patch_size: usize) -> String {
+    let merged = merged_frame_timestamps(&video.timestamps, temporal_patch_size);
+    let mut out = String::new();
+    for t in merged {
+        out.push_str(&format!("<{t:.1} seconds>"));
+        out.push_str("<|vision_start|><|video_pad|><|vision_end|>");
+    }
+    out
+}
+
+/// Replace each image/video block with its Qwen-VL placeholder text so the (text-only) chat template
+/// renders the vision framing verbatim. Images become `<|vision_start|><|image_pad|><|vision_end|>`
+/// (one `image_pad`, expanded to the per-image patch count after tokenizing); videos become the
+/// per-frame Text–Timestamp-Alignment string `<{t} seconds><|vision_start|><|video_pad|><|vision_end|>`
+/// (one `video_pad` per frame, each expanded to `frame_seqlen` after tokenizing). Keeps the core-llm
+/// template contract image/video-free.
+fn substitute_vision_placeholders(messages: &[Message], temporal_patch_size: usize) -> Vec<Message> {
+    const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
     messages
         .iter()
         .map(|m| Message {
@@ -198,7 +269,8 @@ fn substitute_image_placeholders(messages: &[Message]) -> Vec<Message> {
                 .content
                 .iter()
                 .map(|c| match c {
-                    Content::Image(_) => Content::text(PLACEHOLDER),
+                    Content::Image(_) => Content::text(IMAGE_PLACEHOLDER),
+                    Content::Video(v) => Content::text(video_placeholder_text(v, temporal_patch_size)),
                     Content::Text(t) => Content::Text(t.clone()),
                 })
                 .collect(),
@@ -268,11 +340,22 @@ impl LlamaProvider {
                 .and_then(|x| x.as_i64())
                 .map(|x| x as i32)
                 .unwrap_or(248056);
+            // Video tokens (Qwen3-VL): `video_token_id` (`<|video_pad|>`, 151656) plus the
+            // vision_start/end framing the Text–Timestamp-Alignment substitution emits per frame. A
+            // checkpoint without `video_token_id` in its config does not advertise video.
+            let video_token_id = cfg_value
+                .get("video_token_id")
+                .and_then(|x| x.as_i64())
+                .map(|x| x as i32);
             descriptor.capabilities.supports_vision = true;
+            descriptor.capabilities.supports_video = video_token_id.is_some();
             Some(Qwen35Vision {
                 tower,
                 processor: Qwen35ImageProcessor::default(),
                 image_token_id,
+                // Fall back to the canonical Qwen3-VL id when absent so the field is always valid;
+                // `supports_video` already gates whether the video path is reachable.
+                video_token_id: video_token_id.unwrap_or(151656),
                 spatial_merge_size: vcfg.spatial_merge_size,
             })
         } else {
@@ -314,35 +397,42 @@ impl LlamaProvider {
         }
     }
 
-    /// Build the multimodal prefill: encode each image (preprocess → ViT → merged rows), expand the
-    /// rendered `image_pad` placeholders to the per-image token counts, splice the features into the
-    /// token embeds, and compute the interleaved M-RoPE 3-D positions. `prompt_ids` is the tokenized
-    /// prompt (one `image_token_id` per image, from the rendered placeholders).
+    /// Build the multimodal prefill: encode each visual (image or video) in **document order**
+    /// (preprocess → ViT → merged rows), expand the rendered `image_pad` / `video_pad` placeholders to
+    /// the per-visual / per-frame token counts, splice the features into the token embeds, and compute
+    /// the interleaved M-RoPE 3-D positions over the image **and** video grids. `prompt_ids` is the
+    /// tokenized prompt (one `image_token_id` per image; one `video_token_id` per frame from the
+    /// Text–Timestamp-Alignment placeholders). `messages` is the *original* (un-substituted)
+    /// conversation, walked to recover the visual order.
     fn prepare_multimodal(
         &self,
         prompt_ids: &[i32],
-        images: &[&ImageRef],
+        messages: &[Message],
     ) -> CoreResult<MultimodalPrefill> {
         let vision = self
             .vision
             .as_ref()
             .ok_or_else(|| CoreError::Load("qwen-vl vision: provider has no vision tower".into()))?;
 
-        let mut feats: Vec<Array> = Vec::with_capacity(images.len());
-        let mut counts: Vec<usize> = Vec::with_capacity(images.len());
-        let mut grids: Vec<[i32; 3]> = Vec::with_capacity(images.len());
+        // Walk the conversation in document order; encode each visual once, in order, so the
+        // concatenated feature buffer lines up one-to-one with the visual placeholder spans of the
+        // (image+video) prompt. Image placeholders expand to one count; a video expands to `grid_t`
+        // per-frame counts (`frame_seqlen` each), in frame order.
+        let mut feats: Vec<Array> = Vec::new();
+        let mut image_counts: Vec<usize> = Vec::new();
+        let mut video_counts: Vec<usize> = Vec::new();
+        let mut image_grids: Vec<[i32; 3]> = Vec::new();
+        let mut video_grids: Vec<[i32; 3]> = Vec::new();
         let mut deepstack_by_tap: Vec<Vec<Array>> = Vec::new();
-        for img in images {
-            let (f, deepstack, grid) = vision.encode(img)?;
-            counts.push(f.shape()[0] as usize);
-            grids.push(grid);
-            feats.push(f);
+        let merge = vision.spatial_merge_size;
+
+        let mut push_deepstack = |deepstack: Vec<Array>| -> CoreResult<()> {
             if deepstack_by_tap.is_empty() {
                 deepstack_by_tap.resize_with(deepstack.len(), Vec::new);
             }
             if deepstack.len() != deepstack_by_tap.len() {
                 return Err(CoreError::Load(format!(
-                    "qwen3.6 vision: inconsistent DeepStack tap count {} != {}",
+                    "qwen-vl vision: inconsistent DeepStack tap count {} != {}",
                     deepstack.len(),
                     deepstack_by_tap.len()
                 )));
@@ -350,49 +440,84 @@ impl LlamaProvider {
             for (tap, feature) in deepstack.into_iter().enumerate() {
                 deepstack_by_tap[tap].push(feature);
             }
+            Ok(())
+        };
+
+        for m in messages {
+            for c in &m.content {
+                match c {
+                    Content::Image(img) => {
+                        let (f, deepstack, grid) = vision.encode(img)?;
+                        image_counts.push(f.shape()[0] as usize);
+                        image_grids.push(grid);
+                        feats.push(f);
+                        push_deepstack(deepstack)?;
+                    }
+                    Content::Video(video) => {
+                        let (f, deepstack, grid) = vision.encode_video(video)?;
+                        // One placeholder count per frame: `frame_seqlen = (h/merge)·(w/merge)`.
+                        let [gt, gh, gw] = grid;
+                        let frame_seqlen = ((gh / merge) * (gw / merge)) as usize;
+                        for _ in 0..gt {
+                            video_counts.push(frame_seqlen);
+                        }
+                        video_grids.push(grid);
+                        feats.push(f);
+                        push_deepstack(deepstack)?;
+                    }
+                    Content::Text(_) => {}
+                }
+            }
         }
 
+        // Expand both placeholder tokens to their per-occurrence counts. Each call only touches its
+        // own token, so order across the two is preserved and the result interleaves correctly.
+        let img_id = vision.image_token_id;
+        let vid_id = vision.video_token_id;
+        let expanded = crate::models::qwen35::expand_vision_placeholders(prompt_ids, img_id, &image_counts)
+            .map_err(to_core)?;
         let expanded =
-            crate::models::qwen35::expand_vision_placeholders(prompt_ids, vision.image_token_id, &counts)
+            crate::models::qwen35::expand_vision_placeholders(&expanded, vid_id, &video_counts)
                 .map_err(to_core)?;
-        let visual_pos_mask: Vec<bool> = expanded.iter().map(|&id| id == vision.image_token_id).collect();
+        let visual_pos_mask: Vec<bool> =
+            expanded.iter().map(|&id| id == img_id || id == vid_id).collect();
+
         let refs: Vec<&Array> = feats.iter().collect();
         let all_features = match refs.as_slice() {
             [one] => (*one).clone(),
             many => concatenate_axis(many, 0).map_err(|e| to_core(e.into()))?,
         };
         let mut deepstack = Vec::with_capacity(deepstack_by_tap.len());
-        for by_image in deepstack_by_tap {
-            let refs: Vec<&Array> = by_image.iter().collect();
+        for by_visual in deepstack_by_tap {
+            let refs: Vec<&Array> = by_visual.iter().collect();
             deepstack.push(match refs.as_slice() {
                 [one] => (*one).clone(),
                 many => concatenate_axis(many, 0).map_err(|e| to_core(e.into()))?,
             });
         }
 
-        // Embed the expanded ids, splice in the image features, and compute interleaved-M-RoPE
-        // positions — dispatched to whichever decoder powers this VLM (Qwen3.6 hybrid or Qwen3-VL
-        // generic-causal). Both expose the same embed / splice / mrope hooks.
-        let img_id = vision.image_token_id;
-        let merge = vision.spatial_merge_size;
+        // Embed the expanded ids, splice in the vision features (image+video placeholder rows), and
+        // compute interleaved-M-RoPE positions over both image and video grids — dispatched to
+        // whichever decoder powers this VLM (Qwen3.6 hybrid or Qwen3-VL generic-causal).
+        let placeholders = [img_id, vid_id];
         let (spliced, positions) = match (self.model.as_qwen35(), self.model.as_causal()) {
             (Some(model), _) => {
                 let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
                 let spliced = model
-                    .splice_image_features(&embeds, &expanded, &all_features, img_id)
+                    .splice_vision_features(&embeds, &expanded, &all_features, &placeholders)
                     .map_err(to_core)?;
                 let positions = model
-                    .mrope_positions(&expanded, &grids, img_id, merge)
+                    .mrope_positions_mm(&expanded, &image_grids, img_id, &video_grids, vid_id, merge)
                     .map_err(to_core)?;
                 (spliced, positions)
             }
             (None, Some(model)) => {
                 let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
                 let spliced = model
-                    .splice_image_features(&embeds, &expanded, &all_features, img_id)
+                    .splice_vision_features(&embeds, &expanded, &all_features, &placeholders)
                     .map_err(to_core)?;
                 let positions = model
-                    .mrope_positions(&expanded, &grids, img_id, merge)
+                    .mrope_positions_mm(&expanded, &image_grids, img_id, &video_grids, vid_id, merge)
                     .map_err(to_core)?;
                 (spliced, positions)
             }
@@ -504,17 +629,25 @@ impl TextLlm for LlamaProvider {
             return Err(CoreError::Canceled); // typed pre-inference cancel
         }
 
-        // Multimodal (Qwen3.6 + image content): replace image blocks with the Qwen-VL placeholder so
-        // the (image-free) chat template renders `<|vision_start|><|image_pad|><|vision_end|>`. The
-        // images are encoded + spliced after tokenizing. Text-only requests are unchanged.
-        let images: Vec<&ImageRef> = match &self.vision {
-            Some(_) => collect_images(&req.messages),
-            None => Vec::new(),
+        // Multimodal (Qwen-VL + image/video content): replace image blocks with the Qwen-VL image
+        // placeholder (`<|vision_start|><|image_pad|><|vision_end|>`) and video blocks with the
+        // per-frame Text–Timestamp-Alignment placeholder string
+        // (`<{t} seconds><|vision_start|><|video_pad|><|vision_end|>` ×frames), so the (vision-free)
+        // chat template renders the framing verbatim. The visuals are encoded + spliced after
+        // tokenizing, in document order. Text-only requests are unchanged.
+        let temporal_patch = self
+            .vision
+            .as_ref()
+            .map(|v| v.processor.temporal_patch_size)
+            .unwrap_or(2);
+        let (images, videos): (Vec<&ImageRef>, Vec<&VideoRef>) = match &self.vision {
+            Some(_) => (collect_images(&req.messages), collect_videos(&req.messages)),
+            None => (Vec::new(), Vec::new()),
         };
-        let multimodal = !images.is_empty();
+        let multimodal = !images.is_empty() || !videos.is_empty();
         let substituted;
         let messages: &[Message] = if multimodal {
-            substituted = substitute_image_placeholders(&req.messages);
+            substituted = substitute_vision_placeholders(&req.messages, temporal_patch);
             &substituted
         } else {
             &req.messages
@@ -539,10 +672,10 @@ impl TextLlm for LlamaProvider {
             .map(|id| id as i32)
             .collect();
 
-        // Encode + splice the images and compute M-RoPE positions (the image-token-expanded prompt
+        // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
         let mm = if multimodal {
-            Some(self.prepare_multimodal(&prompt_ids, &images)?)
+            Some(self.prepare_multimodal(&prompt_ids, &req.messages)?)
         } else {
             None
         };
@@ -874,6 +1007,9 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             // Text-only today; the VLM path (sc-7157) flips this on for a vision provider.
             supports_vision: false,
+            // Weightless default: conservative. The load path flips this on for a Qwen3-VL checkpoint
+            // whose config carries a `video_token_id` (sc-8081).
+            supports_video: false,
             // Weightless default: conservative. The load path (descriptor_for + load) flips this on
             // when the loaded model's own chat template gates an `enable_thinking` kwarg (sc-7585).
             supports_thinking: false,
@@ -1238,7 +1374,7 @@ mod tests {
             // render the model's own Jinja template (add_generation_prompt), then tokenize without
             // auto special tokens.
             let messages = oracle_messages(case);
-            let substituted = substitute_image_placeholders(&messages);
+            let substituted = substitute_vision_placeholders(&messages, 2);
             let prompt = template
                 .render_with(
                     &substituted,
@@ -1274,5 +1410,182 @@ mod tests {
         assert!(prompt_opens_thinking("<think>\nold\n</think>\n\nq<|im_start|>assistant\n<think>\n"));
         // No reasoning markers at all (non-thinking template).
         assert!(!prompt_opens_thinking("<|im_start|>assistant\n"));
+    }
+
+    // --- Qwen3-VL video Text–Timestamp-Alignment oracle (tools/gen_qwen3vl_video_oracle.py) --------
+
+    fn qwen3vl_video_oracle() -> serde_json::Value {
+        serde_json::from_str(include_str!("models/testdata/qwen3vl_video_oracle.json")).unwrap()
+    }
+
+    /// **Merged per-frame timestamps match `Qwen3VLProcessor._calculate_timestamps`.** Given the
+    /// sampled `frames_indices` + `fps`, the per-temporal-patch averaged timestamps must equal the HF
+    /// reference exactly — the values that feed the `<{t:.1f} seconds>` Text–Timestamp-Alignment tags.
+    #[test]
+    fn video_merged_timestamps_match_hf_reference() {
+        let j = qwen3vl_video_oracle();
+        let fps = j["fps"].as_f64().unwrap() as f32;
+        let temporal = j["temporal_patch_size"].as_u64().unwrap() as usize;
+        let indices: Vec<f32> = j["frames_indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        // Per-sample timestamps are `idx / fps` (matching the reference, which averages these).
+        let per_sample: Vec<f32> = indices.iter().map(|&i| i / fps).collect();
+        let got = merged_frame_timestamps(&per_sample, temporal);
+        let want: Vec<f32> = j["merged_timestamps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        assert_eq!(got.len(), want.len(), "merged timestamp count vs HF");
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-5, "merged timestamp {g} vs HF {w}");
+        }
+    }
+
+    /// **The per-frame placeholder string matches `Qwen3VLProcessor.replace_video_token` (collapsed
+    /// form).** The engine emits **one** `<|video_pad|>` per frame and expands it to `frame_seqlen`
+    /// copies after tokenizing (exactly the image path's pattern, where the chat template renders a
+    /// single `<|image_pad|>`). The reference `replace_video_token` writes the *already-expanded*
+    /// string (`frame_seqlen` `<|video_pad|>` per frame). Collapsing each consecutive `<|video_pad|>`
+    /// run of the reference string to one token must yield exactly [`video_placeholder_text`]: same
+    /// `<{t:.1f} seconds>` Text–Timestamp-Alignment tags, same per-frame vision framing.
+    #[test]
+    fn video_placeholder_string_matches_hf_reference() {
+        let j = qwen3vl_video_oracle();
+        let fps = j["fps"].as_f64().unwrap() as f32;
+        let temporal = j["temporal_patch_size"].as_u64().unwrap() as usize;
+        let indices: Vec<f32> = j["frames_indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect();
+        // Build a synthetic VideoRef with one 1x1 frame per sampled index carrying its `idx/fps`
+        // timestamp (the frame pixels are irrelevant to the placeholder string).
+        let frames: Vec<ImageRef> = indices
+            .iter()
+            .map(|_| ImageRef::new(1, 1, vec![0, 0, 0]).unwrap())
+            .collect();
+        let timestamps: Vec<f32> = indices.iter().map(|&i| i / fps).collect();
+        let video = VideoRef::new(frames, timestamps).unwrap();
+        let got = video_placeholder_text(&video, temporal);
+
+        // Collapse the reference string's `<|video_pad|>` runs to a single token per frame.
+        let pad = "<|video_pad|>";
+        let mut collapsed = j["placeholder_text"].as_str().unwrap().to_string();
+        while collapsed.contains(&format!("{pad}{pad}")) {
+            collapsed = collapsed.replace(&format!("{pad}{pad}"), pad);
+        }
+        assert_eq!(
+            got, collapsed,
+            "collapsed Text–Timestamp-Alignment placeholder string must byte-match HF replace_video_token"
+        );
+        // The timestamp tags themselves must appear verbatim (the core of Text–Timestamp Alignment).
+        for t in j["merged_timestamps"].as_array().unwrap() {
+            let tag = format!("<{:.1} seconds>", t.as_f64().unwrap());
+            assert!(got.contains(&tag), "placeholder must carry the `{tag}` timestamp tag: {got}");
+        }
+    }
+
+    /// **The per-frame `<|video_pad|>` expansion matches the HF id stream.** Tokenizing the reference
+    /// placeholder string yields one `<|video_pad|>` per frame; expanding each to `frame_seqlen`
+    /// copies (the merged patch count the ViT emits per frame) must reproduce the exact id stream the
+    /// processor produces — same per-frame vision framing, same timestamp tokens, same counts. This is
+    /// the video analogue of `expand_vision_placeholders` for images, but with `grid_t` runs.
+    #[test]
+    fn video_token_expansion_matches_hf_reference() {
+        let j = qwen3vl_video_oracle();
+        let expanded_hf: Vec<i32> =
+            j["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect();
+        let vid = j["video_token_id"].as_i64().unwrap() as i32;
+        let grid_t = j["grid_t"].as_u64().unwrap() as usize;
+        let frame_seqlen = j["frame_seqlen"].as_u64().unwrap() as usize;
+        let expected_video_tokens = j["expected_video_tokens"].as_u64().unwrap() as usize;
+
+        // The merged-token count per frame, and total, must agree with the HF processor.
+        assert_eq!(grid_t * frame_seqlen, expected_video_tokens, "total video tokens vs HF");
+        assert_eq!(
+            expanded_hf.iter().filter(|&&x| x == vid).count(),
+            expected_video_tokens,
+            "video tokens in HF id stream"
+        );
+
+        // Reconstruct the *raw* (pre-expansion) ids: collapse each consecutive `<|video_pad|>` run
+        // back to a single placeholder. The HF stream has `grid_t` such runs (one per frame), each of
+        // `frame_seqlen` tokens; collapsing recovers one `<|video_pad|>` per frame.
+        let mut raw = Vec::new();
+        let mut i = 0usize;
+        let mut runs = 0usize;
+        while i < expanded_hf.len() {
+            if expanded_hf[i] == vid {
+                raw.push(vid);
+                runs += 1;
+                while i < expanded_hf.len() && expanded_hf[i] == vid {
+                    i += 1;
+                }
+            } else {
+                raw.push(expanded_hf[i]);
+                i += 1;
+            }
+        }
+        assert_eq!(runs, grid_t, "one <|video_pad|> run per frame (grid_t)");
+
+        // Expanding each per-frame placeholder to `frame_seqlen` reproduces the HF id stream exactly.
+        let counts = vec![frame_seqlen; grid_t];
+        let expanded = crate::models::qwen35::expand_vision_placeholders(&raw, vid, &counts).unwrap();
+        assert_eq!(expanded, expanded_hf, "expanded video ids vs HF processor");
+    }
+
+    /// **The video M-RoPE positions over the oracle grid are well-formed and per-frame-reset.** Feed
+    /// the expanded video id stream + the `video_grid_thw` through `mrope_positions_mm`: the temporal
+    /// row must reset to the frame's cursor at each frame (Qwen3-VL's synthetic time axis splits each
+    /// `[t,h,w]` into `t` per-frame `[1,h,w]` blocks). The HF-pinned exact-row check lives in
+    /// `qwen35::qwen3vl_mrope_video_matches_hf_reference`; here we confirm the provider's video grid
+    /// drives the same path consistently.
+    #[test]
+    fn video_mrope_positions_split_frames() {
+        let j = qwen3vl_video_oracle();
+        let expanded_hf: Vec<i32> =
+            j["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect();
+        let vid = j["video_token_id"].as_i64().unwrap() as i32;
+        let img = j["video_token_id"].as_i64().unwrap() as i32 - 1; // a distinct unused image id
+        let g = j["video_grid_thw"].as_array().unwrap()[0].as_array().unwrap();
+        let grid = [g[0].as_i64().unwrap() as i32, g[1].as_i64().unwrap() as i32, g[2].as_i64().unwrap() as i32];
+        let merge = j["merge"].as_i64().unwrap() as i32;
+
+        let (t, h, w, _delta) = crate::models::deepstack::mrope_positions_mm(
+            &expanded_hf,
+            &[],
+            img,
+            &[grid],
+            vid,
+            merge,
+        )
+        .unwrap();
+        assert_eq!(t.len(), expanded_hf.len());
+        // Each frame's video tokens share one temporal index (gt = 1 per frame after the split), and
+        // the two frames sit at *different* temporal positions (the cursor advances between them).
+        let frame_temporals: Vec<i32> = expanded_hf
+            .iter()
+            .zip(&t)
+            .filter_map(|(&id, &tt)| (id == vid).then_some(tt))
+            .collect();
+        let distinct: std::collections::BTreeSet<i32> = frame_temporals.iter().copied().collect();
+        assert_eq!(distinct.len(), grid[0] as usize, "one distinct temporal index per frame");
+        // h/w spans are bounded by the per-frame grid (h/merge, w/merge).
+        let max_w = (grid[2] / merge) - 1;
+        let frame_ws: Vec<i32> = expanded_hf
+            .iter()
+            .zip(&w)
+            .zip(&t)
+            .filter_map(|((&id, &ww), &tt)| (id == vid).then_some(ww - tt))
+            .collect();
+        assert!(frame_ws.iter().all(|&rel| (0..=max_w).contains(&rel)), "w within per-frame grid");
+        let _ = h;
     }
 }

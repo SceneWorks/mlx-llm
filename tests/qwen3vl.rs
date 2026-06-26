@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use core_llm::{
     load_for_model_with, load_textllm, Channel, Content, ImageRef, LoadSpec, Message,
     ModelRequirements, Quantize, Role, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmRequest,
-    ThinkingMode, Tokenizer,
+    ThinkingMode, Tokenizer, VideoRef,
 };
 
 use mlx_llm::config::{Architecture, ModelConfig};
@@ -438,4 +438,149 @@ fn qwen3vl_vision_q4_q8_import_path() {
             "{label}: quantized greedy answer must ground on the image and name '{want}', got: {content:?}"
         );
     }
+}
+
+// =============================================================================================
+// sc-8081 — Qwen3-VL VIDEO modality + Text–Timestamp Alignment, end-to-end via the core-llm contract.
+// =============================================================================================
+
+/// A solid-color RGB video **frame** of `w·h` pixels.
+fn solid_frame(w: u32, h: u32, rgb: [u8; 3]) -> ImageRef {
+    solid_image(w, h, rgb)
+}
+
+/// Build a sampled video from solid-color frames, at `fps`, with the frame timestamps the host would
+/// derive from the sampled frame indices (`idx / fps`). 64×64 keeps the video preprocess resize a
+/// no-op (a clean, fast grid) while still exercising the full multi-frame ViT path.
+fn solid_video(colors: &[[u8; 3]], fps: f32) -> VideoRef {
+    let frames: Vec<ImageRef> = colors.iter().map(|&c| solid_frame(64, 64, c)).collect();
+    let timestamps: Vec<f32> = (0..colors.len()).map(|i| i as f32 / fps).collect();
+    VideoRef::new(frames, timestamps).expect("video frames + timestamps")
+}
+
+/// **sc-8081 AC #1 — a short video prompt produces a temporally-grounded answer.** Load the real
+/// Qwen3-VL-8B snapshot end-to-end via the core-llm provider; confirm it advertises **video**; then
+/// feed a short synthetic video whose color changes over time (red → blue) and ask which color comes
+/// **first**. A correct end-to-end video path (frame sampling layout → multi-frame ViT → per-frame
+/// `<|video_pad|>` expansion → Text–Timestamp-Alignment timestamps → interleaved-M-RoPE per-frame time
+/// axis → DeepStack fusion → decode) is what lets the model order the frames; a break anywhere makes
+/// the temporal answer unreliable. The model's exact phrasing is logged.
+#[test]
+fn qwen3vl_video_grounds_temporal_order_via_core_llm() {
+    let Some(dir) = snapshot_dir() else {
+        eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        return;
+    };
+    let provider = load_for_model_with(
+        &LoadSpec::dense(dir.to_str().unwrap()),
+        &ModelRequirements::default(),
+    )
+    .expect("load_for_model must resolve the Qwen3-VL snapshot");
+    assert_eq!(provider.descriptor().id, PROVIDER_ID, "must route to mlx-llama");
+    assert_eq!(provider.descriptor().family, "qwen3_vl");
+    assert!(
+        provider.descriptor().capabilities.supports_video,
+        "a loaded Qwen3-VL checkpoint must advertise video (config carries video_token_id)"
+    );
+
+    // A video that is solid RED for the first half then solid BLUE for the second half. Four sampled
+    // frames at 1 fps fold (temporal_patch_size=2) into **two** merged temporal patches — patch 0 =
+    // red+red (≈0.5s), patch 1 = blue+blue (≈2.5s) — so the model sees two distinct timestamped
+    // vision frames in order. (Two frames would fold into a single patch with no temporal extent.)
+    let video = solid_video(&[[205, 35, 35], [205, 35, 35], [35, 70, 200], [35, 70, 200]], 1.0);
+    let req = vision_request(
+        vec![user_turn(vec![
+            Content::Video(video),
+            Content::text(
+                "This is a short video. What color is shown at the start, and what color is shown \
+                 at the end? Answer with two color words: first the starting color, then the ending color.",
+            ),
+        ])],
+        48,
+    );
+    let (content, usage) = run_vision(provider.as_ref(), &req);
+    println!("\n=== Qwen3-VL VIDEO temporal-order ===\n[answer] {content:?}\n");
+    assert!(usage.prompt_tokens > 0 && usage.generated_tokens > 0, "must run the video prefill");
+    assert!(!content.trim().is_empty(), "must produce an answer");
+    let lc = content.to_lowercase();
+    // The video path must ground on *both* frames' colors. Temporal ordering (red before blue) is the
+    // strong claim; if the 8B model names them out of order on synthetic input we still require both
+    // colors to appear (proving both frames reached the model with distinct content).
+    assert!(
+        lc.contains("red") && lc.contains("blue"),
+        "video answer must ground on both frames (red and blue), got: {content:?}"
+    );
+    if let (Some(r), Some(b)) = (lc.find("red"), lc.find("blue")) {
+        // Log whether temporal order was correct; this is the grounding signal we care about.
+        println!(
+            "temporal order {}: red@{r} blue@{b}",
+            if r < b { "CORRECT (red before blue)" } else { "out-of-order" }
+        );
+        assert!(r < b, "temporally-grounded answer must name the starting color (red) before the ending color (blue), got: {content:?}");
+    }
+}
+
+/// **sc-8081 — temporal grounding on a second, independent video (order reversed).** A
+/// complementary grounding check with the colors in the *opposite* order (blue first, then green) so
+/// a model that simply always emits a fixed pair cannot pass both this and the red→blue test. The
+/// four frames fold into two merged temporal patches (blue@~0.5s, green@~2.5s); a temporally-grounded
+/// answer names blue before green. Exercises the same Text–Timestamp-Alignment path on different
+/// content. The model's exact phrasing is logged.
+#[test]
+fn qwen3vl_video_temporal_order_reversed_via_core_llm() {
+    let Some(dir) = snapshot_dir() else {
+        eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        return;
+    };
+    let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
+
+    // Solid BLUE for the first half, then solid GREEN for the second half.
+    let video = solid_video(&[[35, 70, 200], [35, 70, 200], [40, 180, 60], [40, 180, 60]], 1.0);
+    let req = vision_request(
+        vec![user_turn(vec![
+            Content::Video(video),
+            Content::text(
+                "This is a short video. What color is shown at the start, and what color is shown \
+                 at the end? Answer with two color words: first the starting color, then the ending color.",
+            ),
+        ])],
+        48,
+    );
+    let (content, usage) = run_vision(provider.as_ref(), &req);
+    println!("\n=== Qwen3-VL VIDEO temporal-order (reversed) ===\n[answer] {content:?}\n");
+    assert!(usage.generated_tokens > 0);
+    let lc = content.to_lowercase();
+    assert!(!lc.trim().is_empty(), "must produce an answer");
+    assert!(
+        lc.contains("blue") && lc.contains("green"),
+        "video answer must ground on both frames (blue and green), got: {content:?}"
+    );
+    if let (Some(b), Some(g)) = (lc.find("blue"), lc.find("green")) {
+        println!(
+            "temporal order {}: blue@{b} green@{g}",
+            if b < g { "CORRECT (blue before green)" } else { "out-of-order" }
+        );
+        assert!(b < g, "temporally-grounded answer must name the starting color (blue) before the ending color (green), got: {content:?}");
+    }
+}
+
+/// **sc-8081 AC #2 (representation sanity) — the descriptor advertises video and a video request is
+/// accepted.** A provider-level check that the video capability flag is wired and a `Content::Video`
+/// request validates (the contract gate from core-llm) on the real snapshot.
+#[test]
+fn qwen3vl_video_capability_and_validate() {
+    let Some(dir) = snapshot_dir() else {
+        eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        return;
+    };
+    let provider = load_textllm(PROVIDER_ID, &LoadSpec::dense(dir.to_str().unwrap())).unwrap();
+    assert!(provider.descriptor().capabilities.supports_video);
+    let req = vision_request(
+        vec![user_turn(vec![
+            Content::Video(solid_video(&[[0, 0, 0], [255, 255, 255]], 2.0)),
+            Content::text("Describe this video."),
+        ])],
+        8,
+    );
+    provider.validate(&req).expect("a video request must validate on a video-capable provider");
 }

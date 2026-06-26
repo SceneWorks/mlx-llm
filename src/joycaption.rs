@@ -464,6 +464,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             max_new_tokens: 0,
             supports_system_prompt: true,
             supports_vision: true,
+            supports_video: false,
             supports_thinking: false,
             supports_tools: false,
             supported_constraints: Vec::new(),

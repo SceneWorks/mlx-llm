@@ -19,29 +19,46 @@ pub(crate) fn splice_image_features(
     hidden: i32,
     compute_dtype: mlx_rs::Dtype,
 ) -> Result<Array> {
+    splice_vision_features(embeds, input_ids, image_features, &[image_token_id], hidden, compute_dtype)
+}
+
+/// Generalised VLM splice: replace every row whose id is **any** of `placeholder_tokens` (image
+/// `<|image_pad|>` and/or video `<|video_pad|>`) with the next feature row, in sequence order. This is
+/// the multimodal splice for a mixed image+video prompt — the visual features (image features then
+/// the video's per-frame merged rows, concatenated in the same order the placeholders appear) line up
+/// one-to-one with the visual positions. Reduces to [`splice_image_features`] for a single token.
+pub(crate) fn splice_vision_features(
+    embeds: &Array,
+    input_ids: &[i32],
+    vision_features: &Array,
+    placeholder_tokens: &[i32],
+    hidden: i32,
+    compute_dtype: mlx_rs::Dtype,
+) -> Result<Array> {
     let s = embeds.shape()[1] as usize;
-    let feats = image_features.as_dtype(compute_dtype)?;
-    let num_img = input_ids.iter().filter(|&&x| x == image_token_id).count() as i32;
-    if num_img != feats.shape()[0] {
+    let feats = vision_features.as_dtype(compute_dtype)?;
+    let is_vis = |id: i32| placeholder_tokens.contains(&id);
+    let num_vis = input_ids.iter().filter(|&&x| is_vis(x)).count() as i32;
+    if num_vis != feats.shape()[0] {
         return Err(Error::Msg(format!(
-            "vlm splice: {num_img} image tokens != {} feature rows",
+            "vlm splice: {num_vis} vision tokens != {} feature rows",
             feats.shape()[0]
         )));
     }
-    if num_img == 0 {
+    if num_vis == 0 {
         return Ok(embeds.clone());
     }
     let mut pieces: Vec<Array> = Vec::new();
     let mut feat_off = 0i32;
     let mut i = 0usize;
     while i < s {
-        let is_img = input_ids[i] == image_token_id;
+        let vis = is_vis(input_ids[i]);
         let mut j = i;
-        while j < s && (input_ids[j] == image_token_id) == is_img {
+        while j < s && is_vis(input_ids[j]) == vis {
             j += 1;
         }
         let n = (j - i) as i32;
-        if is_img {
+        if vis {
             let idx = Array::from_slice(&(feat_off..feat_off + n).collect::<Vec<_>>(), &[n]);
             pieces.push(feats.take_axis(&idx, 0)?.reshape(&[1, n, hidden])?);
             feat_off += n;
