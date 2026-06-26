@@ -686,10 +686,9 @@ impl Qwen35Model {
     /// containing `image_grid_thw`-described `image_token_id` runs, plus the `mrope_delta`
     /// (`max_position + 1 − len`) the decode loop adds to continue positions after the prompt.
     ///
-    /// Text tokens advance all three axes (t,h,w) by 1; an image run lays its tokens out over the
-    /// `(t, h/merge, w/merge)` grid (temporal constant, height = row, width = col, offset by the shared
-    /// cursor) and then advances the cursor by `max(h, w) / merge`. `spatial_merge_size` comes from the
-    /// vision config. Returns `(t_row, h_row, w_row, mrope_delta)`.
+    /// The image-only entry point — the multimodal prefill path. See
+    /// [`Self::mrope_positions_mm`] for the general (image + video) port; this forwards to it with
+    /// no video runs.
     pub fn mrope_positions(
         &self,
         input_ids: &[i32],
@@ -697,26 +696,88 @@ impl Qwen35Model {
         image_token_id: i32,
         spatial_merge_size: i32,
     ) -> Result<MropePositions> {
+        self.mrope_positions_mm(
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            &[],
+            image_token_id, // unused: no video runs
+            spatial_merge_size,
+        )
+    }
+
+    /// The full Qwen3-VL `get_rope_index` port (B=1), covering **both** image and video vision runs.
+    ///
+    /// Text tokens advance all three axes (t,h,w) by 1. A vision run lays its tokens over the
+    /// `(t, h/merge, w/merge)` grid — temporal index per frame, height = row, width = col — offset by
+    /// the shared cursor `st_idx` (`= max(prev block) + 1`), then advances the cursor by
+    /// `max(grid_t, h/merge, w/merge)` (the reference's `llm_positions.max() + 1`).
+    ///
+    /// **Qwen3-VL video is the synthetic time axis.** Unlike a single multi-`t` block, Qwen3-VL
+    /// separates frames with timestamp text, so the processor emits one `video_token_id` run **per
+    /// frame** and the model splits `video_grid_thw` via `repeat_interleave(t); t ← 1`. Each frame is
+    /// thus its own `gt = 1` block, and the temporal index **resets to 0 each frame** (the frames are
+    /// ordered only by the advancing cursor). We mirror that by expanding each `[t, h, w]` video grid
+    /// into `t` per-frame `[1, h, w]` blocks, one per consecutive video-token run. Image grids are
+    /// consumed one run per `image_grid_thw` entry (Qwen3-VL images are always `gt = 1`).
+    ///
+    /// `spatial_merge_size` comes from the vision config. Returns `(t_row, h_row, w_row, mrope_delta)`.
+    pub fn mrope_positions_mm(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        video_grid_thw: &[[i32; 3]],
+        video_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<MropePositions> {
         let merge = spatial_merge_size.max(1);
+        // Per-frame video blocks: `[t, h, w]` → `t × [1, h, w]` (the timestamp frame-split). Image
+        // blocks pass through unchanged (always `gt = 1`).
+        let mut video_frames: Vec<[i32; 3]> = Vec::new();
+        for &[t, h, w] in video_grid_thw {
+            if t <= 0 {
+                return Err(Error::Msg(format!("qwen3_5 mrope: bad video grid {:?}", [t, h, w])));
+            }
+            for _ in 0..t {
+                video_frames.push([1, h, w]);
+            }
+        }
+
         let (mut t, mut h, mut w) = (Vec::new(), Vec::new(), Vec::new());
         let mut cur = 0i32;
-        let mut gi = 0usize;
+        let (mut img_i, mut vid_i) = (0usize, 0usize);
         let mut i = 0usize;
         while i < input_ids.len() {
-            if input_ids[i] == image_token_id {
-                let g = *image_grid_thw.get(gi).ok_or_else(|| {
-                    Error::Msg("qwen3_5 mrope: more image runs than image_grid_thw entries".into())
-                })?;
-                gi += 1;
-                let (gt, gh, gw) = (g[0], g[1] / merge, g[2] / merge);
-                if gh <= 0 || gw <= 0 || gt <= 0 {
-                    return Err(Error::Msg(format!("qwen3_5 mrope: bad image grid {g:?}")));
+            let id = input_ids[i];
+            let is_image = id == image_token_id;
+            // `image_token_id == video_token_id` would be ambiguous; the configs always differ, and
+            // an image run is matched first.
+            let is_video = !is_image && id == video_token_id;
+            if is_image || is_video {
+                let (grid, label): ([i32; 3], &str) = if is_image {
+                    let g = *image_grid_thw.get(img_i).ok_or_else(|| {
+                        Error::Msg("qwen3_5 mrope: more image runs than image_grid_thw entries".into())
+                    })?;
+                    img_i += 1;
+                    (g, "image")
+                } else {
+                    let g = *video_frames.get(vid_i).ok_or_else(|| {
+                        Error::Msg("qwen3_5 mrope: more video frame runs than video_grid_thw frames".into())
+                    })?;
+                    vid_i += 1;
+                    (g, "video")
+                };
+                let (gt, gh, gw) = (grid[0], grid[1] / merge, grid[2] / merge);
+                if gt <= 0 || gh <= 0 || gw <= 0 {
+                    return Err(Error::Msg(format!("qwen3_5 mrope: bad {label} grid {grid:?}")));
                 }
                 let count = (gt * gh * gw) as usize;
-                let run = input_ids[i..].iter().take_while(|&&x| x == image_token_id).count();
+                let tok = id;
+                let run = input_ids[i..].iter().take_while(|&&x| x == tok).count();
                 if run != count {
                     return Err(Error::Msg(format!(
-                        "qwen3_5 mrope: image run length {run} != grid tokens {count}"
+                        "qwen3_5 mrope: {label} run length {run} != grid tokens {count}"
                     )));
                 }
                 let frame = gh * gw;
@@ -726,7 +787,7 @@ impl Qwen35Model {
                     h.push(rem / gw + cur);
                     w.push(rem % gw + cur);
                 }
-                cur += gh.max(gw);
+                cur += gt.max(gh).max(gw);
                 i += count;
             } else {
                 t.push(cur);
@@ -1007,6 +1068,55 @@ impl crate::decode::Decode for Qwen35Model {
             .ok_or_else(|| Error::Msg("Qwen35Model::step: cache is not a Qwen35Cache".into()))?;
         self.decode_logits(input_ids, cache, offset)
     }
+}
+
+/// Expand a single vision placeholder token into `count` copies — the Qwen3-VL image/video
+/// placeholder token expansion (`Qwen3VLProcessor`).
+///
+/// The chat template renders each visual as `<|vision_start|> <placeholder> <|vision_end|>` with a
+/// **single** `placeholder_token` (image `151655` or video `151656`). The processor then replaces
+/// that one placeholder with `grid_t · grid_h · grid_w / merge²` copies (`counts[k]` here — the
+/// merged-patch count the vision tower emits for visual `k`), leaving the `vision_start` /
+/// `vision_end` frame and all surrounding text untouched. The resulting ids line up one-to-one with
+/// the spliced patch-feature rows ([`Qwen35Model::splice_image_features`]) and the M-RoPE layout
+/// ([`Qwen35Model::mrope_positions_mm`]).
+///
+/// `counts` must have one entry per placeholder occurrence of `placeholder_token`, in sequence
+/// order. Returns the expanded id stream.
+pub fn expand_vision_placeholders(
+    ids: &[i32],
+    placeholder_token: i32,
+    counts: &[usize],
+) -> Result<Vec<i32>> {
+    let n_placeholders = ids.iter().filter(|&&x| x == placeholder_token).count();
+    if n_placeholders != counts.len() {
+        return Err(Error::Msg(format!(
+            "qwen3_5 token-expansion: {n_placeholders} placeholders for token {placeholder_token} \
+             but {} counts supplied",
+            counts.len()
+        )));
+    }
+    let total: usize = counts.iter().sum();
+    let mut out = Vec::with_capacity(ids.len() - n_placeholders + total);
+    let mut ci = 0usize;
+    for &id in ids {
+        if id == placeholder_token {
+            out.extend(std::iter::repeat_n(placeholder_token, counts[ci]));
+            ci += 1;
+        } else {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// The merged-patch token count for a vision grid `[t, h, w]` (patch units): `t · h · w / merge²`
+/// — the number of placeholder tokens the processor emits and the number of feature rows the vision
+/// tower produces for that visual.
+pub fn vision_merged_token_count(grid_thw: [i32; 3], spatial_merge_size: i32) -> usize {
+    let merge = spatial_merge_size.max(1);
+    let [t, h, w] = grid_thw;
+    (t.max(0) * (h.max(0) / merge) * (w.max(0) / merge)) as usize
 }
 
 #[cfg(test)]
@@ -1382,6 +1492,160 @@ mod tests {
         assert_eq!(h, ints("h"));
         assert_eq!(w, ints("w"));
         assert_eq!(delta, r["delta"].as_i64().unwrap() as i32);
+    }
+
+    // --- Qwen3-VL HF-backed oracles (tools/gen_qwen3vl_mrope_oracle.py) ----------------------------
+
+    fn qwen3vl_mrope_oracle() -> serde_json::Value {
+        serde_json::from_str(include_str!("testdata/qwen3vl_mrope_oracle.json")).unwrap()
+    }
+
+    fn ints_of(v: &serde_json::Value) -> Vec<i32> {
+        v.as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
+    }
+
+    fn grids_of(v: &serde_json::Value) -> Vec<[i32; 3]> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|g| [g[0].as_i64().unwrap() as i32, g[1].as_i64().unwrap() as i32, g[2].as_i64().unwrap() as i32])
+            .collect()
+    }
+
+    /// **Interleaved-MRoPE position ids — mixed text/image.** `mrope_positions_mm` must reproduce the
+    /// real `Qwen3VLModel.get_rope_index` 3-D rows + `mrope_delta` for a text+image sequence, exact
+    /// integer match. This is the Qwen3-VL placement (image block offset by the running cursor, cursor
+    /// advanced by `max(t, h/merge, w/merge)`).
+    #[test]
+    fn qwen3vl_mrope_image_matches_hf_reference() {
+        let j = qwen3vl_mrope_oracle();
+        let r = &j["rope_index_image"];
+        let ids = ints_of(&r["input_ids"]);
+        let grid = grids_of(&r["image_grid_thw"]);
+        let img = j["image_token_id"].as_i64().unwrap() as i32;
+        let merge = j["merge"].as_i64().unwrap() as i32;
+
+        let (_cfg, model) = synthetic_model();
+        let (t, h, w, delta) = model.mrope_positions(&ids, &grid, img, merge).unwrap();
+        assert_eq!(t, ints_of(&r["t"]), "image t-row vs HF get_rope_index");
+        assert_eq!(h, ints_of(&r["h"]), "image h-row vs HF get_rope_index");
+        assert_eq!(w, ints_of(&r["w"]), "image w-row vs HF get_rope_index");
+        assert_eq!(delta, r["delta"].as_i64().unwrap() as i32, "image mrope_delta");
+    }
+
+    /// **Interleaved-MRoPE position ids — synthetic time / multi-frame video axis.** Qwen3-VL splits a
+    /// `[t, h, w]` video into `t` per-frame `gt = 1` blocks (timestamps separate frames), so the
+    /// temporal index resets per frame and frames are ordered only by the advancing cursor.
+    /// `mrope_positions_mm` must reproduce the HF rows + delta exactly for the 2-frame case — the
+    /// Qwen3-VL-specific delta a single multi-`t` block would get wrong.
+    #[test]
+    fn qwen3vl_mrope_video_matches_hf_reference() {
+        let j = qwen3vl_mrope_oracle();
+        let r = &j["rope_index_video"];
+        let ids = ints_of(&r["input_ids"]);
+        let vgrid = grids_of(&r["video_grid_thw"]);
+        let vid = j["video_token_id"].as_i64().unwrap() as i32;
+        let img = j["image_token_id"].as_i64().unwrap() as i32;
+        let merge = j["merge"].as_i64().unwrap() as i32;
+
+        let (_cfg, model) = synthetic_model();
+        let (t, h, w, delta) = model
+            .mrope_positions_mm(&ids, &[], img, &vgrid, vid, merge)
+            .unwrap();
+        assert_eq!(t, ints_of(&r["t"]), "video t-row vs HF get_rope_index (per-frame reset)");
+        assert_eq!(h, ints_of(&r["h"]), "video h-row vs HF get_rope_index");
+        assert_eq!(w, ints_of(&r["w"]), "video w-row vs HF get_rope_index");
+        assert_eq!(delta, r["delta"].as_i64().unwrap() as i32, "video mrope_delta");
+    }
+
+    /// **Interleaved-MRoPE table — end to end at Qwen3-VL config.** Build the partial-rotary RoPE at
+    /// the real text config (head_dim 128, `rotary_dim` 128, theta 5e6, `mrope_section [24,20,20]`),
+    /// feed it the HF rope rows for the image sequence, and require the interleaved cos/sin tables to
+    /// match the reference `apply_interleaved_mrope` within 1e-5 (f32). Closes the loop from
+    /// `get_rope_index` rows through the Qwen3-VL interleaving.
+    #[test]
+    fn qwen3vl_interleaved_cos_sin_matches_hf_reference() {
+        let j = qwen3vl_mrope_oracle();
+        let il = &j["interleaved"];
+        let head_dim = j["head_dim"].as_i64().unwrap() as i32;
+        let theta = j["rope_theta"].as_f64().unwrap() as f32;
+        let section: Vec<usize> = j["mrope_section"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as usize)
+            .collect();
+        let sections = [section[0], section[1], section[2]];
+        let (t, h, w) = (ints_of(&il["t"]), ints_of(&il["h"]), ints_of(&il["w"]));
+        let expect = |k: &str| -> Vec<f32> {
+            il[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+        };
+
+        // Qwen3-VL text rope is full-rotary (partial_rotary_factor 1.0 ⇒ rotary_dim == head_dim),
+        // NeoX half-split — exactly Rope::partial(head_dim, theta, false).
+        let rope = crate::primitives::rope::Rope::partial(head_dim, theta, false);
+        let (cos, sin) = rope
+            .mrope_interleaved_cos_sin([&t, &h, &w], sections, Dtype::Float32)
+            .unwrap();
+        assert_eq!(cos.shape(), &[1, t.len() as i32, head_dim]);
+        let cmp = |got: &[f32], exp: &[f32]| {
+            assert_eq!(got.len(), exp.len(), "table length");
+            got.iter().zip(exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+        };
+        let dc = cmp(cos.as_slice::<f32>(), &expect("cos"));
+        let ds = cmp(sin.as_slice::<f32>(), &expect("sin"));
+        assert!(dc < 1e-5, "interleaved cos vs HF reference: max abs diff {dc}");
+        assert!(ds < 1e-5, "interleaved sin vs HF reference: max abs diff {ds}");
+    }
+
+    /// **Image-placeholder token expansion matches the HF processor.** Given the raw chat ids with a
+    /// single `<|image_pad|>` framed by `<|vision_start|>` / `<|vision_end|>`, expanding the
+    /// placeholder to `grid.prod() / merge²` copies must reproduce the exact id stream
+    /// `Qwen3VLProcessor` emits — same count, same vision framing, surrounding text untouched.
+    #[test]
+    fn qwen3vl_token_expansion_matches_hf_processor() {
+        let j = qwen3vl_mrope_oracle();
+        let ex = &j["expand"];
+        let expanded_hf = ints_of(&ex["expanded_ids"]);
+        let img = ex["image_token_id"].as_i64().unwrap() as i32;
+        let vs = ex["vision_start_token_id"].as_i64().unwrap() as i32;
+        let ve = ex["vision_end_token_id"].as_i64().unwrap() as i32;
+        let g = ints_of(&ex["grid_thw"]); // single [t, h, w]
+        let grid = [g[0], g[1], g[2]];
+        let merge = ex["merge"].as_i64().unwrap() as i32;
+        let expected_count = ex["expected_count"].as_i64().unwrap() as usize;
+
+        // The count the vision tower / processor agree on.
+        let count = vision_merged_token_count(grid, merge);
+        assert_eq!(count, expected_count, "merged-token count formula vs HF processor");
+
+        // Reconstruct the *raw* (pre-expansion) chat ids: the single image placeholder framed by
+        // vision_start/vision_end, with all surrounding (non-image) tokens preserved in order. The HF
+        // expanded ids are that with the placeholder repeated `count` times — so collapsing the image
+        // run back to one token recovers the raw stream.
+        let mut raw = Vec::new();
+        let mut i = 0usize;
+        while i < expanded_hf.len() {
+            if expanded_hf[i] == img {
+                raw.push(img); // one placeholder
+                while i < expanded_hf.len() && expanded_hf[i] == img {
+                    i += 1;
+                }
+            } else {
+                raw.push(expanded_hf[i]);
+                i += 1;
+            }
+        }
+
+        let expanded = expand_vision_placeholders(&raw, img, &[count]).unwrap();
+        assert_eq!(expanded, expanded_hf, "expanded ids vs HF processor");
+
+        // The expansion is framed by exactly one vision_start … vision_end with `count` image tokens
+        // between, and the count matches what the merger emits.
+        let si = expanded.iter().position(|&x| x == vs).unwrap();
+        let ei = expanded.iter().position(|&x| x == ve).unwrap();
+        assert_eq!(ei - si - 1, count, "image tokens framed between vision_start/vision_end");
+        assert_eq!(expanded[si + 1..ei].iter().filter(|&&x| x == img).count(), count);
     }
 
     /// **The text-path invariant.** Feeding token embeds + equal (text) 3-D positions through
