@@ -298,6 +298,62 @@ fn qwen3vl_vision_grounds_single_image_via_core_llm() {
     }
 }
 
+/// **sc-8077 (the story-D gap, closed):** model-first **vision-required** routing must resolve the
+/// Qwen3-VL snapshot to `mlx-llama` at the pre-load capability gate — `load_for_model_with(spec,
+/// ModelRequirements::with_vision())`, the path a worker uses when a request carries an image.
+///
+/// Before sc-8077 this REJECTED a genuine Qwen3-VL snapshot: the provider's weightless descriptor
+/// reports `supports_vision=false` (it also serves text-only checkpoints), so core-llm's gate
+/// (`meets`) filtered `mlx-llama` out and returned `Error::Unsupported`. Only the id-based
+/// (`load_textllm`) / default-requirements path worked. The weightless per-snapshot vision probe
+/// (`provider::weightless_vision`, wired into the registration) closes the gap. This asserts the
+/// vision-required load now resolves to `mlx-llama` (NOT a misrouted JoyCaption/LLaVA provider) and,
+/// loaded, grounds on an image.
+#[test]
+fn qwen3vl_vision_required_routing_resolves_via_core_llm() {
+    let Some(dir) = snapshot_dir() else {
+        eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+        return;
+    };
+    let spec = LoadSpec::dense(dir.to_str().unwrap());
+
+    // The pre-load weightless gate (no weights loaded): the provider's probe advertises vision for
+    // this snapshot from config.json alone, so a vision-required model-first load resolves it.
+    assert!(
+        mlx_llm::provider::weightless_vision(&spec),
+        "the weightless vision probe must advertise vision for a real Qwen3-VL snapshot"
+    );
+
+    // The gap closed: with_vision() requirement no longer rejects the snapshot at the gate.
+    let provider = load_for_model_with(&spec, &ModelRequirements::default().with_vision())
+        .expect("vision-required model-first load must resolve the Qwen3-VL snapshot (sc-8077 gap)");
+    assert_eq!(
+        provider.descriptor().id, PROVIDER_ID,
+        "vision-required routing must land on mlx-llama, not a misrouted vision provider"
+    );
+    assert_eq!(provider.descriptor().family, "qwen3_vl");
+    assert!(
+        provider.descriptor().capabilities.supports_vision,
+        "the loaded Qwen3-VL checkpoint must advertise vision"
+    );
+
+    // And it actually grounds on an image through the vision-required-resolved provider.
+    let req = vision_request(
+        vec![user_turn(vec![
+            Content::Image(solid_image(256, 256, [205, 35, 35])),
+            Content::text("What is the dominant color of this image? Answer with one word."),
+        ])],
+        16,
+    );
+    let (content, usage) = run_vision(provider.as_ref(), &req);
+    println!("\n=== Qwen3-VL VISION-REQUIRED routing ===\n[answer] {content:?}\n");
+    assert!(usage.generated_tokens > 0);
+    assert!(
+        content.to_lowercase().contains("red"),
+        "vision-required-resolved provider must ground on the image, got: {content:?}"
+    );
+}
+
 /// **sc-8076 AC #2:** a 2-image prompt works end-to-end. Two solid-color images are interleaved with
 /// text in a single user turn; the model must name the first image's color and the second's (in
 /// order). This exercises multi-image preprocessing, per-image patch-count placeholder expansion,

@@ -1001,6 +1001,7 @@ inventory::submit! {
         descriptor: provider_descriptor,
         load: load_registered,
         can_load,
+        weightless_vision: Some(weightless_vision),
     }
 }
 
@@ -1037,6 +1038,43 @@ fn can_load_value(v: &serde_json::Value) -> bool {
         return false;
     }
     Architecture::from_config(v).is_ok()
+}
+
+/// **Weightless** per-snapshot vision probe (sc-8077): does `mlx-llama` serve the snapshot at
+/// `spec.source` *with* vision? Reads **only** `config.json` (never a weight shard), mirroring
+/// [`can_load`]. It drives core-llm's pre-load capability gate so a *model-first* vision-required
+/// load (`load_for_model_with(spec, with_vision())`) resolves a Qwen-VL wrapper here.
+///
+/// This is necessary because the provider's STATIC [`provider_descriptor`] must report
+/// `supports_vision=false` (the one registration also serves plain text-only checkpoints; vision is
+/// only flipped on post-load when the loaded checkpoint carries `model.visual.*`). Without a
+/// per-snapshot probe a genuine Qwen3-VL snapshot would be rejected at the gate (the story-D gap).
+pub fn weightless_vision(spec: &LoadSpec) -> bool {
+    let dir = Path::new(&spec.source);
+    let path = if dir.is_dir() { dir.join("config.json") } else { dir.to_path_buf() };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    weightless_vision_value(&v)
+}
+
+/// Pure per-snapshot vision decision over a parsed `config.json` (split out for unit testing). True
+/// iff this provider both *claims* the snapshot ([`can_load_value`]) AND the snapshot is a Qwen-VL
+/// wrapper that loads its vision tower: a `vision_config` is present and the architecture dispatches
+/// to a Qwen-VL decoder (`qwen3_vl` or the Qwen3.6 `qwen3_5` hybrid) — exactly the post-load
+/// condition that flips `supports_vision` on in [`LlamaProvider::load`]. A plain text checkpoint (no
+/// `vision_config`) or a ceded LLaVA snapshot returns false.
+fn weightless_vision_value(v: &serde_json::Value) -> bool {
+    if !can_load_value(v) || v.get("vision_config").is_none() {
+        return false;
+    }
+    matches!(
+        Architecture::from_config(v),
+        Ok(Architecture::Qwen3Vl) | Ok(Architecture::Qwen35)
+    )
 }
 
 #[cfg(test)]
@@ -1080,6 +1118,23 @@ mod tests {
         // Plain text models (no vision_config) are unaffected.
         assert!(can_load_value(&json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })));
         assert!(can_load_value(&json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })));
+    }
+
+    #[test]
+    fn weightless_vision_advertises_qwen_vl_wrappers_only() {
+        // The sc-8077 weightless vision gate: `mlx-llama` advertises vision (pre-load, config.json
+        // only) for a Qwen-VL wrapper so a model-first vision-required load resolves here.
+        // Qwen3-VL: a vision_config + qwen3_vl arch ⇒ vision-capable.
+        assert!(weightless_vision_value(&qwen3vl_wrapper()));
+        // Qwen3.6 hybrid (qwen3_5) Qwen-VL wrapper: likewise vision-capable.
+        assert!(weightless_vision_value(&qwen36_wrapper()));
+        // A LLaVA snapshot is ceded to JoyCaption (can_load=false here) ⇒ NOT advertised, so a
+        // Qwen3-VL load can never be mistaken for / misrouted via this provider's vision path.
+        assert!(!weightless_vision_value(&llava_wrapper()));
+        // Plain text checkpoints (no vision_config) ⇒ NOT vision-capable (the static descriptor
+        // already reports supports_vision=false; the probe must not flip it on).
+        assert!(!weightless_vision_value(&json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })));
+        assert!(!weightless_vision_value(&json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })));
     }
 
     /// Locate the cached Qwen3-VL-8B-Instruct snapshot (rev 0c351dd0) for the chat-template oracle.

@@ -508,6 +508,10 @@ inventory::submit! {
         descriptor,
         load: load_registered,
         can_load,
+        // No per-snapshot vision distinction: this dedicated vision provider's static descriptor
+        // already declares `supports_vision=true` for every (LLaVA) snapshot its `can_load` claims,
+        // so the core-llm gate's static fallback is correct. (`None` ⇒ unchanged prior behavior.)
+        weightless_vision: None,
     }
 }
 
