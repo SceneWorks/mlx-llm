@@ -42,7 +42,7 @@ const ROPE_THETA: f32 = 10000.0;
 const MASK_NEG: f32 = -1e30;
 
 /// Geometry of the Qwen3.6 vision tower (`vision_config`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Qwen35VisionConfig {
     pub depth: usize,
     pub hidden_size: i32,
@@ -54,6 +54,7 @@ pub struct Qwen35VisionConfig {
     pub spatial_merge_size: i32,
     pub out_hidden_size: i32,
     pub num_position_embeddings: i32,
+    pub deepstack_visual_indexes: Vec<usize>,
 }
 
 impl Qwen35VisionConfig {
@@ -66,6 +67,15 @@ impl Qwen35VisionConfig {
         let req = |k: &str| -> Result<i32> {
             int(k).ok_or_else(|| Error::Config(format!("qwen3_5 vision_config missing `{k}`")))
         };
+        let deepstack_visual_indexes = c
+            .get("deepstack_visual_indexes")
+            .and_then(|x| x.as_array())
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|x| x.as_u64().map(|x| x as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             depth: req("depth")? as usize,
             hidden_size: req("hidden_size")?,
@@ -77,6 +87,7 @@ impl Qwen35VisionConfig {
             spatial_merge_size: int("spatial_merge_size").unwrap_or(2),
             out_hidden_size: req("out_hidden_size")?,
             num_position_embeddings: req("num_position_embeddings")?,
+            deepstack_visual_indexes,
         })
     }
 
@@ -159,11 +170,22 @@ impl VisionBlock {
         let n = x.shape()[0];
         let hidden = num_heads * head_dim;
         // Fused QKV → [n, 3, heads, head_dim] → three [n, heads, head_dim].
-        let qkv = linear(x, &self.qkv_w, self.qkv_b.as_ref())?.reshape(&[n, 3, num_heads, head_dim])?;
+        let qkv =
+            linear(x, &self.qkv_w, self.qkv_b.as_ref())?.reshape(&[n, 3, num_heads, head_dim])?;
         let parts = split(&qkv, 3, 1)?;
         // RoPE expects [batch, seq, heads, head_dim]; cos/sin [1, n, head_dim] broadcast over heads.
-        let q = apply_rope(&parts[0].reshape(&[1, n, num_heads, head_dim])?, cos, sin, false)?;
-        let k = apply_rope(&parts[1].reshape(&[1, n, num_heads, head_dim])?, cos, sin, false)?;
+        let q = apply_rope(
+            &parts[0].reshape(&[1, n, num_heads, head_dim])?,
+            cos,
+            sin,
+            false,
+        )?;
+        let k = apply_rope(
+            &parts[1].reshape(&[1, n, num_heads, head_dim])?,
+            cos,
+            sin,
+            false,
+        )?;
         let v = parts[2].reshape(&[1, n, num_heads, head_dim])?;
         // → [1, heads, n, head_dim] for SDPA.
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
@@ -190,18 +212,32 @@ struct PatchMerger {
     fc2_w: Array,
     fc2_b: Option<Array>,
     merge_dim: i32,
+    use_postshuffle_norm: bool,
 }
 
 impl PatchMerger {
-    /// `[num_patches, hidden]` → `[num_patches / merge², out_hidden]`. The per-patch LayerNorm runs
-    /// over `hidden` first, then adjacent `merge²` patches are concatenated (`view`) and projected.
     fn forward(&self, x: &Array) -> Result<Array> {
-        let m = layer_norm(x, Some(&self.norm_w), Some(&self.norm_b), LN_EPS)?;
-        let m = m.reshape(&[-1, self.merge_dim])?;
+        let m = if self.use_postshuffle_norm {
+            let grouped = x.reshape(&[-1, self.merge_dim])?;
+            layer_norm(&grouped, Some(&self.norm_w), Some(&self.norm_b), LN_EPS)?
+        } else {
+            layer_norm(x, Some(&self.norm_w), Some(&self.norm_b), LN_EPS)?
+                .reshape(&[-1, self.merge_dim])?
+        };
         let m = gelu(&linear(&m, &self.fc1_w, self.fc1_b.as_ref())?)?; // nn.GELU() default = exact erf
         linear(&m, &self.fc2_w, self.fc2_b.as_ref())
     }
 }
+
+pub struct Qwen35VisionOutput {
+    pub last_hidden_state: Array,
+    pub pooler_output: Array,
+    pub deepstack_features: Vec<Array>,
+}
+
+pub type Qwen3VLVisionConfig = Qwen35VisionConfig;
+pub type Qwen3VLVisionOutput = Qwen35VisionOutput;
+pub type Qwen3VLVisionModel = Qwen35VisionModel;
 
 /// A loaded Qwen3.6 vision tower.
 pub struct Qwen35VisionModel {
@@ -209,6 +245,7 @@ pub struct Qwen35VisionModel {
     pos_embed: Array,
     blocks: Vec<VisionBlock>,
     merger: PatchMerger,
+    deepstack_mergers: Vec<PatchMerger>,
     cfg: Qwen35VisionConfig,
 }
 
@@ -222,7 +259,8 @@ impl Qwen35VisionModel {
 
         // Conv3d weight `[hidden, C, T, P, P]` → reshaped `[hidden, C·T·P·P]` linear.
         let patch_embed = PatchEmbed {
-            weight: req(p("patch_embed.proj.weight"))?.reshape(&[cfg.hidden_size, cfg.patch_in()])?,
+            weight: req(p("patch_embed.proj.weight"))?
+                .reshape(&[cfg.hidden_size, cfg.patch_in()])?,
             bias: opt(p("patch_embed.proj.bias")),
         };
         let pos_embed = req(p("pos_embed.weight"))?;
@@ -247,21 +285,32 @@ impl Qwen35VisionModel {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let merger = PatchMerger {
-            norm_w: req(p("merger.norm.weight"))?,
-            norm_b: req(p("merger.norm.bias"))?,
-            fc1_w: req(p("merger.linear_fc1.weight"))?,
-            fc1_b: opt(p("merger.linear_fc1.bias")),
-            fc2_w: req(p("merger.linear_fc2.weight"))?,
-            fc2_b: opt(p("merger.linear_fc2.bias")),
-            merge_dim: cfg.merge_dim(),
+        let load_merger = |stem: String, use_postshuffle_norm: bool| -> Result<PatchMerger> {
+            let m = |leaf: &str| format!("{stem}.{leaf}");
+            Ok(PatchMerger {
+                norm_w: req(m("norm.weight"))?,
+                norm_b: req(m("norm.bias"))?,
+                fc1_w: req(m("linear_fc1.weight"))?,
+                fc1_b: opt(m("linear_fc1.bias")),
+                fc2_w: req(m("linear_fc2.weight"))?,
+                fc2_b: opt(m("linear_fc2.bias")),
+                merge_dim: cfg.merge_dim(),
+                use_postshuffle_norm,
+            })
         };
+
+        let merger = load_merger(p("merger"), false)?;
+
+        let deepstack_mergers = (0..cfg.deepstack_visual_indexes.len())
+            .map(|i| load_merger(p(&format!("deepstack_merger_list.{i}")), true))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             patch_embed,
             pos_embed,
             blocks,
             merger,
+            deepstack_mergers,
             cfg,
         })
     }
@@ -276,17 +325,25 @@ impl Qwen35VisionModel {
     /// one embedding per merged `merge×merge` block, in the same merge-block order the preprocessor
     /// emits patches.
     pub fn forward(&self, pixel_values: &Array, grid_thw: &[[i32; 3]]) -> Result<Array> {
+        Ok(self
+            .forward_with_deepstack(pixel_values, grid_thw)?
+            .pooler_output)
+    }
+
+    pub fn forward_with_deepstack(
+        &self,
+        pixel_values: &Array,
+        grid_thw: &[[i32; 3]],
+    ) -> Result<Qwen35VisionOutput> {
         let cfg = &self.cfg;
         let merge = cfg.spatial_merge_size;
         let head_dim = cfg.head_dim();
         let n = pixel_values.shape()[0];
 
-        // Patch embed + bilinearly-resampled learned position embedding.
         let mut hs = self.patch_embed.forward(pixel_values)?;
         let pos = self.position_embeds(grid_thw, n)?;
         hs = add(&hs, &pos)?;
 
-        // 2-D rotary tables and the per-frame block-diagonal attention mask.
         let pos_ids = vision_position_ids(grid_thw, merge);
         let (cos, sin) = vision_rotary(&pos_ids, head_dim, ROPE_THETA)?;
         let cu = vision_cu_seqlens(grid_thw);
@@ -296,18 +353,38 @@ impl Qwen35VisionModel {
             None => AttnMask::None,
         };
 
-        for blk in &self.blocks {
+        let mut deepstack_features = Vec::with_capacity(self.deepstack_mergers.len());
+        for (layer_num, blk) in self.blocks.iter().enumerate() {
             hs = blk.forward(&hs, &cos, &sin, cfg.num_heads, head_dim, mask)?;
+            if let Some(tap) = cfg
+                .deepstack_visual_indexes
+                .iter()
+                .position(|&idx| idx == layer_num)
+            {
+                deepstack_features.push(self.deepstack_mergers[tap].forward(&hs)?);
+            }
         }
-        self.merger.forward(&hs)
+        let pooler_output = self.merger.forward(&hs)?;
+        Ok(Qwen35VisionOutput {
+            last_hidden_state: hs,
+            pooler_output,
+            deepstack_features,
+        })
     }
 
     /// Gather + bilinearly weight the learned position table for the image grid → `[total_patches,
     /// hidden]` (the `(pos_embed(indices) * weights).sum(0)` of the reference).
     fn position_embeds(&self, grid_thw: &[[i32; 3]], n: i32) -> Result<Array> {
-        let (idx, wts) = vision_bilinear(grid_thw, self.cfg.grid_per_side(), self.cfg.spatial_merge_size);
+        let (idx, wts) = vision_bilinear(
+            grid_thw,
+            self.cfg.grid_per_side(),
+            self.cfg.spatial_merge_size,
+        );
         let idx_arr = Array::from_slice(&idx, &[4 * n]);
-        let gathered = self.pos_embed.take_axis(&idx_arr, 0)?.reshape(&[4, n, self.cfg.hidden_size])?;
+        let gathered =
+            self.pos_embed
+                .take_axis(&idx_arr, 0)?
+                .reshape(&[4, n, self.cfg.hidden_size])?;
         let w_arr = Array::from_slice(&wts, &[4, n, 1]).as_dtype(gathered.dtype())?;
         Ok(sum_axis(&multiply(&gathered, &w_arr)?, 0, false)?)
     }
@@ -374,8 +451,16 @@ fn vision_bilinear(grid_thw: &[[i32; 3]], side: i32, merge: i32) -> (Vec<i32>, V
         let w_floor: Vec<i32> = w_grid.iter().map(|&x| x as i32).collect();
         let h_ceil: Vec<i32> = h_floor.iter().map(|&f| (f + 1).min(side - 1)).collect();
         let w_ceil: Vec<i32> = w_floor.iter().map(|&f| (f + 1).min(side - 1)).collect();
-        let h_frac: Vec<f32> = h_grid.iter().zip(&h_floor).map(|(&g, &f)| g - f as f32).collect();
-        let w_frac: Vec<f32> = w_grid.iter().zip(&w_floor).map(|(&g, &f)| g - f as f32).collect();
+        let h_frac: Vec<f32> = h_grid
+            .iter()
+            .zip(&h_floor)
+            .map(|(&g, &f)| g - f as f32)
+            .collect();
+        let w_frac: Vec<f32> = w_grid
+            .iter()
+            .zip(&w_floor)
+            .map(|(&g, &f)| g - f as f32)
+            .collect();
 
         // Full row-major (h, w) corner index/weight arrays.
         let hw = (h * w) as usize;
@@ -497,18 +582,27 @@ fn join(prefix: &str, leaf: &str) -> String {
 mod tests {
     use super::*;
     use mlx_rs::Dtype;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
+    use std::path::{Path, PathBuf};
 
     fn oracle() -> serde_json::Value {
         serde_json::from_str(include_str!("testdata/qwen35_vision_oracle.json")).unwrap()
     }
 
     fn arr(j: &serde_json::Value, k: &str) -> Vec<f32> {
-        j[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+        j[k].as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
     }
 
     fn arr_i32(j: &serde_json::Value, k: &str) -> Vec<i32> {
-        j[k].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
+        j[k].as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as i32)
+            .collect()
     }
 
     fn test_cfg() -> Qwen35VisionConfig {
@@ -524,6 +618,7 @@ mod tests {
             spatial_merge_size: 2,
             out_hidden_size: 48,
             num_position_embeddings: 36,
+            deepstack_visual_indexes: Vec::new(),
         }
     }
 
@@ -557,8 +652,15 @@ mod tests {
         let (idx, wts) = vision_bilinear(&grid, 6, 2);
         assert_eq!(idx, arr_i32(&j, "expect_bi"));
         let exp_bw = arr(&j, "expect_bw");
-        let md = wts.iter().zip(&exp_bw).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(md < 1e-6, "bilinear weights vs reference: max abs diff {md}");
+        let md = wts
+            .iter()
+            .zip(&exp_bw)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md < 1e-6,
+            "bilinear weights vs reference: max abs diff {md}"
+        );
     }
 
     /// End-to-end encoder vs the reference `Qwen3_5VisionModel.forward` (patch embed → bilinear pos
@@ -583,49 +685,392 @@ mod tests {
         let put = |m: &mut HashMap<String, Array>, key: &str, k: &str, shape: &[i32]| {
             m.insert(key.to_string(), Array::from_slice(&arr(&j, k), shape));
         };
-        let (h, hid, inter, out_h) = (cfg.num_heads, cfg.hidden_size, cfg.intermediate_size, cfg.out_hidden_size);
+        let (h, hid, inter, out_h) = (
+            cfg.num_heads,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            cfg.out_hidden_size,
+        );
         let _ = h;
         // Patch embed weight stored 5-D (as in the real checkpoint) → loader reshapes it.
-        put(&mut m, "model.visual.patch_embed.proj.weight", "patch_w", &[hid, cfg.in_channels, cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size]);
-        put(&mut m, "model.visual.patch_embed.proj.bias", "patch_b", &[hid]);
-        put(&mut m, "model.visual.pos_embed.weight", "pos_embed", &[cfg.num_position_embeddings, hid]);
+        put(
+            &mut m,
+            "model.visual.patch_embed.proj.weight",
+            "patch_w",
+            &[
+                hid,
+                cfg.in_channels,
+                cfg.temporal_patch_size,
+                cfg.patch_size,
+                cfg.patch_size,
+            ],
+        );
+        put(
+            &mut m,
+            "model.visual.patch_embed.proj.bias",
+            "patch_b",
+            &[hid],
+        );
+        put(
+            &mut m,
+            "model.visual.pos_embed.weight",
+            "pos_embed",
+            &[cfg.num_position_embeddings, hid],
+        );
         for i in 0..cfg.depth {
             let pre = format!("model.visual.blocks.{i}");
-            put(&mut m, &format!("{pre}.norm1.weight"), &format!("b{i}_n1w"), &[hid]);
-            put(&mut m, &format!("{pre}.norm1.bias"), &format!("b{i}_n1b"), &[hid]);
-            put(&mut m, &format!("{pre}.norm2.weight"), &format!("b{i}_n2w"), &[hid]);
-            put(&mut m, &format!("{pre}.norm2.bias"), &format!("b{i}_n2b"), &[hid]);
-            put(&mut m, &format!("{pre}.attn.qkv.weight"), &format!("b{i}_qkv_w"), &[3 * hid, hid]);
-            put(&mut m, &format!("{pre}.attn.qkv.bias"), &format!("b{i}_qkv_b"), &[3 * hid]);
-            put(&mut m, &format!("{pre}.attn.proj.weight"), &format!("b{i}_proj_w"), &[hid, hid]);
-            put(&mut m, &format!("{pre}.attn.proj.bias"), &format!("b{i}_proj_b"), &[hid]);
-            put(&mut m, &format!("{pre}.mlp.linear_fc1.weight"), &format!("b{i}_fc1_w"), &[inter, hid]);
-            put(&mut m, &format!("{pre}.mlp.linear_fc1.bias"), &format!("b{i}_fc1_b"), &[inter]);
-            put(&mut m, &format!("{pre}.mlp.linear_fc2.weight"), &format!("b{i}_fc2_w"), &[hid, inter]);
-            put(&mut m, &format!("{pre}.mlp.linear_fc2.bias"), &format!("b{i}_fc2_b"), &[hid]);
+            put(
+                &mut m,
+                &format!("{pre}.norm1.weight"),
+                &format!("b{i}_n1w"),
+                &[hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.norm1.bias"),
+                &format!("b{i}_n1b"),
+                &[hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.norm2.weight"),
+                &format!("b{i}_n2w"),
+                &[hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.norm2.bias"),
+                &format!("b{i}_n2b"),
+                &[hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.attn.qkv.weight"),
+                &format!("b{i}_qkv_w"),
+                &[3 * hid, hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.attn.qkv.bias"),
+                &format!("b{i}_qkv_b"),
+                &[3 * hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.attn.proj.weight"),
+                &format!("b{i}_proj_w"),
+                &[hid, hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.attn.proj.bias"),
+                &format!("b{i}_proj_b"),
+                &[hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.mlp.linear_fc1.weight"),
+                &format!("b{i}_fc1_w"),
+                &[inter, hid],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.mlp.linear_fc1.bias"),
+                &format!("b{i}_fc1_b"),
+                &[inter],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.mlp.linear_fc2.weight"),
+                &format!("b{i}_fc2_w"),
+                &[hid, inter],
+            );
+            put(
+                &mut m,
+                &format!("{pre}.mlp.linear_fc2.bias"),
+                &format!("b{i}_fc2_b"),
+                &[hid],
+            );
         }
-        put(&mut m, "model.visual.merger.norm.weight", "mg_norm_w", &[hid]);
+        put(
+            &mut m,
+            "model.visual.merger.norm.weight",
+            "mg_norm_w",
+            &[hid],
+        );
         put(&mut m, "model.visual.merger.norm.bias", "mg_norm_b", &[hid]);
-        put(&mut m, "model.visual.merger.linear_fc1.weight", "mg_fc1_w", &[cfg.merge_dim(), cfg.merge_dim()]);
-        put(&mut m, "model.visual.merger.linear_fc1.bias", "mg_fc1_b", &[cfg.merge_dim()]);
-        put(&mut m, "model.visual.merger.linear_fc2.weight", "mg_fc2_w", &[out_h, cfg.merge_dim()]);
-        put(&mut m, "model.visual.merger.linear_fc2.bias", "mg_fc2_b", &[out_h]);
+        put(
+            &mut m,
+            "model.visual.merger.linear_fc1.weight",
+            "mg_fc1_w",
+            &[cfg.merge_dim(), cfg.merge_dim()],
+        );
+        put(
+            &mut m,
+            "model.visual.merger.linear_fc1.bias",
+            "mg_fc1_b",
+            &[cfg.merge_dim()],
+        );
+        put(
+            &mut m,
+            "model.visual.merger.linear_fc2.weight",
+            "mg_fc2_w",
+            &[out_h, cfg.merge_dim()],
+        );
+        put(
+            &mut m,
+            "model.visual.merger.linear_fc2.bias",
+            "mg_fc2_b",
+            &[out_h],
+        );
 
         let w = Weights::from_map(m);
-        let model = Qwen35VisionModel::from_weights(&w, "model.visual", cfg).unwrap();
+        let model = Qwen35VisionModel::from_weights(&w, "model.visual", cfg.clone()).unwrap();
 
         let pixel = Array::from_slice(&arr(&j, "pixel"), &[n, cfg.patch_in()]);
         let out = model.forward(&pixel, &grid).unwrap();
         assert_eq!(out.shape(), &[n / 4, out_h]);
 
-        let got = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let got = out
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
         let exp = arr(&j, "expected_output");
-        let max_abs = got.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_abs = got
+            .iter()
+            .zip(&exp)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         let max_mag = exp.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         let rel = max_abs / (max_mag + 1e-20);
         assert!(
             rel < 3e-3,
             "vision encoder vs reference: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})\n got {got:?}\n exp {exp:?}"
         );
+    }
+
+    fn qwen3vl_oracle() -> serde_json::Value {
+        serde_json::from_str(include_str!("testdata/qwen3vl_vision_oracle.json")).unwrap()
+    }
+
+    fn qwen3vl_cfg(j: &serde_json::Value) -> Qwen35VisionConfig {
+        let d = &j["dims"];
+        let get = |k: &str| d[k].as_i64().unwrap() as i32;
+        Qwen35VisionConfig {
+            depth: get("depth") as usize,
+            hidden_size: get("hidden"),
+            num_heads: get("num_heads"),
+            intermediate_size: get("inter"),
+            in_channels: get("in_ch"),
+            patch_size: get("patch"),
+            temporal_patch_size: get("tpatch"),
+            spatial_merge_size: get("merge"),
+            out_hidden_size: get("out_hidden"),
+            num_position_embeddings: get("num_pos"),
+            deepstack_visual_indexes: j["deepstack_visual_indexes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as usize)
+                .collect(),
+        }
+    }
+
+    /// Qwen3-VL parse: the `deepstack_visual_indexes` are read from `vision_config`.
+    #[test]
+    fn config_parses_deepstack_indexes() {
+        let v = serde_json::json!({
+            "vision_config": {
+                "depth": 27, "hidden_size": 1152, "num_heads": 16, "intermediate_size": 4304,
+                "in_channels": 3, "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2,
+                "out_hidden_size": 4096, "num_position_embeddings": 2304,
+                "deepstack_visual_indexes": [8, 16, 24]
+            }
+        });
+        let cfg = Qwen35VisionConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.deepstack_visual_indexes, vec![8, 16, 24]);
+        assert_eq!(cfg.out_hidden_size, 4096);
+        assert_eq!(cfg.head_dim(), 72);
+    }
+
+    fn qwen3vl_snapshot_dir() -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("QWEN3VL_SNAPSHOT") {
+            let path = PathBuf::from(path);
+            return path.exists().then_some(path);
+        }
+        let home = std::env::var("HOME").ok()?;
+        let path = PathBuf::from(home).join(
+            ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        );
+        path.exists().then_some(path)
+    }
+
+    fn qwen3vl_visual_weights(snapshot: &Path) -> Weights {
+        let index_path = snapshot.join("model.safetensors.index.json");
+        let index_raw = std::fs::read_to_string(&index_path).unwrap_or_else(|e| {
+            panic!("qwen3vl oracle: reading index {}: {e}", index_path.display())
+        });
+        let index: serde_json::Value = serde_json::from_str(&index_raw)
+            .unwrap_or_else(|e| panic!("qwen3vl oracle: parsing index {}: {e}", index_path.display()));
+        let weight_map = index["weight_map"]
+            .as_object()
+            .expect("qwen3vl oracle: index missing `weight_map` object");
+        let shards: BTreeSet<String> = weight_map
+            .iter()
+            .filter_map(|(k, v)| {
+                k.starts_with("model.visual.")
+                    .then(|| v.as_str().map(ToOwned::to_owned))
+                    .flatten()
+            })
+            .collect();
+        assert!(
+            !shards.is_empty(),
+            "qwen3vl oracle: no `model.visual.*` shards in index {}",
+            index_path.display()
+        );
+        let mut tensors = HashMap::new();
+        for shard in shards {
+            let shard_path = snapshot.join(&shard);
+            let weights = Weights::from_file(&shard_path)
+                .unwrap_or_else(|e| panic!("qwen3vl oracle: loading shard {}: {e}", shard_path.display()));
+            for (k, v) in weights.into_map() {
+                if !k.starts_with("model.visual.") {
+                    continue;
+                }
+                let v = v
+                    .as_dtype(Dtype::Float32)
+                    .unwrap_or_else(|e| panic!("qwen3vl oracle: casting `{k}` to f32: {e}"));
+                tensors.insert(k, v);
+            }
+        }
+        assert!(
+            !tensors.is_empty(),
+            "qwen3vl oracle: no `model.visual.*` tensors loaded from {}",
+            snapshot.display()
+        );
+        Weights::from_map(tensors)
+    }
+
+    fn nested_arr(j: &serde_json::Value, k: &str, idx: usize) -> Vec<f32> {
+        j[k].as_array().unwrap()[idx]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    }
+
+    fn max_rel(got: &[f32], exp: &[f32]) -> (f32, f32, f32) {
+        let max_abs = got
+            .iter()
+            .zip(exp)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_mag = exp.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        (max_abs / (max_mag + 1e-20), max_abs, max_mag)
+    }
+
+    #[test]
+    fn qwen3vl_oracle_matches_hf_reference() {
+        let j = qwen3vl_oracle();
+        let cfg = qwen3vl_cfg(&j);
+        assert_eq!(cfg.depth, 27);
+        assert_eq!(cfg.hidden_size, 1152);
+        assert_eq!(cfg.num_heads, 16);
+        assert_eq!(cfg.head_dim(), 72);
+        assert_eq!(cfg.intermediate_size, 4304);
+        assert_eq!(cfg.in_channels, 3);
+        assert_eq!(cfg.patch_size, 16);
+        assert_eq!(cfg.temporal_patch_size, 2);
+        assert_eq!(cfg.spatial_merge_size, 2);
+        assert_eq!(cfg.out_hidden_size, 4096);
+        assert_eq!(cfg.num_position_embeddings, 2304);
+        assert_eq!(cfg.grid_per_side(), 48);
+        assert_eq!(cfg.patch_in(), 1536);
+        assert_eq!(cfg.merge_dim(), 4608);
+        assert_eq!(cfg.deepstack_visual_indexes, vec![8, 16, 24]);
+
+        let grid: Vec<[i32; 3]> = {
+            let g = arr_i32(&j, "grid_thw");
+            vec![[g[0], g[1], g[2]]]
+        };
+        let n = (grid[0][0] * grid[0][1] * grid[0][2]) as i32;
+        assert_eq!(n, j["dims"]["N"].as_i64().unwrap() as i32);
+        assert_eq!(arr_i32(&j, "expected_output_shape"), vec![4, 4096]);
+        let deepstack_shapes: Vec<Vec<i32>> = j["expected_deepstack_shapes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|shape| {
+                shape
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_i64().unwrap() as i32)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            deepstack_shapes,
+            vec![vec![4, 4096], vec![4, 4096], vec![4, 4096]]
+        );
+
+        let cu = vision_cu_seqlens(&grid);
+        assert_eq!(cu, arr_i32(&j, "expect_cu"));
+        let pos = vision_position_ids(&grid, cfg.spatial_merge_size);
+        let pos_flat: Vec<i32> = pos.iter().flat_map(|&(r, c)| [r, c]).collect();
+        assert_eq!(pos_flat, arr_i32(&j, "expect_pos_ids"));
+        let (idx, wts) = vision_bilinear(&grid, cfg.grid_per_side(), cfg.spatial_merge_size);
+        assert_eq!(idx, arr_i32(&j, "expect_bi"));
+        let exp_bw = arr(&j, "expect_bw");
+        let md = wts
+            .iter()
+            .zip(&exp_bw)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md < 1e-6,
+            "qwen3-vl bilinear weights vs oracle: max abs diff {md}"
+        );
+
+        let Some(snapshot) = qwen3vl_snapshot_dir() else {
+            eprintln!("skipping qwen3vl real-weight oracle: cached HF snapshot unavailable");
+            return;
+        };
+        let weights = qwen3vl_visual_weights(&snapshot);
+        let model = Qwen35VisionModel::from_weights(&weights, "model.visual", cfg.clone()).unwrap();
+        let pixel = Array::from_slice(&arr(&j, "pixel"), &[n, cfg.patch_in()]);
+        let out = model.forward_with_deepstack(&pixel, &grid).unwrap();
+        assert_eq!(out.pooler_output.shape(), &[4, 4096]);
+        assert_eq!(out.deepstack_features.len(), 3);
+
+        let got = out
+            .pooler_output
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let exp = arr(&j, "expected_output");
+        let (rel, max_abs, max_mag) = max_rel(&got, &exp);
+        assert!(
+            rel < 7e-3,
+            "qwen3-vl pooled output vs HF: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})"
+        );
+
+        for (tap, feature) in out.deepstack_features.iter().enumerate() {
+            assert_eq!(feature.shape(), &[4, 4096]);
+            let got = feature
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec();
+            let exp = nested_arr(&j, "expected_deepstack", tap);
+            let (rel, max_abs, max_mag) = max_rel(&got, &exp);
+            assert!(
+                rel < 7e-3,
+                "qwen3-vl deepstack tap {tap} vs HF: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})"
+            );
+        }
     }
 }

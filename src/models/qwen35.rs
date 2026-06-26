@@ -21,6 +21,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_section
 use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
+use crate::models::deepstack::deepstack_fused_decoder_layers;
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
@@ -759,6 +760,43 @@ impl Qwen35Model {
         self.project_last(&h)
     }
 
+    /// Run the decoder over precomputed input `embeds` `[1, S, hidden]` with interleaved M-RoPE
+    /// (the multimodal embeds path) **and DeepStack feature fusion**: after decoder layer `i`, for
+    /// `i < deepstack.len()`, the `i`-th tapped/merged ViT feature set is added to the visual-token
+    /// rows of the running hidden states (`visual_pos_mask[p]` marks an image-token position).
+    ///
+    /// This is the Qwen3-VL DeepStack seam (`Qwen3VLTextModel.forward` + `_deepstack_process`):
+    /// `deepstack` carries the `deepstack_features` produced by the vision tower at its tap layers,
+    /// projected to `out_hidden_size == hidden`, and is injected into the *first* `len(deepstack)`
+    /// decoder layers (HF indexes by decoder position, not by the vision tap index). Returns
+    /// last-position logits `[1, vocab]`. With an empty `deepstack` this equals
+    /// [`Self::decode_logits_from_embeds`].
+    pub fn decode_logits_from_embeds_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<Array> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            COMPUTE_DTYPE,
+        )?;
+        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let layers = &self.layers;
+        let cache_layers = &mut cache.layers;
+        let h = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            layers.len(),
+            |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
+        )?;
+        self.project_last(&h)
+    }
+
     /// Build from a loaded checkpoint (dense). See [`Qwen35Model::from_weights_with`].
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
         Self::from_weights_with(w, prefix, cfg, None)
@@ -1397,6 +1435,145 @@ mod tests {
         let v = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
         let row = |r: usize| v[r * hidden]; // first element of each row (whole row is constant)
         assert_eq!([row(0), row(1), row(2), row(3), row(4)], [0.0, 100.0, 101.0, 3.0, 4.0]);
+    }
+
+    /// DeepStack fusion is actually wired through the decoder: feeding non-zero tapped features
+    /// through `decode_logits_from_embeds_with_deepstack` must (a) run end to end to finite logits
+    /// and (b) **differ** from the same prefill with the fusion disabled (empty taps) — proving the
+    /// tapped features are consumed in the decoder layers, not computed and dropped.
+    #[test]
+    fn deepstack_fused_path_consumes_features_and_differs() {
+        let (cfg, model) = synthetic_model();
+        let img = 49i32;
+        let ids = [1i32, 2, img, img, img, img, 3, 4];
+        let grid = vec![[1i32, 4, 4]];
+        let ids_arr = Array::from_slice(&ids, &[1, ids.len() as i32]);
+
+        let embeds = model.embed_input_ids(&ids_arr).unwrap();
+        let feats = Array::from_slice(
+            &(0..4 * cfg.hidden_size).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+            &[4, cfg.hidden_size],
+        );
+        let spliced = model.splice_image_features(&embeds, &ids, &feats, img).unwrap();
+        let (t, h, w, _delta) = model.mrope_positions(&ids, &grid, img, 2).unwrap();
+        let visual_pos_mask: Vec<bool> = ids.iter().map(|&id| id == img).collect();
+
+        let ds = |scale: f32| {
+            Array::from_slice(
+                &(0..4 * cfg.hidden_size).map(|i| (i % 5) as f32 * scale + 0.05).collect::<Vec<_>>(),
+                &[4, cfg.hidden_size],
+            )
+        };
+        let deepstack = [ds(0.2), ds(-0.15)];
+
+        let fused = model
+            .decode_logits_from_embeds_with_deepstack(
+                &spliced,
+                [&t, &h, &w],
+                &mut model.new_cache(),
+                &visual_pos_mask,
+                &deepstack,
+            )
+            .unwrap();
+        let unfused = model
+            .decode_logits_from_embeds_with_deepstack(
+                &spliced,
+                [&t, &h, &w],
+                &mut model.new_cache(),
+                &visual_pos_mask,
+                &[],
+            )
+            .unwrap();
+        let baseline = model
+            .decode_logits_from_embeds(&spliced, [&t, &h, &w], &mut model.new_cache())
+            .unwrap();
+
+        assert_eq!(fused.shape(), &[1, cfg.vocab_size]);
+        let fv = fused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let uv = unfused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let bv = baseline.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        assert!(fv.iter().all(|x| x.is_finite()), "non-finite fused logit");
+
+        let unfused_vs_baseline = uv.iter().zip(&bv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert_eq!(unfused_vs_baseline, 0.0, "empty-deepstack path must equal plain embeds path");
+
+        let fused_vs_unfused = fv.iter().zip(&uv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(
+            fused_vs_unfused > 1e-3,
+            "DeepStack fusion did not change the logits (features dropped?): max abs diff {fused_vs_unfused}"
+        );
+    }
+
+    #[test]
+    fn deepstack_seam_is_decoder_agnostic_at_qwen3vl_shapes() {
+        let hidden = 4096i32;
+        let num_layers = 6usize;
+        let taps = [8usize, 16, 24];
+        let seq = 8i32;
+        let visual_pos_mask: Vec<bool> = (0..seq).map(|i| (2..6).contains(&i)).collect();
+        let num_visual = visual_pos_mask.iter().filter(|&&m| m).count() as i32;
+        assert_eq!(num_visual, 4);
+
+        let v0 = 0.5f32;
+        let h0 = Array::from_slice(&vec![v0; (seq * hidden) as usize], &[1, seq, hidden])
+            .as_dtype(COMPUTE_DTYPE)
+            .unwrap();
+        let feat_val = [0.25f32, 0.5, 0.75];
+        let deepstack: Vec<Array> = (0..taps.len())
+            .map(|t| {
+                Array::from_slice(&vec![feat_val[t]; (num_visual * hidden) as usize], &[num_visual, hidden])
+                    .as_dtype(COMPUTE_DTYPE)
+                    .unwrap()
+            })
+            .collect();
+
+        let two = Array::from_f32(2.0).as_dtype(COMPUTE_DTYPE).unwrap();
+        let mut calls: Vec<usize> = Vec::new();
+        let fused = deepstack_fused_decoder_layers(
+            &h0,
+            &visual_pos_mask,
+            &deepstack,
+            num_layers,
+            |i, h| {
+                calls.push(i);
+                Ok(multiply(h, &two)?)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, (0..num_layers).collect::<Vec<_>>(), "every decoder layer must run once, in order");
+
+        let unfused = deepstack_fused_decoder_layers(
+            &h0,
+            &visual_pos_mask,
+            &[],
+            num_layers,
+            |_i, h| Ok(multiply(h, &two)?),
+        )
+        .unwrap();
+
+        let scale = 2f32.powi(num_layers as i32);
+        let text_expected = v0 * scale;
+        let visual_expected: f32 = v0 * scale
+            + (0..taps.len())
+                .map(|t| feat_val[t] * 2f32.powi((num_layers - 1 - t) as i32))
+                .sum::<f32>();
+
+        let fv = fused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let uv = unfused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let row = |buf: &[f32], r: i32| buf[(r * hidden) as usize];
+        for r in 0..seq {
+            let got = row(&fv, r);
+            let want = if visual_pos_mask[r as usize] { visual_expected } else { text_expected };
+            assert!((got - want).abs() < 1e-1, "fused row {r}: got {got}, want {want}");
+        }
+        assert!((visual_expected - 54.0).abs() < 1e-3);
+        assert!((text_expected - 32.0).abs() < 1e-3);
+
+        for r in 0..seq {
+            assert!((row(&uv, r) - text_expected).abs() < 1e-1, "unfused row {r} must skip injection");
+        }
+        let fused_vs_unfused = fv.iter().zip(&uv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(fused_vs_unfused > 1.0, "fused path must differ from non-fused: max abs diff {fused_vs_unfused}");
     }
 
     /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
