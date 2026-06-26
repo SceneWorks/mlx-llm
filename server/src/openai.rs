@@ -128,6 +128,10 @@ impl ChatRequest {
             .map(|m| Message {
                 role: role_of(&m.role),
                 content: vec![Content::Text(m.content.into_text())],
+                // This OpenAI shim does not yet accept prior-turn reasoning or assistant tool calls
+                // on input; default both to the contract's "absent" values (no behavior change).
+                thinking: None,
+                tool_calls: Vec::new(),
             })
             .collect();
 
@@ -157,6 +161,10 @@ impl ChatRequest {
             max_new_tokens: self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             seed: self.seed,
             constraint,
+            // This shim does not yet surface request-level thinking/tools controls; leave thinking
+            // at the template default (Auto) and offer no tools (no behavior change).
+            thinking: Default::default(),
+            tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
         })
