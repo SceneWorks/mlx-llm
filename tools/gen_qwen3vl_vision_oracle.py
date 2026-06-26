@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 from pathlib import Path
 
-DIMS = {
-    "depth": 27,
-    "hidden": 1152,
-    "num_heads": 16,
-    "head_dim": 72,
-    "inter": 4304,
-    "in_ch": 3,
-    "patch": 16,
-    "tpatch": 2,
-    "merge": 2,
-    "out_hidden": 4096,
-    "num_pos": 2304,
-    "grid_per_side": 48,
-    "patch_in": 1536,
-    "N": 16,
-}
+SNAPSHOT = Path(
+    "~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
+).expanduser()
 TAPS = [8, 16, 24]
 GRID_THW = [1, 4, 4]
 
@@ -100,21 +88,82 @@ def vision_bilinear(grid_thw, side, merge):
     return [x for corner in idx for x in corner], [x for corner in wts for x in corner]
 
 
-def oracle():
-    grid = [GRID_THW]
-    n_tokens = DIMS["N"] // (DIMS["merge"] * DIMS["merge"])
-    bi, bw = vision_bilinear(grid, DIMS["grid_per_side"], DIMS["merge"])
+def fixed_pixel_values(n, patch_in):
+    return [((i * 37 + 17) % 1024) / 511.5 - 1.0 for i in range(n * patch_in)]
+
+
+def load_vision_model(snapshot):
+    import torch
+    from safetensors import safe_open
+    from transformers import AutoConfig, Qwen3VLVisionModel
+
+    config = AutoConfig.from_pretrained(snapshot, local_files_only=True).vision_config
+    config._attn_implementation = "eager"
+    model = Qwen3VLVisionModel(config)
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+    shards = sorted(
+        {v for k, v in index["weight_map"].items() if k.startswith("model.visual.")}
+    )
+    state = {}
+    for shard in shards:
+        with safe_open(snapshot / shard, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.startswith("model.visual."):
+                    state[key.removeprefix("model.visual.")] = f.get_tensor(key)
+    missing, unexpected = model.load_state_dict(state, strict=True)
+    if missing or unexpected:
+        raise RuntimeError(f"state_dict mismatch: missing={missing} unexpected={unexpected}")
+    model.eval()
+    model.to(dtype=torch.float32)
+    return config, model
+
+
+def tensor_list(tensor):
+    return [round(float(x), 8) for x in tensor.detach().cpu().float().reshape(-1).tolist()]
+
+
+def oracle(snapshot):
+    import torch
+
+    config, model = load_vision_model(snapshot)
+    dims = {
+        "depth": config.depth,
+        "hidden": config.hidden_size,
+        "num_heads": config.num_heads,
+        "head_dim": config.hidden_size // config.num_heads,
+        "inter": config.intermediate_size,
+        "in_ch": config.in_channels,
+        "patch": config.patch_size,
+        "tpatch": config.temporal_patch_size,
+        "merge": config.spatial_merge_size,
+        "out_hidden": config.out_hidden_size,
+        "num_pos": config.num_position_embeddings,
+        "grid_per_side": int(config.num_position_embeddings ** 0.5),
+        "patch_in": config.in_channels * config.temporal_patch_size * config.patch_size * config.patch_size,
+        "N": GRID_THW[0] * GRID_THW[1] * GRID_THW[2],
+    }
+    pixel = fixed_pixel_values(dims["N"], dims["patch_in"])
+    pixel_values = torch.tensor(pixel, dtype=torch.float32).reshape(dims["N"], dims["patch_in"])
+    grid = torch.tensor([GRID_THW], dtype=torch.long)
+    with torch.no_grad():
+        out = model(pixel_values, grid)
+    bi, bw = vision_bilinear([GRID_THW], dims["grid_per_side"], dims["merge"])
     return {
         "source": "tools/gen_qwen3vl_vision_oracle.py",
-        "mode": "confirmed_config_shape_oracle",
-        "note": "Confirmed Qwen3-VL vision geometry and DeepStack tap oracle. Full HF reference tensor generation requires transformers/torch/model weights and is intentionally not embedded as multi-GB JSON.",
-        "dims": DIMS,
-        "deepstack_visual_indexes": TAPS,
+        "mode": "hf_qwen3vl_vision_numeric_oracle",
+        "hf_model": "Qwen/Qwen3-VL-8B-Instruct",
+        "hf_revision": snapshot.name,
+        "dtype": "float32_reference_from_bfloat16_weights",
+        "deepstack_visual_indexes": list(config.deepstack_visual_indexes),
+        "dims": dims,
         "grid_thw": GRID_THW,
-        "expected_output_shape": [n_tokens, DIMS["out_hidden"]],
-        "expected_deepstack_shape": [n_tokens, DIMS["out_hidden"]],
-        "expect_cu": vision_cu_seqlens(grid),
-        "expect_pos_ids": vision_position_ids(grid, DIMS["merge"]),
+        "pixel": [round(x, 8) for x in pixel],
+        "expected_output_shape": list(out.pooler_output.shape),
+        "expected_output": tensor_list(out.pooler_output),
+        "expected_deepstack_shapes": [list(x.shape) for x in out.deepstack_features],
+        "expected_deepstack": [tensor_list(x) for x in out.deepstack_features],
+        "expect_cu": vision_cu_seqlens([GRID_THW]),
+        "expect_pos_ids": vision_position_ids([GRID_THW], dims["merge"]),
         "expect_bi": bi,
         "expect_bw": bw,
     }
@@ -122,15 +171,13 @@ def oracle():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--out",
-        default="src/models/testdata/qwen3vl_vision_oracle.json",
-        help="Path to write the Qwen3-VL oracle JSON",
-    )
+    parser.add_argument("--snapshot", default=os.environ.get("QWEN3VL_SNAPSHOT", str(SNAPSHOT)))
+    parser.add_argument("--out", default="src/models/testdata/qwen3vl_vision_oracle.json")
     args = parser.parse_args()
+    snapshot = Path(args.snapshot).expanduser()
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(oracle(), indent=2, sort_keys=True) + "\n")
+    out.write_text(json.dumps(oracle(snapshot), indent=2, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":
