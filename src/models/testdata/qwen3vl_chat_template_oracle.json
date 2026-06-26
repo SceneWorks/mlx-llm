@@ -1,0 +1,135 @@
+{
+  "_source": "Qwen/Qwen3-VL-8B-Instruct rev 0c351dd0, transformers 4.57.0 tokenizer.apply_chat_template (the prompt-id path the Qwen3-VL processor delegates to)",
+  "_note": "Pinned HF reference. Engine path: substitute image content with <|vision_start|><|image_pad|><|vision_end|>, render the model Jinja chat_template (add_generation_prompt=true), encode without auto special tokens. The single <|image_pad|> (151655) is expanded by patch count separately (vision_merged_token_count / expand_vision_placeholders); these fixtures pin the pre-expansion prompt ids.",
+  "special_tokens": {
+    "im_start": 151644,
+    "im_end": 151645,
+    "vision_start": 151652,
+    "vision_end": 151653,
+    "image_pad": 151655,
+    "video_pad": 151656
+  },
+  "cases": {
+    "text_only": {
+      "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+      "ids": [
+        151644,
+        872,
+        198,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        9625,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    },
+    "system_user_text": {
+      "text": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n",
+      "ids": [
+        151644,
+        8948,
+        198,
+        2610,
+        525,
+        264,
+        10950,
+        17847,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        9707,
+        0,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    },
+    "single_image": {
+      "text": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe this image.<|im_end|>\n<|im_start|>assistant\n",
+      "ids": [
+        151644,
+        872,
+        198,
+        151652,
+        151655,
+        151653,
+        74785,
+        419,
+        2168,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    },
+    "multi_image_mixed": {
+      "text": "<|im_start|>user\nCompare:<|vision_start|><|image_pad|><|vision_end|>and<|vision_start|><|image_pad|><|vision_end|>please.<|im_end|>\n<|im_start|>assistant\n",
+      "ids": [
+        151644,
+        872,
+        198,
+        27374,
+        25,
+        151652,
+        151655,
+        151653,
+        437,
+        151652,
+        151655,
+        151653,
+        30021,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    },
+    "multi_turn": {
+      "text": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello there!<|im_end|>\n<|im_start|>user\nHow are you?<|im_end|>\n<|im_start|>assistant\n",
+      "ids": [
+        151644,
+        872,
+        198,
+        13048,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        9707,
+        1052,
+        0,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        4340,
+        525,
+        498,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+      ]
+    }
+  }
+}

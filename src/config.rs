@@ -46,6 +46,15 @@ pub enum Architecture {
     /// sc-7629 (27B), and sc-7630 (35B MoE). The decoder-shape predicates below stay at their
     /// defaults until then.
     Qwen35,
+    /// Qwen3-VL family (`model_type` `qwen3_vl` / `text_config.model_type` `qwen3_vl_text`): a
+    /// VLM-wrapped **standard full-attention** Qwen3 decoder (GQA + per-head q/k RMSNorm + SwiGLU)
+    /// — NOT the Qwen3.6 hybrid — with the Qwen3-Next `(1 + weight)` RMSNorm convention, a 256K
+    /// context (`rope_theta` 5e6, `max_position_embeddings` 262144), and **interleaved multimodal
+    /// RoPE** (`rope_scaling.mrope_interleaved` + `mrope_section`). The decoder weights nest under
+    /// `model.language_model.*` (the ViT tower under `model.visual.*`, loaded by the vision path).
+    /// The text path is plain 1-D RoPE (interleaved M-RoPE with equal t/h/w rows is bit-identical);
+    /// the image path uses the interleaved-M-RoPE cos/sin table from story B (sc-8075).
+    Qwen3Vl,
 }
 
 impl Architecture {
@@ -67,8 +76,12 @@ impl Architecture {
             arch.unwrap_or("").to_lowercase(),
             model_type.unwrap_or("").to_lowercase()
         );
-        // `qwen3_5` must be tested before `qwen3` (the latter is a substring of the former).
-        if hay.contains("qwen3_5") || hay.contains("qwen35") {
+        // `qwen3_vl` / `qwen3_5` must each be tested before the bare `qwen3` (a substring of both),
+        // and they are mutually distinct (`qwen3_vl` ⊄ `qwen3_5` and vice versa) so their order is
+        // free.
+        if hay.contains("qwen3_vl") || hay.contains("qwen3vl") {
+            Ok(Architecture::Qwen3Vl)
+        } else if hay.contains("qwen3_5") || hay.contains("qwen35") {
             Ok(Architecture::Qwen35)
         } else if hay.contains("qwen3") {
             Ok(Architecture::Qwen3)
@@ -109,7 +122,15 @@ impl Architecture {
             Architecture::Glm4 => "glm4",
             Architecture::DeepseekV2 => "deepseek_v2",
             Architecture::Qwen35 => "qwen3_5",
+            Architecture::Qwen3Vl => "qwen3_vl",
         }
+    }
+
+    /// Whether this is the Qwen3-VL decoder (drives the `text_config` descent, the Qwen3-Next
+    /// `(1 + weight)` RMSNorm convention, the `model.language_model.*` weight prefix, and the
+    /// interleaved multimodal RoPE).
+    pub fn is_qwen3_vl(self) -> bool {
+        matches!(self, Architecture::Qwen3Vl)
     }
 
     /// Whether this is a Gemma-2 decoder (drives `(1+weight)` norms, embedding scaling, GeGLU, the
@@ -136,9 +157,9 @@ impl Architecture {
         matches!(self, Architecture::DeepseekV2)
     }
 
-    /// Whether attention applies per-head q/k RMSNorm (Qwen3).
+    /// Whether attention applies per-head q/k RMSNorm (Qwen3 / Qwen3-VL).
     pub fn has_qk_norm(self) -> bool {
-        matches!(self, Architecture::Qwen3)
+        matches!(self, Architecture::Qwen3 | Architecture::Qwen3Vl)
     }
 }
 
@@ -281,6 +302,11 @@ pub struct ModelConfig {
     pub mla: Option<MlaConfig>,
     /// YaRN RoPE-scaling parameters (DeepSeek-V2); `None` ⇒ no YaRN.
     pub yarn: Option<YarnConfig>,
+    /// Interleaved multimodal-RoPE section `[t, h, w]` (`rope_scaling.mrope_section`, sums to
+    /// `rotary_dim/2`), present for Qwen3-VL; `None` ⇒ a plain 1-D RoPE model. Drives the per-channel
+    /// axis assignment for image (3-D) positions; irrelevant to the text path (where all three rows
+    /// are equal, so the interleaved table is bit-identical to plain 1-D RoPE).
+    pub mrope_section: Option<[i32; 3]>,
 }
 
 impl ModelConfig {
@@ -298,6 +324,14 @@ impl ModelConfig {
                     .to_string(),
             ));
         }
+        // The Qwen3-VL VLM wrapper nests the standard Qwen3 decoder fields under `text_config`
+        // (`hidden_size`, `num_hidden_layers`, `rope_theta`, …). Read the decoder fields from there,
+        // falling back to the top level for a non-wrapped config. Other architectures read top-level.
+        let v = if architecture.is_qwen3_vl() {
+            v.get("text_config").unwrap_or(v)
+        } else {
+            v
+        };
         let int = |key: &str| -> Option<i32> { v.get(key).and_then(|x| x.as_i64()).map(|x| x as i32) };
         let req_int = |key: &str| -> Result<i32> {
             int(key).ok_or_else(|| Error::Config(format!("config.json missing integer `{key}`")))
@@ -429,6 +463,17 @@ impl ModelConfig {
             })
         });
 
+        // Interleaved multimodal-RoPE section `[t, h, w]` (Qwen3-VL `rope_scaling.mrope_section`).
+        let mrope_section = v
+            .get("rope_scaling")
+            .and_then(|rs| rs.get("mrope_section"))
+            .and_then(|x| x.as_array())
+            .filter(|a| a.len() == 3)
+            .map(|a| {
+                let g = |i: usize| a[i].as_i64().unwrap_or(0) as i32;
+                [g(0), g(1), g(2)]
+            });
+
         Ok(Self {
             hidden_size,
             intermediate_size,
@@ -451,6 +496,7 @@ impl ModelConfig {
             partial_rotary_factor,
             mla,
             yarn,
+            mrope_section,
         })
     }
 
@@ -458,6 +504,19 @@ impl ModelConfig {
     pub fn rotary_dim(&self) -> i32 {
         let rd = (self.head_dim as f32 * self.partial_rotary_factor).round() as i32;
         rd & !1 // force even (RoPE rotates in pairs)
+    }
+
+    /// The interleaved multimodal-RoPE section `[t, h, w]` (Qwen3-VL), defaulting to an even split
+    /// of `rotary_dim/2` (biased toward `t` then `h`) when the config omits `mrope_section`. Used by
+    /// the image (3-D) RoPE path; the text path (all rows equal) is independent of the split.
+    pub fn mrope_section_resolved(&self) -> [usize; 3] {
+        if let Some(s) = self.mrope_section {
+            return [s[0].max(0) as usize, s[1].max(0) as usize, s[2].max(0) as usize];
+        }
+        let half = (self.rotary_dim() / 2) as usize;
+        let base = half / 3;
+        let rem = half % 3;
+        [base + (rem > 0) as usize, base + (rem > 1) as usize, base]
     }
 
     /// Whether the decoder uses a Mixture-of-Experts FFN.
@@ -840,6 +899,72 @@ mod tests {
         // Plain Qwen3 is unaffected (the `qwen3_5`-before-`qwen3` ordering).
         let q3 = json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" });
         assert_eq!(Architecture::from_config(&q3).unwrap(), Architecture::Qwen3);
+    }
+
+    #[test]
+    fn qwen3vl_dispatches_and_parses_nested_text_config() {
+        // Qwen3-VL self-identifies as `qwen3_vl`, wrapped as a VLM with the standard full-attention
+        // Qwen3 text decoder under `text_config` (`qwen3_vl_text`). The dispatch must pick Qwen3-VL
+        // (NOT the bare `qwen3` substring, NOT the hybrid `qwen3_5`), and the config must parse the
+        // decoder fields out of `text_config` along with the 256K RoPE and interleaved M-RoPE section.
+        // These mirror the cached Qwen/Qwen3-VL-8B-Instruct rev 0c351dd0 `text_config`.
+        let v = json!({
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "image_token_id": 151655,
+            "model_type": "qwen3_vl",
+            "tie_word_embeddings": false,
+            "video_token_id": 151656,
+            "vision_start_token_id": 151652,
+            "vision_end_token_id": 151653,
+            "text_config": {
+                "model_type": "qwen3_vl_text",
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 36,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 5000000,
+                "max_position_embeddings": 262144,
+                "rope_scaling": { "mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default" }
+            },
+            "vision_config": { "model_type": "qwen3_vl", "depth": 27 }
+        });
+        assert_eq!(Architecture::from_config(&v).unwrap(), Architecture::Qwen3Vl);
+        assert_eq!(Architecture::Qwen3Vl.family(), "qwen3_vl");
+        assert!(Architecture::Qwen3Vl.is_qwen3_vl());
+        assert!(Architecture::Qwen3Vl.has_qk_norm());
+
+        let cfg = ModelConfig::from_json(&v).unwrap();
+        assert_eq!(cfg.architecture, Architecture::Qwen3Vl);
+        // Decoder shape read from text_config.
+        assert_eq!(cfg.hidden_size, 4096);
+        assert_eq!(cfg.intermediate_size, 12288);
+        assert_eq!(cfg.num_layers, 36);
+        assert_eq!(cfg.num_heads, 32);
+        assert_eq!(cfg.num_kv_heads, 8);
+        assert_eq!(cfg.groups(), 4); // GQA 32/8
+        assert_eq!(cfg.head_dim, 128); // explicit, != 4096/32
+        assert_eq!(cfg.vocab_size, 151936);
+        assert!(cfg.has_qk_norm());
+        assert!(!cfg.tie_word_embeddings, "Qwen3-VL lm_head is untied");
+        // RoPE / 256K context.
+        assert_eq!(cfg.rope_theta, 5_000_000.0);
+        assert_eq!(cfg.max_position_embeddings, 262144);
+        assert_eq!(cfg.partial_rotary_factor, 1.0); // full rotary (rope_type "default")
+        assert_eq!(cfg.rotary_dim(), 128);
+        // Interleaved M-RoPE section parsed from rope_scaling.
+        assert_eq!(cfg.mrope_section, Some([24, 20, 20]));
+        assert_eq!(cfg.mrope_section_resolved(), [24, 20, 20]); // sums to dim/2 = 64
+        assert_eq!(cfg.mrope_section_resolved().iter().sum::<usize>(), (cfg.rotary_dim() / 2) as usize);
+        // The text-path RoPE is plain full-width NeoX (theta 5e6); not interleaved, not partial, no yarn.
+        let rope = cfg.build_rope();
+        assert_eq!(rope.dim(), 128);
+        assert!(!rope.interleaved());
+        assert!(cfg.yarn.is_none());
+        assert!(cfg.rope_scaling.is_none()); // rope_type "default" is neither llama3 nor yarn
     }
 
     #[test]

@@ -79,11 +79,22 @@ impl Decoder {
             Decoder::Causal(_) => None,
         }
     }
+
+    /// The generic causal decoder, when this is the Qwen3-VL path (the multimodal embeds/M-RoPE +
+    /// DeepStack hooks live on [`CausalLm`]).
+    fn as_causal(&self) -> Option<&CausalLm> {
+        match self {
+            Decoder::Causal(m) => Some(m),
+            Decoder::Qwen35(_) => None,
+        }
+    }
 }
 
-/// The Qwen3.6 vision side of the provider: the ViT tower, the image preprocessor, and the
-/// multimodal token ids needed to expand placeholders and assign M-RoPE positions. Present only when
-/// the loaded `qwen3_5` checkpoint carries `model.visual.*`.
+/// The Qwen-VL vision side of the provider: the ViT tower, the image preprocessor, and the
+/// multimodal token ids needed to expand placeholders and assign M-RoPE positions. Present when the
+/// loaded `qwen3_5` (Qwen3.6) or `qwen3_vl` (Qwen3-VL) checkpoint carries `model.visual.*`. The two
+/// share the identical Qwen3-VL ViT tower (`Qwen3VLVisionModel == Qwen35VisionModel`); only the
+/// decoder prefill differs ([`Decoder::Qwen35`] vs [`Decoder::Causal`]).
 struct Qwen35Vision {
     tower: Qwen35VisionModel,
     processor: Qwen35ImageProcessor,
@@ -139,6 +150,25 @@ impl Decode for ShiftedQwen35<'_> {
             .downcast_mut::<Qwen35Cache>()
             .ok_or_else(|| crate::error::Error::Msg("ShiftedQwen35: cache is not a Qwen35Cache".into()))?;
         self.model.decode_logits(ids, c, offset + self.delta)
+    }
+}
+
+/// The Qwen3-VL analogue of [`ShiftedQwen35`]: a [`Decode`] wrapper over the generic [`CausalLm`]
+/// decoder that shifts the RoPE offset by the constant `mrope_delta`. The post-prompt continuation
+/// tokens are text, so a single shifted 1-D position is the correct interleaved-M-RoPE position
+/// (equal t/h/w rows ⇒ bit-identical to plain 1-D RoPE at that offset).
+struct ShiftedCausal<'a> {
+    model: &'a CausalLm,
+    delta: i32,
+}
+
+impl Decode for ShiftedCausal<'_> {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        self.model.make_cache()
+    }
+
+    fn step(&self, ids: &Array, cache: &mut dyn KvCache, offset: i32) -> crate::error::Result<Array> {
+        self.model.decode_logits(ids, cache, offset + self.delta)
     }
 }
 
@@ -223,9 +253,10 @@ impl LlamaProvider {
             (Decoder::Causal(m), descriptor)
         };
 
-        // Qwen3.6 vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
-        // VLM) and the config exposes a `vision_config`. Absent → a text-only `qwen3_5` checkpoint.
-        let vision = if arch == Architecture::Qwen35
+        // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
+        // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
+        // (`qwen3_vl`), which share the identical Qwen3-VL ViT tower. Absent → a text-only checkpoint.
+        let vision = if (arch == Architecture::Qwen35 || arch == Architecture::Qwen3Vl)
             && cfg_value.get("vision_config").is_some()
             && weights.get("model.visual.patch_embed.proj.weight").is_some()
         {
@@ -295,11 +326,7 @@ impl LlamaProvider {
         let vision = self
             .vision
             .as_ref()
-            .ok_or_else(|| CoreError::Load("qwen3.6 vision: provider has no vision tower".into()))?;
-        let model = self
-            .model
-            .as_qwen35()
-            .ok_or_else(|| CoreError::Load("qwen3.6 vision requires the qwen3_5 decoder".into()))?;
+            .ok_or_else(|| CoreError::Load("qwen-vl vision: provider has no vision tower".into()))?;
 
         let mut feats: Vec<Array> = Vec::with_capacity(images.len());
         let mut counts: Vec<usize> = Vec::with_capacity(images.len());
@@ -343,13 +370,36 @@ impl LlamaProvider {
             });
         }
 
-        let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
-        let spliced = model
-            .splice_image_features(&embeds, &expanded, &all_features, vision.image_token_id)
-            .map_err(to_core)?;
-        let positions = model
-            .mrope_positions(&expanded, &grids, vision.image_token_id, vision.spatial_merge_size)
-            .map_err(to_core)?;
+        // Embed the expanded ids, splice in the image features, and compute interleaved-M-RoPE
+        // positions — dispatched to whichever decoder powers this VLM (Qwen3.6 hybrid or Qwen3-VL
+        // generic-causal). Both expose the same embed / splice / mrope hooks.
+        let img_id = vision.image_token_id;
+        let merge = vision.spatial_merge_size;
+        let (spliced, positions) = match (self.model.as_qwen35(), self.model.as_causal()) {
+            (Some(model), _) => {
+                let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
+                let spliced = model
+                    .splice_image_features(&embeds, &expanded, &all_features, img_id)
+                    .map_err(to_core)?;
+                let positions = model
+                    .mrope_positions(&expanded, &grids, img_id, merge)
+                    .map_err(to_core)?;
+                (spliced, positions)
+            }
+            (None, Some(model)) => {
+                let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
+                let spliced = model
+                    .splice_image_features(&embeds, &expanded, &all_features, img_id)
+                    .map_err(to_core)?;
+                let positions = model
+                    .mrope_positions(&expanded, &grids, img_id, merge)
+                    .map_err(to_core)?;
+                (spliced, positions)
+            }
+            (None, None) => {
+                return Err(CoreError::Load("qwen-vl vision requires a qwen3_5 or qwen3_vl decoder".into()))
+            }
+        };
 
         Ok(MultimodalPrefill {
             expanded_ids: expanded,
@@ -639,37 +689,69 @@ impl TextLlm for LlamaProvider {
             let should_stop = || halt.get();
             let should_stop_opt = stop_active.then_some(&should_stop as &dyn Fn() -> bool);
             match &mm {
-                // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
-                // continuation (text positions shifted by `mrope_delta`) through the shared loop.
+                // Multimodal: prefill the spliced embeds with interleaved M-RoPE + DeepStack fusion,
+                // then decode the continuation (text positions shifted by `mrope_delta`) through the
+                // shared loop. Dispatched to the Qwen3.6 hybrid or the Qwen3-VL generic-causal decoder.
                 Some(m) => {
-                    let model = self
-                        .model
-                        .as_qwen35()
-                        .ok_or_else(|| CoreError::Load("qwen3.6 vision requires the qwen3_5 decoder".into()))?;
-                    let mut cache = model.new_cache();
                     let (t, h, w, delta) = &m.positions;
-                    let first = model
-                        .decode_logits_from_embeds_with_deepstack(
-                            &m.embeds,
-                            [t.as_slice(), h.as_slice(), w.as_slice()],
-                            &mut cache,
-                            &m.visual_pos_mask,
-                            &m.deepstack,
-                        )
-                        .map_err(to_core)?;
-                    let shifted = ShiftedQwen35 { model, delta: *delta };
-                    generate_from_prefill(
-                        &shifted,
-                        &mut cache,
-                        first,
-                        m.expanded_ids.clone(),
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                        should_stop_opt,
-                    )
-                    .map_err(to_core)?
+                    let pos = [t.as_slice(), h.as_slice(), w.as_slice()];
+                    match (self.model.as_qwen35(), self.model.as_causal()) {
+                        (Some(model), _) => {
+                            let mut cache = model.new_cache();
+                            let first = model
+                                .decode_logits_from_embeds_with_deepstack(
+                                    &m.embeds,
+                                    pos,
+                                    &mut cache,
+                                    &m.visual_pos_mask,
+                                    &m.deepstack,
+                                )
+                                .map_err(to_core)?;
+                            let shifted = ShiftedQwen35 { model, delta: *delta };
+                            generate_from_prefill(
+                                &shifted,
+                                &mut cache,
+                                first,
+                                m.expanded_ids.clone(),
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                constraint,
+                                should_stop_opt,
+                            )
+                            .map_err(to_core)?
+                        }
+                        (None, Some(model)) => {
+                            let mut cache = model.make_cache();
+                            let first = model
+                                .decode_logits_from_embeds_mrope_deepstack(
+                                    &m.embeds,
+                                    pos,
+                                    cache.as_mut(),
+                                    &m.visual_pos_mask,
+                                    &m.deepstack,
+                                )
+                                .map_err(to_core)?;
+                            let shifted = ShiftedCausal { model, delta: *delta };
+                            generate_from_prefill(
+                                &shifted,
+                                cache.as_mut(),
+                                first,
+                                m.expanded_ids.clone(),
+                                &config,
+                                &req.cancel,
+                                &mut sink,
+                                constraint,
+                                should_stop_opt,
+                            )
+                            .map_err(to_core)?
+                        }
+                        (None, None) => {
+                            return Err(CoreError::Load(
+                                "qwen-vl vision requires a qwen3_5 or qwen3_vl decoder".into(),
+                            ))
+                        }
+                    }
                 }
                 None => generate_with(
                     &self.model,
@@ -978,16 +1060,153 @@ mod tests {
             "vision_config": { "model_type": "siglip_vision_model" }
         })
     }
+    fn qwen3vl_wrapper() -> serde_json::Value {
+        json!({
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "model_type": "qwen3_vl",
+            "text_config": { "model_type": "qwen3_vl_text" },
+            "vision_config": { "model_type": "qwen3_vl", "depth": 27 }
+        })
+    }
 
     #[test]
     fn text_provider_claims_qwen36_but_cedes_llava() {
         // Qwen3.6 (Qwen-VL wrapper): claimed by the text provider, served text-only.
         assert!(can_load_value(&qwen36_wrapper()));
+        // Qwen3-VL (Qwen-VL wrapper): also claimed by `mlx-llama` (its nested standard Qwen3 decoder).
+        assert!(can_load_value(&qwen3vl_wrapper()));
         // LLaVA: ceded to the JoyCaption vision provider.
         assert!(!can_load_value(&llava_wrapper()));
         // Plain text models (no vision_config) are unaffected.
         assert!(can_load_value(&json!({ "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3" })));
         assert!(can_load_value(&json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })));
+    }
+
+    /// Locate the cached Qwen3-VL-8B-Instruct snapshot (rev 0c351dd0) for the chat-template oracle.
+    /// `QWEN3VL_SNAPSHOT` overrides; otherwise the default HF cache path. `None` ⇒ the gated tests
+    /// self-skip cleanly (the snapshot is present in CI for this story).
+    fn qwen3vl_snapshot_dir() -> Option<std::path::PathBuf> {
+        if let Ok(path) = std::env::var("QWEN3VL_SNAPSHOT") {
+            let path = std::path::PathBuf::from(path);
+            return path.exists().then_some(path);
+        }
+        let home = std::env::var("HOME").ok()?;
+        let path = std::path::PathBuf::from(home).join(
+            ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        );
+        path.exists().then_some(path)
+    }
+
+    /// Build the representative chat-message sets the oracle pins (text-only, system+user, single
+    /// image, multi-image/mixed, multi-turn). Image content is a `Content::Image` (a 1×1 black pixel
+    /// placeholder); the byte-match exercises the same `substitute_image_placeholders` path the
+    /// provider uses, so the rendered single `<|image_pad|>` per image must match HF.
+    fn oracle_messages(case: &str) -> Vec<Message> {
+        let img = || Content::Image(ImageRef::new(1, 1, vec![0, 0, 0]).unwrap());
+        let user = |content: Vec<Content>| Message {
+            role: core_llm::Role::User,
+            content,
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        let sys = |t: &str| Message {
+            role: core_llm::Role::System,
+            content: vec![Content::text(t)],
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        let asst = |t: &str| Message {
+            role: core_llm::Role::Assistant,
+            content: vec![Content::text(t)],
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        match case {
+            "text_only" => vec![user(vec![Content::text("What is the capital of France?")])],
+            "system_user_text" => {
+                vec![sys("You are a helpful assistant."), user(vec![Content::text("Hello!")])]
+            }
+            "single_image" => vec![user(vec![img(), Content::text("Describe this image.")])],
+            "multi_image_mixed" => vec![user(vec![
+                Content::text("Compare:"),
+                img(),
+                Content::text("and"),
+                img(),
+                Content::text("please."),
+            ])],
+            "multi_turn" => vec![
+                user(vec![Content::text("Hi")]),
+                asst("Hello there!"),
+                user(vec![Content::text("How are you?")]),
+            ],
+            other => panic!("unknown oracle case {other}"),
+        }
+    }
+
+    /// Byte-match oracle (sc-8075 AC #1): the engine's chat-template + image-placeholder + tokenize
+    /// path must reproduce the pinned HF `apply_chat_template` prompt token ids **exactly** for the
+    /// representative messages — text-only, single-image, and multi-image/mixed. The single
+    /// `<|image_pad|>` (151655) per image is what the processor emits *before* patch-count expansion;
+    /// these fixtures pin that pre-expansion prompt. Self-skips cleanly when the snapshot is absent.
+    #[test]
+    fn chat_template_byte_matches_hf_processor() {
+        let Some(dir) = qwen3vl_snapshot_dir() else {
+            eprintln!("skipping: Qwen3-VL-8B snapshot not present (set QWEN3VL_SNAPSHOT)");
+            return;
+        };
+        let oracle: serde_json::Value =
+            serde_json::from_str(include_str!("models/testdata/qwen3vl_chat_template_oracle.json"))
+                .expect("parse chat-template oracle");
+
+        // Sanity: the dispatch and config see Qwen3-VL (and parse the nested 256K-context text decoder).
+        let cfg_value = read_config_value(&dir).expect("read config.json");
+        assert_eq!(
+            Architecture::from_config(&cfg_value).unwrap(),
+            Architecture::Qwen3Vl,
+            "snapshot must dispatch to Qwen3-VL"
+        );
+        let cfg = ModelConfig::from_json(&cfg_value).expect("parse Qwen3-VL text config");
+        assert_eq!(cfg.architecture, Architecture::Qwen3Vl);
+        assert_eq!(cfg.max_position_embeddings, 262144, "256K context");
+
+        let (template, _, _) = load_chat_template(&dir);
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
+
+        for (case, expected) in oracle["cases"].as_object().unwrap() {
+            let want: Vec<i32> = expected["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect();
+            // Drive the exact provider path: substitute image content with the Qwen-VL placeholder,
+            // render the model's own Jinja template (add_generation_prompt), then tokenize without
+            // auto special tokens.
+            let messages = oracle_messages(case);
+            let substituted = substitute_image_placeholders(&messages);
+            let prompt = template
+                .render_with(
+                    &substituted,
+                    &RenderOptions {
+                        add_generation_prompt: true,
+                        enable_thinking: None,
+                        tools: &[],
+                    },
+                )
+                .expect("render");
+            assert_eq!(
+                prompt,
+                expected["text"].as_str().unwrap(),
+                "case {case}: rendered prompt string must byte-match HF"
+            );
+            let got: Vec<i32> = tokenizer
+                .encode(&prompt, false)
+                .expect("encode")
+                .into_iter()
+                .map(|id| id as i32)
+                .collect();
+            assert_eq!(got, want, "case {case}: tokenized prompt ids must byte-match HF processor");
+        }
     }
 
     #[test]

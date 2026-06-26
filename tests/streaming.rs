@@ -39,6 +39,7 @@ fn tiny_config() -> ModelConfig {
         partial_rotary_factor: 1.0,
         mla: None,
         yarn: None,
+        mrope_section: None,
     }
 }
 
