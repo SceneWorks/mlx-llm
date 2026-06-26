@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Supersede in-flight runs on the same ref (the macOS + MLX build is expensive).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: build + clippy + test (macOS / Metal GPU)
+    # Apple-Silicon runner: MLX is Apple-Silicon-only and every workspace member links MLX
+    # (the root engine `mlx-llm` AND the example `mlx-llm-server` bin), so — unlike mlx-gen,
+    # which has a backend-neutral contract lane on Linux — mlx-llm has a single macOS lane.
+    # The crate forces RUST_TEST_THREADS=1 via .cargo/config.toml, since MLX's default Metal
+    # device is not thread-safe.
+    #
+    # macos-15 is the newest hosted Apple-Silicon image (no hosted macos-26 exists).
+    # The shipping config (.cargo/config.toml) targets macOS 26.2 / Metal 400 for the NAX
+    # matrix-unit fast kernels; that needs SDK >= 26.2, which no hosted runner provides, so
+    # CI lowers the deployment target to 15.0 (Metal 320) to verify correctness. CI therefore
+    # does NOT exercise the NAX fast path — that requires a macOS-26 self-hosted runner.
+    # See mlx-gen sc-2352 / sc-2772 (this CI mirrors mlx-gen's .github/workflows/ci.yml).
+    runs-on: macos-15
+    env:
+      # Override the .cargo/config.toml default (26.2); non-forced there, so this env wins on the
+      # hosted SDK-15 runner. See .cargo/config.toml for the authoritative 26.2 rationale — do NOT
+      # "reconcile" this to a lower target there (sc-2772: the NAX 16-bit kernels miscompile to
+      # garbage below 26.2).
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          cmake --version
+
+      - name: Ensure Metal compiler
+        # mlx-sys builds MLX's Metal kernels from source via cmake, which needs the
+        # `metal` compiler. Xcode 16+ ships it as a separately-downloadable component;
+        # Xcode 15 has it built in. Download only if missing so this works on either.
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            echo "metal not found — downloading the Metal Toolchain component"
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          echo "metal: $(xcrun --find metal)"
+          xcrun metal --version || true
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        # No `@stable` — that would install whatever stable is current and ignore the pin. `rustup
+        # show` installs the channel named in rust-toolchain.toml (its `components` come with it);
+        # the explicit add is idempotent belt-and-suspenders. Bump the toolchain by editing the toml.
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustc --version
+
+      - name: Cache cargo + mlx-sys build
+        uses: Swatinem/rust-cache@v2
+
+      # NOTE: `cargo fmt --all --check` is intentionally NOT a gate yet (mlx-gen enforces it). The
+      # mlx-llm tree has never been rustfmt-clean under the pinned 1.9.0 rustfmt — adding the gate
+      # now would redden CI on committed code that this story does not touch. sc-8134 scoped the
+      # gate to build + clippy + test; a separate story should run `cargo fmt --all` across the repo
+      # and THEN add this step so the fmt baseline is green in the same change.
+
+      - name: Build (full workspace)
+        # The load-bearing gate (sc-8134, follow-up to sc-8132): build EVERY workspace member,
+        # NOT just --lib. sc-8132 broke the `mlx-llm-server` bin after core-llm added
+        # thinking/tool_calls/tools fields, and it stayed invisible because `cargo build --lib`
+        # / `cargo test --lib` never compile the server bin. `--workspace` compiles both the root
+        # engine and the server bin, so a contract drift like that fails here before merge.
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        # Runs the synthetic / weightless tests only. Every real-weights test is `#[ignore]`
+        # behind an MLX_LLM_TEST_MODEL (or sibling) env var (see tests/conformance.rs,
+        # tests/snapshot_hf.rs) — they are skipped here and exercised on a staged machine.
+        run: cargo test --workspace
