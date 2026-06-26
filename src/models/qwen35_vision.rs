@@ -906,11 +906,16 @@ mod tests {
         path.exists().then_some(path)
     }
 
-    fn qwen3vl_visual_weights(snapshot: &Path) -> Option<Weights> {
+    fn qwen3vl_visual_weights(snapshot: &Path) -> Weights {
         let index_path = snapshot.join("model.safetensors.index.json");
-        let index: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(index_path).ok()?).ok()?;
-        let weight_map = index["weight_map"].as_object()?;
+        let index_raw = std::fs::read_to_string(&index_path).unwrap_or_else(|e| {
+            panic!("qwen3vl oracle: reading index {}: {e}", index_path.display())
+        });
+        let index: serde_json::Value = serde_json::from_str(&index_raw)
+            .unwrap_or_else(|e| panic!("qwen3vl oracle: parsing index {}: {e}", index_path.display()));
+        let weight_map = index["weight_map"]
+            .as_object()
+            .expect("qwen3vl oracle: index missing `weight_map` object");
         let shards: BTreeSet<String> = weight_map
             .iter()
             .filter_map(|(k, v)| {
@@ -919,17 +924,32 @@ mod tests {
                     .flatten()
             })
             .collect();
+        assert!(
+            !shards.is_empty(),
+            "qwen3vl oracle: no `model.visual.*` shards in index {}",
+            index_path.display()
+        );
         let mut tensors = HashMap::new();
         for shard in shards {
-            let weights = Weights::from_file(snapshot.join(shard)).ok()?;
+            let shard_path = snapshot.join(&shard);
+            let weights = Weights::from_file(&shard_path)
+                .unwrap_or_else(|e| panic!("qwen3vl oracle: loading shard {}: {e}", shard_path.display()));
             for (k, v) in weights.into_map() {
                 if !k.starts_with("model.visual.") {
                     continue;
                 }
-                tensors.insert(k, v.as_dtype(Dtype::Float32).ok()?);
+                let v = v
+                    .as_dtype(Dtype::Float32)
+                    .unwrap_or_else(|e| panic!("qwen3vl oracle: casting `{k}` to f32: {e}"));
+                tensors.insert(k, v);
             }
         }
-        Some(Weights::from_map(tensors))
+        assert!(
+            !tensors.is_empty(),
+            "qwen3vl oracle: no `model.visual.*` tensors loaded from {}",
+            snapshot.display()
+        );
+        Weights::from_map(tensors)
     }
 
     fn nested_arr(j: &serde_json::Value, k: &str, idx: usize) -> Vec<f32> {
@@ -1018,10 +1038,7 @@ mod tests {
             eprintln!("skipping qwen3vl real-weight oracle: cached HF snapshot unavailable");
             return;
         };
-        let Some(weights) = qwen3vl_visual_weights(&snapshot) else {
-            eprintln!("skipping qwen3vl real-weight oracle: visual weights unavailable");
-            return;
-        };
+        let weights = qwen3vl_visual_weights(&snapshot);
         let model = Qwen35VisionModel::from_weights(&weights, "model.visual", cfg.clone()).unwrap();
         let pixel = Array::from_slice(&arr(&j, "pixel"), &[n, cfg.patch_in()]);
         let out = model.forward_with_deepstack(&pixel, &grid).unwrap();

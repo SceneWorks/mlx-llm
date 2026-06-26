@@ -21,6 +21,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_section
 use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
+use crate::models::deepstack::deepstack_fused_decoder_layers;
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
@@ -783,13 +784,16 @@ impl Qwen35Model {
             self.cfg.mrope_section_resolved(),
             COMPUTE_DTYPE,
         )?;
-        let mut h = embeds.as_dtype(COMPUTE_DTYPE)?;
-        for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            h = layer.forward(&h, &cos, &sin, slot)?;
-            if let Some(feature) = deepstack.get(i) {
-                h = add_visual_features(&h, visual_pos_mask, feature)?;
-            }
-        }
+        let h0 = embeds.as_dtype(COMPUTE_DTYPE)?;
+        let layers = &self.layers;
+        let cache_layers = &mut cache.layers;
+        let h = deepstack_fused_decoder_layers(
+            &h0,
+            visual_pos_mask,
+            deepstack,
+            layers.len(),
+            |i, h| layers[i].forward(h, &cos, &sin, &mut cache_layers[i]),
+        )?;
         self.project_last(&h)
     }
 
@@ -944,61 +948,6 @@ impl Qwen35Model {
             quantized: quant.is_some(),
         })
     }
-}
-
-fn add_visual_features(h: &Array, visual_pos_mask: &[bool], visual: &Array) -> Result<Array> {
-    let sh = h.shape();
-    let (b, s, hidden) = (sh[0], sh[1], sh[2]);
-    if b != 1 {
-        return Err(Error::Msg(format!("deepstack fusion expects batch 1, got {b}")));
-    }
-    if visual_pos_mask.len() != s as usize {
-        return Err(Error::Msg(format!(
-            "deepstack mask length {} != seq {s}",
-            visual_pos_mask.len()
-        )));
-    }
-    let num_visual = visual_pos_mask.iter().filter(|&&m| m).count() as i32;
-    if num_visual != visual.shape()[0] {
-        return Err(Error::Msg(format!(
-            "deepstack: {num_visual} visual positions != {} feature rows",
-            visual.shape()[0]
-        )));
-    }
-    if visual.shape()[1] != hidden {
-        return Err(Error::Msg(format!(
-            "deepstack hidden {} != decoder hidden {hidden}",
-            visual.shape()[1]
-        )));
-    }
-    if num_visual == 0 {
-        return Ok(h.clone());
-    }
-    let vis = visual.as_dtype(h.dtype())?;
-    let mut pieces: Vec<Array> = Vec::new();
-    let mut vis_off = 0i32;
-    let mut i = 0usize;
-    while i < s as usize {
-        let is_vis = visual_pos_mask[i];
-        let mut j = i;
-        while j < s as usize && visual_pos_mask[j] == is_vis {
-            j += 1;
-        }
-        let n = (j - i) as i32;
-        let idx = Array::from_slice(&(i as i32..j as i32).collect::<Vec<_>>(), &[n]);
-        let span = h.take_axis(&idx, 1)?;
-        if is_vis {
-            let vidx = Array::from_slice(&(vis_off..vis_off + n).collect::<Vec<_>>(), &[n]);
-            let vspan = vis.take_axis(&vidx, 0)?.reshape(&[1, n, hidden])?;
-            pieces.push(add(&span, &vspan)?);
-            vis_off += n;
-        } else {
-            pieces.push(span);
-        }
-        i = j;
-    }
-    let refs: Vec<&Array> = pieces.iter().collect();
-    Ok(concatenate_axis(&refs, 1)?)
 }
 
 impl KvCache for Qwen35Cache {
@@ -1553,6 +1502,78 @@ mod tests {
             fused_vs_unfused > 1e-3,
             "DeepStack fusion did not change the logits (features dropped?): max abs diff {fused_vs_unfused}"
         );
+    }
+
+    #[test]
+    fn deepstack_seam_is_decoder_agnostic_at_qwen3vl_shapes() {
+        let hidden = 4096i32;
+        let num_layers = 6usize;
+        let taps = [8usize, 16, 24];
+        let seq = 8i32;
+        let visual_pos_mask: Vec<bool> = (0..seq).map(|i| (2..6).contains(&i)).collect();
+        let num_visual = visual_pos_mask.iter().filter(|&&m| m).count() as i32;
+        assert_eq!(num_visual, 4);
+
+        let v0 = 0.5f32;
+        let h0 = Array::from_slice(&vec![v0; (seq * hidden) as usize], &[1, seq, hidden])
+            .as_dtype(COMPUTE_DTYPE)
+            .unwrap();
+        let feat_val = [0.25f32, 0.5, 0.75];
+        let deepstack: Vec<Array> = (0..taps.len())
+            .map(|t| {
+                Array::from_slice(&vec![feat_val[t]; (num_visual * hidden) as usize], &[num_visual, hidden])
+                    .as_dtype(COMPUTE_DTYPE)
+                    .unwrap()
+            })
+            .collect();
+
+        let two = Array::from_f32(2.0).as_dtype(COMPUTE_DTYPE).unwrap();
+        let mut calls: Vec<usize> = Vec::new();
+        let fused = deepstack_fused_decoder_layers(
+            &h0,
+            &visual_pos_mask,
+            &deepstack,
+            num_layers,
+            |i, h| {
+                calls.push(i);
+                Ok(multiply(h, &two)?)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, (0..num_layers).collect::<Vec<_>>(), "every decoder layer must run once, in order");
+
+        let unfused = deepstack_fused_decoder_layers(
+            &h0,
+            &visual_pos_mask,
+            &[],
+            num_layers,
+            |_i, h| Ok(multiply(h, &two)?),
+        )
+        .unwrap();
+
+        let scale = 2f32.powi(num_layers as i32);
+        let text_expected = v0 * scale;
+        let visual_expected: f32 = v0 * scale
+            + (0..taps.len())
+                .map(|t| feat_val[t] * 2f32.powi((num_layers - 1 - t) as i32))
+                .sum::<f32>();
+
+        let fv = fused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let uv = unfused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let row = |buf: &[f32], r: i32| buf[(r * hidden) as usize];
+        for r in 0..seq {
+            let got = row(&fv, r);
+            let want = if visual_pos_mask[r as usize] { visual_expected } else { text_expected };
+            assert!((got - want).abs() < 1e-1, "fused row {r}: got {got}, want {want}");
+        }
+        assert!((visual_expected - 54.0).abs() < 1e-3);
+        assert!((text_expected - 32.0).abs() < 1e-3);
+
+        for r in 0..seq {
+            assert!((row(&uv, r) - text_expected).abs() < 1e-1, "unfused row {r} must skip injection");
+        }
+        let fused_vs_unfused = fv.iter().zip(&uv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(fused_vs_unfused > 1.0, "fused path must differ from non-fused: max abs diff {fused_vs_unfused}");
     }
 
     /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
