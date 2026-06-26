@@ -93,24 +93,30 @@ struct Qwen35Vision {
 
 impl Qwen35Vision {
     /// Encode one image to its merged patch rows `[n_tokens, hidden]` (the merger output is already
-    /// the language hidden size — no separate projector) plus the image's `grid_thw` (`[1, h, w]` in
-    /// patch units). `n_tokens = (grid_h/merge)·(grid_w/merge)` is the placeholder expansion count.
-    fn encode(&self, img: &ImageRef) -> CoreResult<(Array, [i32; 3])> {
+    /// the language hidden size — no separate projector), the per-tap **DeepStack** feature sets
+    /// (each `[n_tokens, hidden]`, one per `deepstack_visual_indexes` tap), plus the image's
+    /// `grid_thw` (`[1, h, w]` in patch units). `n_tokens = (grid_h/merge)·(grid_w/merge)` is the
+    /// placeholder expansion count.
+    fn encode(&self, img: &ImageRef) -> CoreResult<(Array, Vec<Array>, [i32; 3])> {
         let (pixels, grid) = self
             .processor
             .preprocess(&img.pixels, img.width as usize, img.height as usize)
             .map_err(to_core)?;
-        let features = self.tower.forward(&pixels, &grid).map_err(to_core)?;
-        Ok((features, grid[0]))
+        let out = self.tower.forward_with_deepstack(&pixels, &grid).map_err(to_core)?;
+        Ok((out.pooler_output, out.deepstack_features, grid[0]))
     }
 }
 
 /// The prepared multimodal prefill: the image-token-expanded prompt ids, the decoder input embeds
-/// with image features spliced in, and the interleaved M-RoPE position rows + delta.
+/// with image features spliced in, the interleaved M-RoPE position rows + delta, the per-position
+/// visual mask (`true` at image-token positions), and the per-tap DeepStack feature sets fused into
+/// the first decoder layers.
 struct MultimodalPrefill {
     expanded_ids: Vec<i32>,
     embeds: Array,
     positions: (Vec<i32>, Vec<i32>, Vec<i32>, i32),
+    visual_pos_mask: Vec<bool>,
+    deepstack: Vec<Array>,
 }
 
 /// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` — the Qwen3.6 multimodal
@@ -332,19 +338,42 @@ impl LlamaProvider {
         let mut feats: Vec<Array> = Vec::with_capacity(images.len());
         let mut counts: Vec<usize> = Vec::with_capacity(images.len());
         let mut grids: Vec<[i32; 3]> = Vec::with_capacity(images.len());
+        let mut deepstack_by_tap: Vec<Vec<Array>> = Vec::new();
         for img in images {
-            let (f, grid) = vision.encode(img)?;
+            let (f, deepstack, grid) = vision.encode(img)?;
             counts.push(f.shape()[0] as usize);
             grids.push(grid);
             feats.push(f);
+            if deepstack_by_tap.is_empty() {
+                deepstack_by_tap.resize_with(deepstack.len(), Vec::new);
+            }
+            if deepstack.len() != deepstack_by_tap.len() {
+                return Err(CoreError::Load(format!(
+                    "qwen3.6 vision: inconsistent DeepStack tap count {} != {}",
+                    deepstack.len(),
+                    deepstack_by_tap.len()
+                )));
+            }
+            for (tap, feature) in deepstack.into_iter().enumerate() {
+                deepstack_by_tap[tap].push(feature);
+            }
         }
 
         let expanded = expand_image_placeholders(prompt_ids, vision.image_token_id, &counts).map_err(to_core)?;
+        let visual_pos_mask: Vec<bool> = expanded.iter().map(|&id| id == vision.image_token_id).collect();
         let refs: Vec<&Array> = feats.iter().collect();
         let all_features = match refs.as_slice() {
             [one] => (*one).clone(),
             many => concatenate_axis(many, 0).map_err(|e| to_core(e.into()))?,
         };
+        let mut deepstack = Vec::with_capacity(deepstack_by_tap.len());
+        for by_image in deepstack_by_tap {
+            let refs: Vec<&Array> = by_image.iter().collect();
+            deepstack.push(match refs.as_slice() {
+                [one] => (*one).clone(),
+                many => concatenate_axis(many, 0).map_err(|e| to_core(e.into()))?,
+            });
+        }
 
         let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
         let spliced = model
@@ -358,6 +387,8 @@ impl LlamaProvider {
             expanded_ids: expanded,
             embeds: spliced,
             positions,
+            visual_pos_mask,
+            deepstack,
         })
     }
 }
@@ -650,7 +681,13 @@ impl TextLlm for LlamaProvider {
                     let mut cache = model.new_cache();
                     let (t, h, w, delta) = &m.positions;
                     let first = model
-                        .decode_logits_from_embeds(&m.embeds, [t.as_slice(), h.as_slice(), w.as_slice()], &mut cache)
+                        .decode_logits_from_embeds_with_deepstack(
+                            &m.embeds,
+                            [t.as_slice(), h.as_slice(), w.as_slice()],
+                            &mut cache,
+                            &m.visual_pos_mask,
+                            &m.deepstack,
+                        )
                         .map_err(to_core)?;
                     let shifted = ShiftedQwen35 { model, delta: *delta };
                     generate_from_prefill(

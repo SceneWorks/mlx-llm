@@ -759,6 +759,40 @@ impl Qwen35Model {
         self.project_last(&h)
     }
 
+    /// Run the decoder over precomputed input `embeds` `[1, S, hidden]` with interleaved M-RoPE
+    /// (the multimodal embeds path) **and DeepStack feature fusion**: after decoder layer `i`, for
+    /// `i < deepstack.len()`, the `i`-th tapped/merged ViT feature set is added to the visual-token
+    /// rows of the running hidden states (`visual_pos_mask[p]` marks an image-token position).
+    ///
+    /// This is the Qwen3-VL DeepStack seam (`Qwen3VLTextModel.forward` + `_deepstack_process`):
+    /// `deepstack` carries the `deepstack_features` produced by the vision tower at its tap layers,
+    /// projected to `out_hidden_size == hidden`, and is injected into the *first* `len(deepstack)`
+    /// decoder layers (HF indexes by decoder position, not by the vision tap index). Returns
+    /// last-position logits `[1, vocab]`. With an empty `deepstack` this equals
+    /// [`Self::decode_logits_from_embeds`].
+    pub fn decode_logits_from_embeds_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut Qwen35Cache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<Array> {
+        let (cos, sin) = self.rope.mrope_interleaved_cos_sin(
+            positions,
+            self.cfg.mrope_section_resolved(),
+            COMPUTE_DTYPE,
+        )?;
+        let mut h = embeds.as_dtype(COMPUTE_DTYPE)?;
+        for (i, (layer, slot)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
+            h = layer.forward(&h, &cos, &sin, slot)?;
+            if let Some(feature) = deepstack.get(i) {
+                h = add_visual_features(&h, visual_pos_mask, feature)?;
+            }
+        }
+        self.project_last(&h)
+    }
+
     /// Build from a loaded checkpoint (dense). See [`Qwen35Model::from_weights_with`].
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35Config) -> Result<Self> {
         Self::from_weights_with(w, prefix, cfg, None)
@@ -910,6 +944,61 @@ impl Qwen35Model {
             quantized: quant.is_some(),
         })
     }
+}
+
+fn add_visual_features(h: &Array, visual_pos_mask: &[bool], visual: &Array) -> Result<Array> {
+    let sh = h.shape();
+    let (b, s, hidden) = (sh[0], sh[1], sh[2]);
+    if b != 1 {
+        return Err(Error::Msg(format!("deepstack fusion expects batch 1, got {b}")));
+    }
+    if visual_pos_mask.len() != s as usize {
+        return Err(Error::Msg(format!(
+            "deepstack mask length {} != seq {s}",
+            visual_pos_mask.len()
+        )));
+    }
+    let num_visual = visual_pos_mask.iter().filter(|&&m| m).count() as i32;
+    if num_visual != visual.shape()[0] {
+        return Err(Error::Msg(format!(
+            "deepstack: {num_visual} visual positions != {} feature rows",
+            visual.shape()[0]
+        )));
+    }
+    if visual.shape()[1] != hidden {
+        return Err(Error::Msg(format!(
+            "deepstack hidden {} != decoder hidden {hidden}",
+            visual.shape()[1]
+        )));
+    }
+    if num_visual == 0 {
+        return Ok(h.clone());
+    }
+    let vis = visual.as_dtype(h.dtype())?;
+    let mut pieces: Vec<Array> = Vec::new();
+    let mut vis_off = 0i32;
+    let mut i = 0usize;
+    while i < s as usize {
+        let is_vis = visual_pos_mask[i];
+        let mut j = i;
+        while j < s as usize && visual_pos_mask[j] == is_vis {
+            j += 1;
+        }
+        let n = (j - i) as i32;
+        let idx = Array::from_slice(&(i as i32..j as i32).collect::<Vec<_>>(), &[n]);
+        let span = h.take_axis(&idx, 1)?;
+        if is_vis {
+            let vidx = Array::from_slice(&(vis_off..vis_off + n).collect::<Vec<_>>(), &[n]);
+            let vspan = vis.take_axis(&vidx, 0)?.reshape(&[1, n, hidden])?;
+            pieces.push(add(&span, &vspan)?);
+            vis_off += n;
+        } else {
+            pieces.push(span);
+        }
+        i = j;
+    }
+    let refs: Vec<&Array> = pieces.iter().collect();
+    Ok(concatenate_axis(&refs, 1)?)
 }
 
 impl KvCache for Qwen35Cache {
@@ -1397,6 +1486,73 @@ mod tests {
         let v = out.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
         let row = |r: usize| v[r * hidden]; // first element of each row (whole row is constant)
         assert_eq!([row(0), row(1), row(2), row(3), row(4)], [0.0, 100.0, 101.0, 3.0, 4.0]);
+    }
+
+    /// DeepStack fusion is actually wired through the decoder: feeding non-zero tapped features
+    /// through `decode_logits_from_embeds_with_deepstack` must (a) run end to end to finite logits
+    /// and (b) **differ** from the same prefill with the fusion disabled (empty taps) — proving the
+    /// tapped features are consumed in the decoder layers, not computed and dropped.
+    #[test]
+    fn deepstack_fused_path_consumes_features_and_differs() {
+        let (cfg, model) = synthetic_model();
+        let img = 49i32;
+        let ids = [1i32, 2, img, img, img, img, 3, 4];
+        let grid = vec![[1i32, 4, 4]];
+        let ids_arr = Array::from_slice(&ids, &[1, ids.len() as i32]);
+
+        let embeds = model.embed_input_ids(&ids_arr).unwrap();
+        let feats = Array::from_slice(
+            &(0..4 * cfg.hidden_size).map(|i| (i % 7) as f32 * 0.1 - 0.3).collect::<Vec<_>>(),
+            &[4, cfg.hidden_size],
+        );
+        let spliced = model.splice_image_features(&embeds, &ids, &feats, img).unwrap();
+        let (t, h, w, _delta) = model.mrope_positions(&ids, &grid, img, 2).unwrap();
+        let visual_pos_mask: Vec<bool> = ids.iter().map(|&id| id == img).collect();
+
+        let ds = |scale: f32| {
+            Array::from_slice(
+                &(0..4 * cfg.hidden_size).map(|i| (i % 5) as f32 * scale + 0.05).collect::<Vec<_>>(),
+                &[4, cfg.hidden_size],
+            )
+        };
+        let deepstack = [ds(0.2), ds(-0.15)];
+
+        let fused = model
+            .decode_logits_from_embeds_with_deepstack(
+                &spliced,
+                [&t, &h, &w],
+                &mut model.new_cache(),
+                &visual_pos_mask,
+                &deepstack,
+            )
+            .unwrap();
+        let unfused = model
+            .decode_logits_from_embeds_with_deepstack(
+                &spliced,
+                [&t, &h, &w],
+                &mut model.new_cache(),
+                &visual_pos_mask,
+                &[],
+            )
+            .unwrap();
+        let baseline = model
+            .decode_logits_from_embeds(&spliced, [&t, &h, &w], &mut model.new_cache())
+            .unwrap();
+
+        assert_eq!(fused.shape(), &[1, cfg.vocab_size]);
+        let fv = fused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let uv = unfused.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let bv = baseline.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        assert!(fv.iter().all(|x| x.is_finite()), "non-finite fused logit");
+
+        let unfused_vs_baseline = uv.iter().zip(&bv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert_eq!(unfused_vs_baseline, 0.0, "empty-deepstack path must equal plain embeds path");
+
+        let fused_vs_unfused = fv.iter().zip(&uv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(
+            fused_vs_unfused > 1e-3,
+            "DeepStack fusion did not change the logits (features dropped?): max abs diff {fused_vs_unfused}"
+        );
     }
 
     /// Smoke: the full image+text path (embed → splice features → M-RoPE positions →
