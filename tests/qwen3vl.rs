@@ -41,8 +41,8 @@ fn snapshot_dir() -> Option<PathBuf> {
 /// Direct `CausalLm` load + greedy text-only generation from the real snapshot: the decoder must
 /// load (36 layers, GQA 32/8, head_dim 128, vocab 151936, 256K RoPE), and a factual prompt must
 /// generate coherent, reproducible text. "The capital of France is" → must mention Paris — a tight
-/// end-to-end grounding check (if the weight prefix, the `(1+weight)` norm convention, or the RoPE
-/// were wrong, the model could not answer).
+/// end-to-end grounding check (if the weight prefix, the norm convention (standard RMSNorm), or the
+/// RoPE were wrong, the model could not answer).
 #[test]
 fn qwen3vl_text_decoder_loads_and_generates_coherently() {
     let Some(dir) = snapshot_dir() else {

@@ -48,7 +48,8 @@ pub enum Architecture {
     Qwen35,
     /// Qwen3-VL family (`model_type` `qwen3_vl` / `text_config.model_type` `qwen3_vl_text`): a
     /// VLM-wrapped **standard full-attention** Qwen3 decoder (GQA + per-head q/k RMSNorm + SwiGLU)
-    /// — NOT the Qwen3.6 hybrid — with the Qwen3-Next `(1 + weight)` RMSNorm convention, a 256K
+    /// — NOT the Qwen3.6 hybrid — with standard (verbatim-weight) RMSNorm (`Qwen3VLTextRMSNorm` is
+    /// plain `weight · x`; no `(1 + weight)` fold — that fold applies only to Gemma), a 256K
     /// context (`rope_theta` 5e6, `max_position_embeddings` 262144), and **interleaved multimodal
     /// RoPE** (`rope_scaling.mrope_interleaved` + `mrope_section`). The decoder weights nest under
     /// `model.language_model.*` (the ViT tower under `model.visual.*`, loaded by the vision path).
@@ -126,9 +127,9 @@ impl Architecture {
         }
     }
 
-    /// Whether this is the Qwen3-VL decoder (drives the `text_config` descent, the Qwen3-Next
-    /// `(1 + weight)` RMSNorm convention, the `model.language_model.*` weight prefix, and the
-    /// interleaved multimodal RoPE).
+    /// Whether this is the Qwen3-VL decoder (drives the `text_config` descent, standard
+    /// (verbatim-weight) RMSNorm — `Qwen3VLTextRMSNorm` is plain `weight · x`, no `(1 + weight)`
+    /// fold — the `model.language_model.*` weight prefix, and the interleaved multimodal RoPE).
     pub fn is_qwen3_vl(self) -> bool {
         matches!(self, Architecture::Qwen3Vl)
     }
