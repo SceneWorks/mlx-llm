@@ -26,6 +26,7 @@
 
 use mlx_rs::nn::{silu, softplus};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, exp, multiply, subtract, sum_axis};
+use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
@@ -82,7 +83,18 @@ pub fn gated_delta_recurrence(
         None => zeros_state(b, hv, dv, dk, q.dtype())?,
     };
 
+    // The recurrence is sequential, so the whole `t`-step graph is built before the caller's single
+    // `eval` at the end of the forward. Every step eagerly allocates index arrays (one Metal buffer
+    // each, via `slice_time`'s gather) that stay live until that eval — so on a long sequence the live
+    // buffer count grows without bound and trips the Metal allocator's resource limit, surfacing as a
+    // spurious "expected a non-empty mlx_array" from the next gather (a high-res image expands to
+    // thousands of vision tokens × the decoder's many linear layers). Force the outputs + carried
+    // state every `EVAL_CHUNK` steps so MLX materializes and frees the chunk's transients, bounding
+    // peak buffers to one chunk. Decode (`t == 1`) and short prefills never reach the cadence, so their
+    // graphs — and the per-step sync cost `sc-7469` warned against — are unchanged.
+    const EVAL_CHUNK: i32 = 256;
     let mut ys: Vec<Array> = Vec::with_capacity(t as usize);
+    let mut flushed = 0usize;
     for ti in 0..t {
         let qt = slice_time(&q, ti)?; // [B,Hv,Dk]
         let kt = slice_time(&k, ti)?; // [B,Hv,Dk]
@@ -92,6 +104,12 @@ pub fn gated_delta_recurrence(
         let (y, next) = delta_step(&qt, &kt, &vt, &gt, &bt, &state, b, hv, dk, dv)?;
         state = next;
         ys.push(y.expand_dims(1)?); // [B,1,Hv,Dv]
+        if (ti + 1) % EVAL_CHUNK == 0 {
+            // Force this chunk's outputs + the carried state (which transitively pins every step's
+            // index/intermediate arrays) so they free before the next chunk.
+            eval(ys[flushed..].iter().chain(std::iter::once(&state)))?;
+            flushed = ys.len();
+        }
     }
     let refs: Vec<&Array> = ys.iter().collect();
     let y = concatenate_axis(&refs, 1)?; // [B,T,Hv,Dv]
@@ -406,5 +424,29 @@ mod tests {
         cache.reset();
         assert_eq!(cache.offset(), 0);
         assert!(cache.conv_state.is_none());
+    }
+
+    /// A long prefill must not exhaust the Metal allocator. The recurrence builds the whole `t`-step
+    /// graph before a single eval, eagerly allocating per-step index buffers; without periodic flushing
+    /// a sequence past ~100k steps trips the allocator's resource limit and the next gather fails with a
+    /// spurious "expected a non-empty mlx_array". `t = 130_000` clears that limit (~5 buffers/step >
+    /// 499_000) and must now complete because the recurrence flushes every `EVAL_CHUNK` steps. Marked
+    /// `ignore` only for runtime (the loop is long), not flakiness — it is the direct regression guard
+    /// for the high-res-image vision crash.
+    #[test]
+    #[ignore = "slow: 130k-step recurrence; guards the long-prefill Metal buffer-limit regression"]
+    fn long_prefill_does_not_exhaust_buffer_limit() {
+        let t = 130_000i32;
+        let q = Array::from_slice(&vec![0.01f32; t as usize], &[1, t, 1, 1]);
+        let k = Array::from_slice(&vec![0.02f32; t as usize], &[1, t, 1, 1]);
+        let v = Array::from_slice(&vec![0.03f32; t as usize], &[1, t, 1, 1]);
+        let g = Array::from_slice(&vec![0.9f32; t as usize], &[1, t, 1]);
+        let beta = Array::from_slice(&vec![0.5f32; t as usize], &[1, t, 1]);
+        let (y, state) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None)
+            .expect("long recurrence must not exhaust the Metal allocator");
+        assert_eq!(y.shape(), &[1, t, 1, 1]);
+        assert_eq!(state.shape(), &[1, 1, 1, 1]);
+        // Force a final materialization so a deferred allocator failure can't hide behind laziness.
+        eval([&y, &state]).unwrap();
     }
 }
