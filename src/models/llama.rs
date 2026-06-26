@@ -456,6 +456,28 @@ impl CausalLm {
         Ok(h)
     }
 
+    pub fn decode_logits_from_embeds_with_deepstack(
+        &self,
+        input_embeds: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<Array> {
+        let s = input_embeds.shape()[1];
+        let (cos, sin) = self.rope.cos_sin(s, offset, COMPUTE_DTYPE)?;
+        let mut h = input_embeds.clone();
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &cos, &sin, AttnMask::Causal, cache, i)?;
+            if let Some(feature) = deepstack.get(i) {
+                h = add_visual_features(&h, visual_pos_mask, feature)?;
+            }
+        }
+        let last_h = take_last(&h, s)?;
+        let logits = self.project_logits(&last_h)?;
+        Ok(logits.reshape(&[h.shape()[0], self.cfg.vocab_size])?)
+    }
+
     /// Final RMSNorm + `lm_head` (+ Gemma-2 logit soft-cap) over hidden states `[batch, n, hidden]`.
     fn project_logits(&self, h: &Array) -> Result<Array> {
         let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps)?;
@@ -950,6 +972,55 @@ impl MoeMlp {
     }
 }
 
+fn add_visual_features(h: &Array, visual_pos_mask: &[bool], visual: &Array) -> Result<Array> {
+    let sh = h.shape();
+    let (b, s, hidden) = (sh[0], sh[1], sh[2]);
+    if b != 1 {
+        return Err(Error::Msg(format!("deepstack fusion expects batch 1, got {b}")));
+    }
+    if visual_pos_mask.len() != s as usize {
+        return Err(Error::Msg(format!(
+            "deepstack mask length {} != seq {s}",
+            visual_pos_mask.len()
+        )));
+    }
+    let num_visual = visual_pos_mask.iter().filter(|&&m| m).count() as i32;
+    if num_visual != visual.shape()[0] {
+        return Err(Error::Msg(format!(
+            "deepstack: {num_visual} visual positions != {} feature rows",
+            visual.shape()[0]
+        )));
+    }
+    if num_visual == 0 {
+        return Ok(h.clone());
+    }
+    let vis = visual.as_dtype(h.dtype())?;
+    let mut pieces: Vec<Array> = Vec::new();
+    let mut vis_off = 0i32;
+    let mut i = 0usize;
+    while i < s as usize {
+        let is_vis = visual_pos_mask[i];
+        let mut j = i;
+        while j < s as usize && visual_pos_mask[j] == is_vis {
+            j += 1;
+        }
+        let n = (j - i) as i32;
+        let idx = Array::from_slice(&(i as i32..j as i32).collect::<Vec<_>>(), &[n]);
+        let span = h.take_axis(&idx, 1)?;
+        if is_vis {
+            let vidx = Array::from_slice(&(vis_off..vis_off + n).collect::<Vec<_>>(), &[n]);
+            let vspan = vis.take_axis(&vidx, 0)?.reshape(&[1, n, hidden])?;
+            pieces.push(add(&span, &vspan)?);
+            vis_off += n;
+        } else {
+            pieces.push(span);
+        }
+        i = j;
+    }
+    let refs: Vec<&Array> = pieces.iter().collect();
+    Ok(concatenate_axis(&refs, 1)?)
+}
+
 /// Join a key prefix and suffix (`""` prefix ⇒ the suffix verbatim).
 fn join(prefix: &str, suffix: &str) -> String {
     if prefix.is_empty() {
@@ -970,5 +1041,13 @@ mod tests {
             join("language_model", "model.norm.weight"),
             "language_model.model.norm.weight"
         );
+    }
+
+    #[test]
+    fn add_visual_features_adds_only_masked_rows() {
+        let h = Array::from_slice(&[1.0f32, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0], &[1, 4, 2]);
+        let v = Array::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[2, 2]);
+        let out = add_visual_features(&h, &[false, true, true, false], &v).unwrap();
+        assert_eq!(out.as_slice::<f32>().to_vec(), vec![1.0, 1.0, 12.0, 22.0, 33.0, 43.0, 4.0, 4.0]);
     }
 }

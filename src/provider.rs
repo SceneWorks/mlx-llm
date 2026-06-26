@@ -258,7 +258,8 @@ impl LlamaProvider {
             && weights.get("model.visual.patch_embed.proj.weight").is_some()
         {
             let vcfg = Qwen35VisionConfig::from_json(&cfg_value).map_err(to_core)?;
-            let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg).map_err(to_core)?;
+            let tower = Qwen35VisionModel::from_weights(&weights, "model.visual", vcfg.clone())
+                .map_err(to_core)?;
             let image_token_id = cfg_value
                 .get("image_token_id")
                 .and_then(|x| x.as_i64())

@@ -12,5 +12,8 @@ pub mod siglip;
 
 pub use llama::CausalLm;
 pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
-pub use qwen35_vision::{Qwen35VisionConfig, Qwen35VisionModel};
+pub use qwen35_vision::{
+    Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutput, Qwen3VLVisionConfig,
+    Qwen3VLVisionModel, Qwen3VLVisionOutput,
+};
 pub use siglip::{SiglipVisionConfig, SiglipVisionTower};
