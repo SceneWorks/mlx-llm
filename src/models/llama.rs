@@ -613,6 +613,54 @@ impl crate::decode::Decode for CausalLm {
     }
 }
 
+impl crate::models::VlmDecode for CausalLm {
+    fn embed_input_ids(&self, input_ids: &Array) -> Result<Array> {
+        CausalLm::embed_input_ids(self, input_ids)
+    }
+
+    fn splice_vision_features(
+        &self,
+        embeds: &Array,
+        input_ids: &[i32],
+        vision_features: &Array,
+        placeholder_tokens: &[i32],
+    ) -> Result<Array> {
+        CausalLm::splice_vision_features(self, embeds, input_ids, vision_features, placeholder_tokens)
+    }
+
+    fn mrope_positions_mm(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        video_grid_thw: &[[i32; 3]],
+        video_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<crate::models::deepstack::MropePositions> {
+        CausalLm::mrope_positions_mm(
+            self,
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            video_grid_thw,
+            video_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    fn prefill_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<Array> {
+        // The generic decoder's cache is already the trait-object form — no downcast needed.
+        self.decode_logits_from_embeds_mrope_deepstack(embeds, positions, cache, visual_pos_mask, deepstack)
+    }
+}
+
 /// Slice the last position off the seq axis, keeping the axis (`[b, 1, hidden]`).
 fn take_last(h: &Array, s: i32) -> Result<Array> {
     let last_idx = Array::from_slice(&[s - 1], &[1]);
