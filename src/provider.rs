@@ -27,7 +27,7 @@ use crate::decode::{
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::{
-    CausalLm, Qwen35Cache, Qwen35Config, Qwen35Model, Qwen35VisionConfig, Qwen35VisionModel,
+    CausalLm, Qwen35Config, Qwen35Model, Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
@@ -71,21 +71,14 @@ impl Decoder {
         }
     }
 
-    /// The concrete hybrid decoder, when this is the Qwen3.6 path (the multimodal embeds/M-RoPE hooks
-    /// live on `Qwen35Model`, not the generic `Decode` trait).
-    fn as_qwen35(&self) -> Option<&Qwen35Model> {
+    /// The decoder as the backend-neutral multimodal seam. Both backbones implement [`VlmDecode`]
+    /// (the Qwen3.6 hybrid and the generic Qwen3-VL causal decoder), so the provider drives the
+    /// image/video prefill + decode through this one trait object rather than forking on the concrete
+    /// decoder type.
+    fn as_vlm(&self) -> &dyn VlmDecode {
         match self {
-            Decoder::Qwen35(m) => Some(m),
-            Decoder::Causal(_) => None,
-        }
-    }
-
-    /// The generic causal decoder, when this is the Qwen3-VL path (the multimodal embeds/M-RoPE +
-    /// DeepStack hooks live on [`CausalLm`]).
-    fn as_causal(&self) -> Option<&CausalLm> {
-        match self {
-            Decoder::Causal(m) => Some(m),
-            Decoder::Qwen35(_) => None,
+            Decoder::Causal(m) => m,
+            Decoder::Qwen35(m) => m,
         }
     }
 }
@@ -150,45 +143,24 @@ struct MultimodalPrefill {
     deepstack: Vec<Array>,
 }
 
-/// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` — the Qwen3.6 multimodal
-/// decode steps continue from `mrope_delta` past the cached length (image tokens compress the
-/// position cursor, so post-prompt text positions are `cache_len + mrope_delta`, not `cache_len`).
-/// The new tokens are text, so a single shifted 1-D position is the correct M-RoPE position.
-struct ShiftedQwen35<'a> {
-    model: &'a Qwen35Model,
+/// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` for the post-prompt
+/// continuation of a multimodal decode. Image tokens compress the position cursor, so the text
+/// positions that follow the prompt are `cache_len + mrope_delta`, not `cache_len`; the new tokens
+/// are text, so a single shifted 1-D position is the correct (interleaved-)M-RoPE position. Drives
+/// either backbone through [`VlmDecode`]'s [`Decode`] supertrait — each decoder downcasts its own
+/// cache inside `step`, so no concrete-type fork is needed here.
+struct Shifted<'a> {
+    model: &'a dyn VlmDecode,
     delta: i32,
 }
 
-impl Decode for ShiftedQwen35<'_> {
-    fn make_cache(&self) -> Box<dyn KvCache> {
-        Box::new(self.model.new_cache())
-    }
-
-    fn step(&self, ids: &Array, cache: &mut dyn KvCache, offset: i32) -> crate::error::Result<Array> {
-        let c = cache
-            .as_any_mut()
-            .downcast_mut::<Qwen35Cache>()
-            .ok_or_else(|| crate::error::Error::Msg("ShiftedQwen35: cache is not a Qwen35Cache".into()))?;
-        self.model.decode_logits(ids, c, offset + self.delta)
-    }
-}
-
-/// The Qwen3-VL analogue of [`ShiftedQwen35`]: a [`Decode`] wrapper over the generic [`CausalLm`]
-/// decoder that shifts the RoPE offset by the constant `mrope_delta`. The post-prompt continuation
-/// tokens are text, so a single shifted 1-D position is the correct interleaved-M-RoPE position
-/// (equal t/h/w rows ⇒ bit-identical to plain 1-D RoPE at that offset).
-struct ShiftedCausal<'a> {
-    model: &'a CausalLm,
-    delta: i32,
-}
-
-impl Decode for ShiftedCausal<'_> {
+impl Decode for Shifted<'_> {
     fn make_cache(&self) -> Box<dyn KvCache> {
         self.model.make_cache()
     }
 
     fn step(&self, ids: &Array, cache: &mut dyn KvCache, offset: i32) -> crate::error::Result<Array> {
-        self.model.decode_logits(ids, cache, offset + self.delta)
+        self.model.step(ids, cache, offset + self.delta)
     }
 }
 
@@ -497,34 +469,18 @@ impl LlamaProvider {
         }
 
         // Embed the expanded ids, splice in the vision features (image+video placeholder rows), and
-        // compute interleaved-M-RoPE positions over both image and video grids — dispatched to
-        // whichever decoder powers this VLM (Qwen3.6 hybrid or Qwen3-VL generic-causal).
+        // compute interleaved-M-RoPE positions over both image and video grids — through the shared
+        // `VlmDecode` seam, identical for whichever decoder powers this VLM (Qwen3.6 hybrid or
+        // Qwen3-VL generic-causal).
         let placeholders = [img_id, vid_id];
-        let (spliced, positions) = match (self.model.as_qwen35(), self.model.as_causal()) {
-            (Some(model), _) => {
-                let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
-                let spliced = model
-                    .splice_vision_features(&embeds, &expanded, &all_features, &placeholders)
-                    .map_err(to_core)?;
-                let positions = model
-                    .mrope_positions_mm(&expanded, &image_grids, img_id, &video_grids, vid_id, merge)
-                    .map_err(to_core)?;
-                (spliced, positions)
-            }
-            (None, Some(model)) => {
-                let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
-                let spliced = model
-                    .splice_vision_features(&embeds, &expanded, &all_features, &placeholders)
-                    .map_err(to_core)?;
-                let positions = model
-                    .mrope_positions_mm(&expanded, &image_grids, img_id, &video_grids, vid_id, merge)
-                    .map_err(to_core)?;
-                (spliced, positions)
-            }
-            (None, None) => {
-                return Err(CoreError::Load("qwen-vl vision requires a qwen3_5 or qwen3_vl decoder".into()))
-            }
-        };
+        let model = self.model.as_vlm();
+        let embeds = model.embed_input_ids(&input_ids(&expanded)).map_err(to_core)?;
+        let spliced = model
+            .splice_vision_features(&embeds, &expanded, &all_features, &placeholders)
+            .map_err(to_core)?;
+        let positions = model
+            .mrope_positions_mm(&expanded, &image_grids, img_id, &video_grids, vid_id, merge)
+            .map_err(to_core)?;
 
         Ok(MultimodalPrefill {
             expanded_ids: expanded,
@@ -824,67 +780,34 @@ impl TextLlm for LlamaProvider {
             match &mm {
                 // Multimodal: prefill the spliced embeds with interleaved M-RoPE + DeepStack fusion,
                 // then decode the continuation (text positions shifted by `mrope_delta`) through the
-                // shared loop. Dispatched to the Qwen3.6 hybrid or the Qwen3-VL generic-causal decoder.
+                // shared loop — one path for either backbone via the `VlmDecode` seam.
                 Some(m) => {
                     let (t, h, w, delta) = &m.positions;
                     let pos = [t.as_slice(), h.as_slice(), w.as_slice()];
-                    match (self.model.as_qwen35(), self.model.as_causal()) {
-                        (Some(model), _) => {
-                            let mut cache = model.new_cache();
-                            let first = model
-                                .decode_logits_from_embeds_with_deepstack(
-                                    &m.embeds,
-                                    pos,
-                                    &mut cache,
-                                    &m.visual_pos_mask,
-                                    &m.deepstack,
-                                )
-                                .map_err(to_core)?;
-                            let shifted = ShiftedQwen35 { model, delta: *delta };
-                            generate_from_prefill(
-                                &shifted,
-                                &mut cache,
-                                first,
-                                m.expanded_ids.clone(),
-                                &config,
-                                &req.cancel,
-                                &mut sink,
-                                constraint,
-                                should_stop_opt,
-                            )
-                            .map_err(to_core)?
-                        }
-                        (None, Some(model)) => {
-                            let mut cache = model.make_cache();
-                            let first = model
-                                .decode_logits_from_embeds_mrope_deepstack(
-                                    &m.embeds,
-                                    pos,
-                                    cache.as_mut(),
-                                    &m.visual_pos_mask,
-                                    &m.deepstack,
-                                )
-                                .map_err(to_core)?;
-                            let shifted = ShiftedCausal { model, delta: *delta };
-                            generate_from_prefill(
-                                &shifted,
-                                cache.as_mut(),
-                                first,
-                                m.expanded_ids.clone(),
-                                &config,
-                                &req.cancel,
-                                &mut sink,
-                                constraint,
-                                should_stop_opt,
-                            )
-                            .map_err(to_core)?
-                        }
-                        (None, None) => {
-                            return Err(CoreError::Load(
-                                "qwen-vl vision requires a qwen3_5 or qwen3_vl decoder".into(),
-                            ))
-                        }
-                    }
+                    let model = self.model.as_vlm();
+                    let mut cache = model.make_cache();
+                    let first = model
+                        .prefill_with_deepstack(
+                            &m.embeds,
+                            pos,
+                            cache.as_mut(),
+                            &m.visual_pos_mask,
+                            &m.deepstack,
+                        )
+                        .map_err(to_core)?;
+                    let shifted = Shifted { model, delta: *delta };
+                    generate_from_prefill(
+                        &shifted,
+                        cache.as_mut(),
+                        first,
+                        m.expanded_ids.clone(),
+                        &config,
+                        &req.cancel,
+                        &mut sink,
+                        constraint,
+                        should_stop_opt,
+                    )
+                    .map_err(to_core)?
                 }
                 None => generate_with(
                     &self.model,

@@ -1085,6 +1085,61 @@ impl crate::decode::Decode for Qwen35Model {
     }
 }
 
+impl crate::models::VlmDecode for Qwen35Model {
+    fn embed_input_ids(&self, input_ids: &Array) -> Result<Array> {
+        Qwen35Model::embed_input_ids(self, input_ids)
+    }
+
+    fn splice_vision_features(
+        &self,
+        embeds: &Array,
+        input_ids: &[i32],
+        vision_features: &Array,
+        placeholder_tokens: &[i32],
+    ) -> Result<Array> {
+        Qwen35Model::splice_vision_features(self, embeds, input_ids, vision_features, placeholder_tokens)
+    }
+
+    fn mrope_positions_mm(
+        &self,
+        input_ids: &[i32],
+        image_grid_thw: &[[i32; 3]],
+        image_token_id: i32,
+        video_grid_thw: &[[i32; 3]],
+        video_token_id: i32,
+        spatial_merge_size: i32,
+    ) -> Result<MropePositions> {
+        Qwen35Model::mrope_positions_mm(
+            self,
+            input_ids,
+            image_grid_thw,
+            image_token_id,
+            video_grid_thw,
+            video_token_id,
+            spatial_merge_size,
+        )
+    }
+
+    fn prefill_with_deepstack(
+        &self,
+        embeds: &Array,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Array],
+    ) -> Result<Array> {
+        // The hybrid decoder drives its own concrete cache; recover it (the same downcast
+        // `Qwen35Model::step` performs) before the deepstack prefill.
+        let cache = cache
+            .as_any_mut()
+            .downcast_mut::<Qwen35Cache>()
+            .ok_or_else(|| {
+                Error::Msg("Qwen35Model::prefill_with_deepstack: cache is not a Qwen35Cache".into())
+            })?;
+        self.decode_logits_from_embeds_with_deepstack(embeds, positions, cache, visual_pos_mask, deepstack)
+    }
+}
+
 /// Expand a single vision placeholder token into `count` copies — the Qwen3-VL image/video
 /// placeholder token expansion (`Qwen3VLProcessor`).
 ///
@@ -1780,6 +1835,27 @@ mod tests {
         assert!(
             fused_vs_unfused > 1e-3,
             "DeepStack fusion did not change the logits (features dropped?): max abs diff {fused_vs_unfused}"
+        );
+
+        // The provider drives this decoder through the `VlmDecode` seam, which boxes the cache via
+        // `Decode::make_cache` and downcasts it back to `Qwen35Cache` inside `prefill_with_deepstack`.
+        // That trait path must reproduce the inherent fused logits bit-for-bit (same model, inputs,
+        // and a fresh cache).
+        let mut trait_cache = crate::decode::Decode::make_cache(&model);
+        let via_trait = crate::models::VlmDecode::prefill_with_deepstack(
+            &model,
+            &spliced,
+            [&t, &h, &w],
+            trait_cache.as_mut(),
+            &visual_pos_mask,
+            &deepstack,
+        )
+        .unwrap();
+        let tv = via_trait.as_dtype(Dtype::Float32).unwrap().as_slice::<f32>().to_vec();
+        let trait_vs_inherent = fv.iter().zip(&tv).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert_eq!(
+            trait_vs_inherent, 0.0,
+            "VlmDecode::prefill_with_deepstack must equal the inherent fused path (cache downcast seam)"
         );
     }
 
