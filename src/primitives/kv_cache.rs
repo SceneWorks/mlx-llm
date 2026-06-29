@@ -57,6 +57,19 @@ pub trait KvCache {
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
     fn reset(&mut self);
 
+    /// Resident bytes the cache **actually stores** right now — the faithful footprint of its
+    /// representation, summed over every layer (`elem_count × dtype_size` of each stored array, via
+    /// [`Array::nbytes`](mlx_rs::Array::nbytes)). This is what the KV-quant bench compares across
+    /// methods: a dense cache reports its full K+V bytes; a compressing cache reports only its
+    /// compressed blocks (+ any dense sink). It deliberately ignores transient `update()` return
+    /// values and allocator slack — measure it at a quiescent point, after the transients are dropped.
+    ///
+    /// The default returns `0` ("not reported") for cache impls that have no meaningful static
+    /// footprint to expose (e.g. the pool-backed paged cache, whose bytes live in a shared pool).
+    fn resident_bytes(&self) -> usize {
+        0
+    }
+
     /// Downcast hook so a decoder can recover its concrete cache from a `&mut dyn KvCache` — the
     /// hybrid Qwen3.6 cache (recurrent linear-attention state + KV) is driven natively rather than
     /// through the softmax-only [`KvCache::update`] path.
@@ -173,6 +186,15 @@ impl KvCache for ContiguousKvCache {
         }
     }
 
+    fn resident_bytes(&self) -> usize {
+        // The dense cache stores exactly the merged K and V per layer; sum their byte footprints.
+        self.layers
+            .iter()
+            .flatten()
+            .map(|(k, v)| k.nbytes() + v.nbytes())
+            .sum()
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -209,6 +231,13 @@ pub trait Quantizer {
     /// Batch size (axis 0 extent) a block holds. Used for [`KvCache::batch_size`] without a decode.
     fn batch_size(&self, block: &Self::Block) -> i32;
 
+    /// Resident bytes the **compressed** block actually occupies — `elem_count × dtype_size`
+    /// (via [`Array::nbytes`](mlx_rs::Array::nbytes)) summed over every array the block stores. This
+    /// is the faithful footprint the KV-quant bench charges the method for: a lossless identity block
+    /// reports its full K+V bytes, while a real method (RVQ codes + codebooks) reports only its
+    /// compressed payload, so the bench's memory column drops for a method that stores fewer bytes.
+    fn block_bytes(&self, block: &Self::Block) -> usize;
+
     /// Compact a block's batch axis to keep only the rows in `keep` (indices into the current batch
     /// axis), in order — the compressed-path equivalent of [`KvCache::retain_sequences`].
     fn retain_sequences(&self, block: &Self::Block, keep: &Array) -> Result<Self::Block>;
@@ -242,6 +271,11 @@ impl Quantizer for IdentityQuantizer {
 
     fn batch_size(&self, block: &Self::Block) -> i32 {
         block.0.shape()[0]
+    }
+
+    fn block_bytes(&self, block: &Self::Block) -> usize {
+        // Identity stores K and V verbatim — its footprint is exactly their bytes (no compression).
+        block.0.nbytes() + block.1.nbytes()
     }
 
     fn retain_sequences(&self, block: &Self::Block, keep: &Array) -> Result<Self::Block> {
@@ -588,6 +622,28 @@ impl<Q: Quantizer + 'static> KvCache for QuantizedKvCache<Q> {
             store.sink = None;
             store.blocks.clear();
         }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        // Faithful to the compressed representation: the dense sink's bytes (if any) plus every
+        // compressed block's own footprint, as reported by the quantizer — never the transient
+        // full-context array `update()`/`materialize` hand back to the decoder.
+        self.layers
+            .iter()
+            .map(|store| {
+                let sink = store
+                    .sink
+                    .as_ref()
+                    .map(|(k, v)| k.nbytes() + v.nbytes())
+                    .unwrap_or(0);
+                let blocks: usize = store
+                    .blocks
+                    .iter()
+                    .map(|b| self.quantizer.block_bytes(b))
+                    .sum();
+                sink + blocks
+            })
+            .sum()
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -945,6 +1001,39 @@ mod tests {
         }
         assert_eq!(windowed.sink_config().window(), Some(3));
         assert_eq!(windowed.offset(), contig.offset()); // no eviction: all 7 retained
+    }
+
+    /// `resident_bytes` is faithful to the stored representation and matches between the dense cache
+    /// and the identity-quantized cache (identity stores the same bytes), and grows with content.
+    #[test]
+    fn resident_bytes_identity_matches_dense() {
+        let mut contig = ContiguousKvCache::new(2);
+        let mut quant = QuantizedKvCache::new(2, IdentityQuantizer);
+        assert_eq!(contig.resident_bytes(), 0);
+        assert_eq!(quant.resident_bytes(), 0);
+
+        let steps = [
+            arange4(1, 2, 3, 4),
+            arange4(1, 2, 1, 4),
+            arange4(1, 2, 5, 4),
+        ];
+        for layer in 0..2 {
+            for s in &steps {
+                contig.update(layer, s, s).unwrap();
+                quant.update(layer, s, s).unwrap();
+            }
+        }
+        // Identity stores the exact same arrays as dense, so its resident footprint is identical.
+        assert_eq!(quant.resident_bytes(), contig.resident_bytes());
+        // And it is the real byte count: 2 layers × (k+v) × 9 positions × 2 heads × 4 head_dim × 2
+        // bytes (bf16... but arange4 is f32 => 4 bytes). 2*2*9*2*4*4 = 4608.
+        assert_eq!(contig.resident_bytes(), 2 * 2 * 9 * 2 * 4 * 4);
+
+        // After reset the footprint returns to 0.
+        contig.reset();
+        quant.reset();
+        assert_eq!(contig.resident_bytes(), 0);
+        assert_eq!(quant.resident_bytes(), 0);
     }
 
     /// The cache is usable purely through `&mut dyn KvCache`, including the `as_any_mut` downcast.
