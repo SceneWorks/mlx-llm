@@ -22,11 +22,13 @@
 pub mod bit_packing;
 pub mod codebook;
 pub mod linear;
+pub mod rvq;
 pub mod scalar_quant;
 
 pub use bit_packing::{bit_pack, bit_unpack, packed_len};
 pub use codebook::{lloyd_max, ScalarCodebook};
 pub use linear::QuantizedLinear;
+pub use rvq::{estimate_inner_product, RvqBlock, RvqQuantizer};
 pub use scalar_quant::{
     affine_dequantize, affine_quantize, dequantize_affine, quantize_affine, AffineParams,
     QuantizedGroups,

@@ -19,7 +19,10 @@
 //! `dense` ([`ContiguousKvCache`]) and `identity` (`QuantizedKvCache<IdentityQuantizer>`); registering
 //! RVQ (story D) is one more `Method::new(...)` line — see [`mlx_llm::primitives::kv_bench`].
 
-use mlx_llm::primitives::kv_bench::{default_methods, format_table, run_bench, BenchConfig};
+use mlx_llm::primitives::kv_bench::{
+    format_table, rvq_methods, run_bench, BenchConfig, Method,
+};
+use mlx_llm::primitives::{ContiguousKvCache, IdentityQuantizer, QuantizedKvCache};
 
 fn main() {
     if let Err(e) = run() {
@@ -77,7 +80,17 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cfg.context_lengths, cfg.num_layers, cfg.n_kv_heads, cfg.head_dim
     );
 
-    let result = run_bench(&cfg, &default_methods())?;
+    // Method set: dense baseline first, then the lossless identity seam, then the RVQ methods built
+    // for THIS sweep's head_dim (so a non-default --head-dim still gets correctly-sized RVQ codebooks).
+    let mut methods = vec![
+        Method::new("dense", |n| Box::new(ContiguousKvCache::new(n))),
+        Method::new("identity", |n| {
+            Box::new(QuantizedKvCache::new(n, IdentityQuantizer))
+        }),
+    ];
+    methods.extend(rvq_methods(cfg.head_dim));
+
+    let result = run_bench(&cfg, &methods)?;
     print!("{}", format_table(&result));
     Ok(())
 }
