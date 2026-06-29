@@ -9,14 +9,20 @@
 //!
 //! ## What is measured
 //! - **Distortion** ([`DistortionObserver`]): per-method reconstruction error of the cache's decoded
-//!   keys/values vs. the dense baseline's, accumulated as mean-squared error (MSE) over every
-//!   update. A lossless method (the [`IdentityQuantizer`](crate::primitives::IdentityQuantizer))
-//!   reports ~0.
-//! - **Peak KV-memory** ([`MemoryObserver`]): MLX active-memory high-water mark while the cache for a
-//!   method is resident, via [`mlx_rs::memory`]. The dense baseline's peak is the reference; a method
-//!   that compresses reports a lower peak (and a compression ratio).
+//!   keys/values vs. the dense baseline's, accumulated as mean-squared error (MSE) over **both K and
+//!   V across every layer** at every update — the mean over the full KV path, so a lossy method's
+//!   true error is captured. A lossless method (the
+//!   [`IdentityQuantizer`](crate::primitives::IdentityQuantizer)) reports ~0.
+//! - **Resident KV-memory** ([`KvCache::resident_bytes`](crate::primitives::KvCache::resident_bytes)):
+//!   the bytes the cache **actually stores** (summed `nbytes` of its compressed-or-dense
+//!   representation), sampled at a quiescent point after the fill loop completes. This is faithful to
+//!   a method's compressed footprint and immune to the transient full-context concats + allocator
+//!   fragmentation that dominate an active-memory high-water mark (which masked a compressing method's
+//!   benefit). The dense baseline's footprint is the reference; a method that stores fewer bytes
+//!   reports a lower footprint (and a >1× compression ratio); identity reports ~1.0× (exactly equal).
 //! - **Throughput** ([`LatencyObserver`]): wall-clock tokens/sec of the update path (the per-step
-//!   `update` + decode-and-materialize that a decoder pays), averaged over the swept steps.
+//!   `update` + decode-and-materialize that a decoder pays), averaged over the swept steps after a
+//!   discarded warm-up step so the column is reproducible.
 //!
 //! ## Method-agnostic by construction
 //! The driver takes a `Vec<Method>` where each [`Method`] is `{ name, builder }` and `builder` is a
@@ -27,15 +33,16 @@
 //!
 //! At this point the only available cache impls are
 //! [`ContiguousKvCache`](crate::primitives::ContiguousKvCache) (the dense baseline) and
-//! `QuantizedKvCache<IdentityQuantizer>` (story B); the end-to-end test below validates the harness
-//! with exactly those two — identity must show ~0 quality delta and equal memory vs dense.
+//! `QuantizedKvCache<IdentityQuantizer>` (story B); the `#[ignore]`d end-to-end driver test below
+//! validates the harness with exactly those two — identity must show ~0 quality delta and ~1.0×
+//! resident memory vs dense.
 //!
 //! ## Memory safety
 //! Unbounded MLX sweeps crash the machine, so the harness is bounded by default
 //! ([`BenchConfig::small`]): few short contexts, batch 1, small head geometry. It installs an MLX
 //! memory limit + cache-cap ([`BenchConfig::apply_mlx_limits`]), and **clears the MLX buffer cache
-//! and resets the peak counter between every (method, context) run** so freed KV returns to the OS
-//! instead of accumulating. Larger sweeps are opt-in by constructing a wider [`BenchConfig`].
+//! between every (method, context) run** so freed KV returns to the OS instead of accumulating.
+//! Larger sweeps are opt-in by constructing a wider [`BenchConfig`].
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -275,8 +282,9 @@ pub struct BenchRow {
     pub method: String,
     /// Context length (total positions reached) this row was measured at.
     pub context: i32,
-    /// Peak MLX-resident bytes attributable to this run.
-    pub peak_memory_bytes: usize,
+    /// Resident KV bytes the cache actually stores at this context (its faithful compressed-or-dense
+    /// footprint, [`KvCache::resident_bytes`]) — not a transient/high-water active-memory mark.
+    pub resident_memory_bytes: usize,
     /// Mean reconstruction MSE vs. the dense baseline at this context (`0.0` for the baseline itself).
     pub quality_delta_mse: f64,
     /// Update-path throughput in tokens/sec.
@@ -316,32 +324,60 @@ fn segment_plan(cfg: &BenchConfig, ctx: i32) -> Vec<i32> {
     segs
 }
 
-/// Drive one cache through the segment plan for `ctx`, measuring throughput and (when a
-/// `distortion` observer + matching `reference` segments are supplied) reconstruction error against
-/// the dense baseline. Returns `(peak_memory_bytes, tokens_per_sec, mean_mse)`.
+/// Per-segment reference snapshot for the distortion comparison: the dense baseline's decoded
+/// `(keys, values)` for **every layer** at one segment. A method run diffs its own decoded K and V,
+/// layer-by-layer, against these — so distortion is the mean reconstruction error over the full KV
+/// path (both tensors, all layers), not just one slice.
+type RefSegment = Vec<(Array, Array)>;
+
+/// Drive one cache through the segment plan for `ctx`, measuring resident KV footprint, throughput
+/// and (when matching `reference` segments are supplied) reconstruction error against the dense
+/// baseline. Returns `(resident_bytes, tokens_per_sec, mean_mse, decoded_reference)`.
 ///
-/// `reference` is `Some(per-segment dense decoded keys)` for a method, `None` for the baseline run
-/// itself (which *produces* the reference). The same fixed-seed [`synth`] inputs are fed to both, so
-/// the only difference in decoded output is the method's compression error.
+/// `reference` is `Some(per-segment dense decoded (K,V) for every layer)` for a method, `None` for
+/// the baseline run itself (which *produces* the reference). The same fixed-seed [`synth`] inputs are
+/// fed to both, so the only difference in decoded output is the method's compression error.
+///
+/// **Memory methodology (sc-8534 fix).** The reported number is the cache's *resident* footprint —
+/// [`KvCache::resident_bytes`], the summed `nbytes` of the arrays the cache actually stores — sampled
+/// at a **quiescent** point: after every update for this config completes, we drop all transient
+/// full-context `update()` return arrays and force one MLX `eval` so nothing is left lazily pending,
+/// then read the footprint. This is faithful to a method's compressed representation and is immune to
+/// the transient full-context concats + allocator fragmentation that dominate an active-memory
+/// high-water mark (which masked a compressing method's benefit and made identity read a nonsensical
+/// 0.85×).
 #[allow(clippy::type_complexity)]
 fn run_one(
     cfg: &BenchConfig,
     method: &Method,
     ctx: i32,
-    reference: Option<&[Array]>,
-) -> Result<(usize, f64, f64, Vec<Array>)> {
-    // Fresh cache + clean slate. Clearing the buffer cache and resetting peak BEFORE we start is what
-    // keeps successive runs from accumulating freed KV in the MLX allocator.
+    reference: Option<&[RefSegment]>,
+) -> Result<(usize, f64, f64, Vec<RefSegment>)> {
+    // Fresh cache + clean slate. Clearing the buffer cache BEFORE we start keeps successive runs from
+    // accumulating freed KV in the MLX allocator.
     memory::clear_cache();
     let mut cache = (method.builder)(cfg.num_layers);
-    let mem = MemoryObserver::start();
     let mut lat = LatencyObserver::new();
     let mut dist = DistortionObserver::new();
 
     let plan = segment_plan(cfg, ctx);
-    // Decoded keys captured per segment (layer 0) — this becomes the reference for later methods, and
-    // is what we diff against `reference` for a method run.
-    let mut decoded_keys: Vec<Array> = Vec::with_capacity(plan.len());
+    // Decoded (K, V) per layer per segment — this becomes the reference for later methods, and is
+    // what a method run diffs against `reference`.
+    let mut decoded: Vec<RefSegment> = Vec::with_capacity(plan.len());
+
+    // Warm-up: run the first segment once and discard its timing so throughput is reproducible (the
+    // first update pays one-time graph-build / allocator-warm costs that swing tok/s run-to-run).
+    if let Some(&first) = plan.first() {
+        let seed = (ctx as u64) << 8;
+        let wk = synth(cfg, first, seed)?;
+        let wv = synth(cfg, first, seed.wrapping_add(1))?;
+        for layer in 0..cfg.num_layers {
+            let (kk, vv) = cache.update(layer, &wk, &wv)?;
+            eval([&kk, &vv])?;
+        }
+        cache.reset();
+        memory::clear_cache();
+    }
 
     let mut seed = (ctx as u64) << 8;
     for (seg_idx, &step) in plan.iter().enumerate() {
@@ -351,37 +387,50 @@ fn run_one(
         seed = seed.wrapping_add(2);
 
         let t0 = Instant::now();
-        let mut last_k = k.clone();
+        let mut seg: RefSegment = Vec::with_capacity(cfg.num_layers);
         for layer in 0..cfg.num_layers {
             let (kk, vv) = cache.update(layer, &k, &v)?;
-            if layer == 0 {
-                last_k = kk.clone();
-            }
-            // Force materialization so timing/memory reflect the real decode-path work, not lazy
-            // graph deferral.
+            // Force materialization so timing reflects the real decode-path work, not lazy deferral.
             eval([&kk, &vv])?;
+            seg.push((kk, vv));
         }
         let elapsed = t0.elapsed().as_secs_f64();
         lat.record(step as u64, elapsed);
 
-        // Distortion: compare this method's full decoded layer-0 keys against the dense reference's.
+        // Distortion: compare this method's decoded K and V against the dense reference's, over every
+        // layer. The mean over the full KV path is the faithful reconstruction error.
         if let Some(refs) = reference {
-            if let Some(r) = refs.get(seg_idx) {
-                dist.observe(r, &last_k)?;
+            if let Some(ref_seg) = refs.get(seg_idx) {
+                for ((rk, rv), (ck, cv)) in ref_seg.iter().zip(seg.iter()) {
+                    dist.observe(rk, ck)?;
+                    dist.observe(rv, cv)?;
+                }
             }
         }
-        decoded_keys.push(last_k);
+        decoded.push(seg);
     }
 
-    let peak = mem.peak_delta_bytes();
     let tps = lat.tokens_per_sec();
     let mse = dist.mean_mse();
 
-    // Drop the cache and clear the buffer cache so the next run starts from a clean allocator.
+    // Quiescent memory sample. `resident_bytes` sums `nbytes` of exactly the arrays the cache stores
+    // (its compressed representation + any dense sink), so it is inherently free of the transient
+    // full-context `update()` returns and allocator slack that inflate an active-memory high-water
+    // mark. We read it after the fill loop has fully run.
+    let resident = cache.resident_bytes();
+
+    // Method runs don't reuse `decoded` as a reference, so drop it; baseline runs return it.
+    if reference.is_some() {
+        drop(decoded);
+        drop(cache);
+        memory::clear_cache();
+        return Ok((resident, tps, mse, Vec::new()));
+    }
+
     drop(cache);
     memory::clear_cache();
 
-    Ok((peak, tps, mse, decoded_keys))
+    Ok((resident, tps, mse, decoded))
 }
 
 /// Run the full method × context sweep and return every measured row.
@@ -391,8 +440,8 @@ fn run_one(
 /// against it. (Pass `ContiguousKvCache` first.)
 ///
 /// Memory safety: [`BenchConfig::apply_mlx_limits`] is installed once up front, every context is
-/// guarded against the config's estimated dense KV budget, and the buffer cache is cleared + the peak
-/// counter reset between every run inside [`run_one`].
+/// guarded against the config's estimated dense KV budget, and the buffer cache is cleared between
+/// every run inside [`run_one`].
 pub fn run_bench(cfg: &BenchConfig, methods: &[Method]) -> Result<BenchResult> {
     assert!(
         cfg.context_lengths.len() >= 2,
@@ -419,21 +468,21 @@ pub fn run_bench(cfg: &BenchConfig, methods: &[Method]) -> Result<BenchResult> {
         }
 
         // Baseline first → produces the reference decoded KV for this context.
-        let (base_peak, base_tps, _base_mse, reference) = run_one(cfg, &methods[0], ctx, None)?;
+        let (base_resident, base_tps, _base_mse, reference) = run_one(cfg, &methods[0], ctx, None)?;
         rows.push(BenchRow {
             method: methods[0].name.clone(),
             context: ctx,
-            peak_memory_bytes: base_peak,
+            resident_memory_bytes: base_resident,
             quality_delta_mse: 0.0,
             tokens_per_sec: base_tps,
         });
 
         for method in &methods[1..] {
-            let (peak, tps, mse, _decoded) = run_one(cfg, method, ctx, Some(&reference))?;
+            let (resident, tps, mse, _decoded) = run_one(cfg, method, ctx, Some(&reference))?;
             rows.push(BenchRow {
                 method: method.name.clone(),
                 context: ctx,
-                peak_memory_bytes: peak,
+                resident_memory_bytes: resident,
                 quality_delta_mse: mse,
                 tokens_per_sec: tps,
             });
@@ -450,13 +499,13 @@ pub fn run_bench(cfg: &BenchConfig, methods: &[Method]) -> Result<BenchResult> {
 /// in MB and (for non-baseline methods) as a compression ratio vs. the dense baseline at the same
 /// context.
 pub fn format_table(result: &BenchResult) -> String {
-    // Index baseline (first method) peak per context for the ratio column.
+    // Index baseline (first method) resident bytes per context for the ratio column.
     let baseline = result.rows.first().map(|r| r.method.clone());
-    let mut base_peak: BTreeMap<i32, usize> = BTreeMap::new();
+    let mut base_resident: BTreeMap<i32, usize> = BTreeMap::new();
     if let Some(ref base) = baseline {
         for r in &result.rows {
             if &r.method == base {
-                base_peak.insert(r.context, r.peak_memory_bytes);
+                base_resident.insert(r.context, r.resident_memory_bytes);
             }
         }
     }
@@ -478,16 +527,16 @@ pub fn format_table(result: &BenchResult) -> String {
     out.push_str(&"-".repeat(74));
     out.push('\n');
     for r in &result.rows {
-        let ratio = base_peak
+        let ratio = base_resident
             .get(&r.context)
-            .filter(|_| r.peak_memory_bytes > 0)
-            .map(|&b| format!("{:.2}x", b as f64 / r.peak_memory_bytes as f64))
+            .filter(|_| r.resident_memory_bytes > 0)
+            .map(|&b| format!("{:.2}x", b as f64 / r.resident_memory_bytes as f64))
             .unwrap_or_else(|| "-".to_string());
         out.push_str(&format!(
             "{:<14} {:>7} {:>12.2} {:>9} {:>16.3e} {:>12.1}\n",
             r.method,
             r.context,
-            r.peak_memory_bytes as f64 / 1e6,
+            r.resident_memory_bytes as f64 / 1e6,
             ratio,
             r.quality_delta_mse,
             r.tokens_per_sec,
@@ -579,10 +628,62 @@ mod tests {
         }
     }
 
-    /// End-to-end harness validation (the acceptance check): identity-vs-dense over the small safe
-    /// sweep must produce a table with identity showing ~0 quality delta and ~equal peak memory. This
-    /// is bounded (no model, tiny synthetic KV) so it runs in the default suite.
+    /// Lightweight `run_one` check (stays in the default suite): a tiny 2-layer, ctx-4 sweep proves
+    /// the two fixes faithfully — identity's resident footprint equals dense's exactly, and the
+    /// distortion (now accumulated over **both K and V across every layer**) is exactly 0 for the
+    /// lossless identity path. This exercises the real measurement code (not just the observers) but
+    /// is cheap enough to run by default.
     #[test]
+    fn run_one_identity_resident_and_distortion_faithful() {
+        let cfg = BenchConfig {
+            num_layers: 2,
+            batch: 1,
+            n_kv_heads: 2,
+            head_dim: 8,
+            prefill_tokens: 2,
+            context_lengths: vec![4],
+            ..BenchConfig::small()
+        };
+        cfg.apply_mlx_limits();
+
+        let dense = Method::new("dense", |n| {
+            Box::new(crate::primitives::ContiguousKvCache::new(n))
+        });
+        let ident = Method::new("identity", |n| {
+            use crate::primitives::{IdentityQuantizer, QuantizedKvCache};
+            Box::new(QuantizedKvCache::new(n, IdentityQuantizer))
+        });
+
+        // Baseline produces the per-layer (K,V) reference for every segment.
+        let (dense_resident, dense_tps, _mse, reference) = run_one(&cfg, &dense, 4, None).unwrap();
+        // Reference must carry every layer's K and V for every segment (proves the path is full-KV).
+        assert!(reference
+            .iter()
+            .all(|seg| seg.len() == cfg.num_layers as usize));
+
+        let (ident_resident, ident_tps, ident_mse, _) =
+            run_one(&cfg, &ident, 4, Some(&reference)).unwrap();
+
+        // Faithful resident: identity stores the exact same bytes as dense → equal, non-zero.
+        assert!(dense_resident > 0, "dense must store bytes");
+        assert_eq!(
+            ident_resident, dense_resident,
+            "identity resident must equal dense resident byte-for-byte"
+        );
+        // Distortion over K+V, all layers, is exactly 0 for the lossless identity round-trip.
+        assert_eq!(ident_mse, 0.0, "identity (K+V all layers) must be lossless");
+        assert!(dense_tps > 0.0 && ident_tps > 0.0, "tok/s must be measured");
+    }
+
+    /// End-to-end harness validation (the acceptance check): identity-vs-dense over the small safe
+    /// sweep must produce a table with identity showing ~0 quality delta and ~1.0× resident memory.
+    ///
+    /// Gated `#[ignore]`: it spins up the full `run_bench` driver (the heavy path) and must not run in
+    /// the default `cargo test` unit suite. Run explicitly with
+    /// `cargo test -p mlx-llm identity_matches_dense_end_to_end -- --ignored`. The lightweight
+    /// observer-unit tests above stay in the default suite.
+    #[test]
+    #[ignore = "heavy run_bench driver; run with --ignored"]
     fn identity_matches_dense_end_to_end() {
         let cfg = BenchConfig::small();
         let result = run_bench(&cfg, &default_methods()).unwrap();
@@ -602,9 +703,10 @@ mod tests {
             assert!(r.tokens_per_sec > 0.0, "tok/s must be measured");
         }
 
-        // Identity peak memory ≈ dense peak memory at each context (same stored tensors). Allow a
-        // generous tolerance: the MLX allocator's peak is noisy, but identity stores the exact same
-        // arrays as dense so it must not balloon.
+        // Identity resident memory == dense resident memory at each context: identity stores the exact
+        // same arrays, so its faithful footprint is byte-for-byte equal (ratio exactly 1.0). The
+        // resident measure is deterministic (summed `nbytes`), not a noisy allocator high-water mark,
+        // so the tolerance is tight.
         for &ctx in &cfg.context_lengths {
             let dense = result
                 .rows
@@ -616,15 +718,14 @@ mod tests {
                 .iter()
                 .find(|r| r.method == "identity" && r.context == ctx)
                 .unwrap();
-            if dense.peak_memory_bytes > 0 {
-                let ratio = ident.peak_memory_bytes as f64 / dense.peak_memory_bytes as f64;
-                assert!(
-                    (0.5..=2.0).contains(&ratio),
-                    "identity peak {} should be ~equal to dense peak {} at ctx={ctx} (ratio {ratio:.2})",
-                    ident.peak_memory_bytes,
-                    dense.peak_memory_bytes
-                );
-            }
+            assert!(dense.resident_memory_bytes > 0, "dense must store bytes");
+            let ratio = ident.resident_memory_bytes as f64 / dense.resident_memory_bytes as f64;
+            assert!(
+                (0.98..=1.02).contains(&ratio),
+                "identity resident {} should equal dense resident {} at ctx={ctx} (ratio {ratio:.3})",
+                ident.resident_memory_bytes,
+                dense.resident_memory_bytes
+            );
         }
 
         // The table renders and mentions both methods.
