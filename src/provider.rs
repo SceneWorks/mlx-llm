@@ -991,13 +991,33 @@ impl TextLlm for LlamaProvider {
 /// Qwen3.6 cache, or for an unimplemented method/bit-width, it surfaces a clean
 /// [`CoreError::Unsupported`] — never a silent dense fallback and never a crash.
 fn resolve_kv_quant(req: Option<KvCacheQuant>, model: &Decoder) -> CoreResult<KvQuant> {
+    // Map the loaded decoder to the seam the pure resolver needs: `Some(head_dim)` for the generic
+    // Causal decoder (the only one that can swap its dense cache for a `QuantizedKvCache`), `None`
+    // for the hybrid Qwen3.6 cache (which cannot be quantized).
+    let causal_head_dim = match model {
+        Decoder::Causal(m) => Some(m.config().head_dim),
+        Decoder::Qwen35(_) => None,
+    };
+    resolve_kv_quant_inner(req, causal_head_dim)
+}
+
+/// Pure KV-cache-quant resolution (sc-8533), decoupled from the loaded model so both unsupported
+/// paths are unit-testable without weights: `causal_head_dim` is `Some(head_dim)` for the generic
+/// Causal decoder and `None` for a non-supporting (hybrid Qwen3.6) decoder. `req == None` ⇒ `None`
+/// (dense, the default). A `Some(_)` request on a non-Causal decoder, or with an out-of-range
+/// bit-width/method, surfaces a clean [`CoreError::Unsupported`] — never a silent dense fallback,
+/// never a panic.
+fn resolve_kv_quant_inner(
+    req: Option<KvCacheQuant>,
+    causal_head_dim: Option<i32>,
+) -> CoreResult<KvQuant> {
     let Some(cfg) = req else {
         return Ok(None);
     };
     // Only the generic softmax-attention decoder can swap its dense cache for a `QuantizedKvCache`;
     // the hybrid Qwen3.6 cache cannot, so a request there is a clean `Unsupported` (no silent dense
     // fallback, no crash).
-    let Decoder::Causal(m) = model else {
+    let Some(head_dim) = causal_head_dim else {
         return Err(CoreError::Unsupported(
             "KV-cache quantization is not supported for this model (the hybrid Qwen3.6 cache cannot \
              be quantized)"
@@ -1011,8 +1031,7 @@ fn resolve_kv_quant(req: Option<KvCacheQuant>, model: &Decoder) -> CoreResult<Kv
             // identical quantizer every time. `RvqQuantizer::new` returns `Unsupported` for a
             // bit-width outside {1,2,4} or a non-Hadamard-compatible head_dim, surfaced here as a
             // clean contract error rather than a panic.
-            let q = RvqQuantizer::new(m.config().head_dim, cfg.bits as i32, RVQ_SEED)
-                .map_err(to_core)?;
+            let q = RvqQuantizer::new(head_dim, cfg.bits as i32, RVQ_SEED).map_err(to_core)?;
             Ok(Some(q))
         }
     }
@@ -1273,6 +1292,42 @@ mod tests {
             "text_config": { "model_type": "qwen3_vl_text" },
             "vision_config": { "model_type": "qwen3_vl", "depth": 27 }
         })
+    }
+
+    #[test]
+    fn resolve_kv_quant_rejects_unsupported_paths_cleanly() {
+        // sc-8533: the KV-cache-quant resolver must surface a clean `Unsupported` (never a panic,
+        // never a silent dense fallback) on both unsupported paths.
+
+        // (a) Out-of-range bit-width on the supporting (Causal) decoder. head_dim=128 is
+        // Hadamard-compatible, so bits=3 isolates the bit-width rejection inside `RvqQuantizer::new`.
+        let bad_bits = resolve_kv_quant_inner(Some(KvCacheQuant::rvq(3)), Some(128));
+        assert!(
+            matches!(bad_bits, Err(CoreError::Unsupported(_))),
+            "bits=3 must be a clean Unsupported, got {bad_bits:?}"
+        );
+
+        // (b) A non-supporting decoder (the hybrid Qwen3.6 cache, modeled as `None` head_dim): any
+        // KV-quant request is rejected before it ever reaches the quantizer.
+        let non_causal = resolve_kv_quant_inner(Some(KvCacheQuant::rvq(4)), None);
+        assert!(
+            matches!(non_causal, Err(CoreError::Unsupported(_))),
+            "non-Causal decoder must be a clean Unsupported, got {non_causal:?}"
+        );
+
+        // Control: a valid request on the supporting decoder resolves to a quantizer (no error), and
+        // the no-request path stays dense — so the rejections above are real gates, not blanket fails.
+        assert!(
+            matches!(
+                resolve_kv_quant_inner(Some(KvCacheQuant::rvq(4)), Some(128)),
+                Ok(Some(_))
+            ),
+            "a valid rvq(4) on a Causal head_dim=128 decoder must resolve to a quantizer"
+        );
+        assert!(
+            matches!(resolve_kv_quant_inner(None, Some(128)), Ok(None)),
+            "no kv_cache_quant request must stay dense"
+        );
     }
 
     #[test]
