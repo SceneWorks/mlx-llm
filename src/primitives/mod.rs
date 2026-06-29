@@ -39,7 +39,7 @@ pub use kv_cache::{
 pub use nn::{conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, soft_cap};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{Projection, QuantSpec};
-pub use quant::QuantizedLinear;
+pub use quant::{QuantizedLinear, RvqBlock, RvqQuantizer};
 pub use rope::{apply_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
 pub use weights::Weights;

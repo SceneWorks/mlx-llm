@@ -545,17 +545,51 @@ pub fn format_table(result: &BenchResult) -> String {
     out
 }
 
-/// Build the default method set for the harness as it stands today: the dense baseline first, then
-/// the identity-quantized cache. Registering RVQ later (story D) appends one more [`Method`] here (or
-/// at the call site) — the driver and observers do not change.
+/// Build the default method set for the harness: the dense baseline first, then the identity-quantized
+/// cache (lossless seam check), then the **RVQ** methods (story D) at `b=1` and `b=2`. The RVQ methods
+/// are what produce the epic's memory/quality/throughput numbers; the driver and observers do not
+/// change to add them — registering a method is one `Method::new(...)` line.
+///
+/// The RVQ methods are built for the bench's configured `head_dim` via [`rvq_methods`]; this default
+/// set assumes the [`BenchConfig::small`] head_dim of 64 (Hadamard-compatible). For a different
+/// head_dim, build the method list with [`rvq_methods`] at the call site.
 pub fn default_methods() -> Vec<Method> {
     use crate::primitives::{ContiguousKvCache, IdentityQuantizer, QuantizedKvCache};
-    vec![
+    let mut methods = vec![
         Method::new("dense", |n| Box::new(ContiguousKvCache::new(n))),
         Method::new("identity", |n| {
             Box::new(QuantizedKvCache::new(n, IdentityQuantizer))
         }),
-    ]
+    ];
+    methods.extend(rvq_methods(BenchConfig::small().head_dim));
+    methods
+}
+
+/// Build the RVQ [`Method`]s (`rvq-b1`, `rvq-b2`) for a given `head_dim`, with a dense first-token
+/// sink (attention-sink semantics) so the first position stays lossless. Each method plugs an
+/// [`RvqQuantizer`](crate::primitives::RvqQuantizer) into a
+/// [`QuantizedKvCache`](crate::primitives::QuantizedKvCache). Returns an empty list (with a warning to
+/// stderr) if `head_dim` is not Hadamard-compatible, so a sweep at an incompatible geometry still runs
+/// the dense/identity baselines rather than panicking.
+pub fn rvq_methods(head_dim: i32) -> Vec<Method> {
+    use crate::primitives::{QuantizedKvCache, RvqQuantizer, SinkConfig};
+
+    let mut out = Vec::new();
+    for b in [1i32, 2] {
+        // Probe constructibility once; if the geometry is unsupported, skip (don't panic the sweep).
+        if RvqQuantizer::new(head_dim, b, 42).is_err() {
+            eprintln!(
+                "skip rvq-b{b}: head_dim {head_dim} unsupported (not Hadamard-compatible / bad bits)"
+            );
+            continue;
+        }
+        out.push(Method::new(format!("rvq-b{b}"), move |n| {
+            let q = RvqQuantizer::new(head_dim, b, 42)
+                .expect("rvq quantizer constructible (probed at registration)");
+            Box::new(QuantizedKvCache::with_sink(n, q, SinkConfig::keep_first(1)))
+        }));
+    }
+    out
 }
 
 #[cfg(test)]
