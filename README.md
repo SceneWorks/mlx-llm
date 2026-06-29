@@ -50,6 +50,17 @@ tokenizer.json` to copy a tokenizer in for end-to-end use):
 cargo run --release --example convert_gguf -- model.gguf /path/to/out --tokenizer tokenizer.json
 ```
 
+Benchmark KV-cache quantization methods — emits a method × {KV-memory, quality-delta vs dense, tok/s}
+comparison table at multiple context lengths. The harness is method-agnostic (any `KvCache`/`Quantizer`)
+and bounded for memory safety by default; registering a new method (e.g. RVQ) is one `Method::new(...)`
+line. See `src/primitives/kv_bench.rs`.
+
+```sh
+cargo run --release --example kv_quant_bench
+# wider, opt-in sweep:
+cargo run --release --example kv_quant_bench -- --contexts 128,256,512 --layers 8 --kv-heads 8
+```
+
 Serve an **OpenAI-compatible** chat endpoint (`server/`, a separate bin so its HTTP deps stay out of
 the engine — streaming SSE, single model, backend-neutral over the `core_llm::TextLlm` contract):
 

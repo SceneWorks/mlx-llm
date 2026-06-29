@@ -15,6 +15,7 @@
 
 pub mod attention;
 pub mod gated_delta;
+pub mod kv_bench;
 pub mod kv_cache;
 pub mod nn;
 pub mod paged_kv_cache;
@@ -27,6 +28,10 @@ pub mod weights;
 pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, AttnMask};
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+};
+pub use kv_bench::{
+    default_methods, format_table, run_bench, BenchConfig, BenchResult, BenchRow, CacheBuilder,
+    DistortionObserver, LatencyObserver, MemoryObserver, Method,
 };
 pub use kv_cache::{
     ContiguousKvCache, IdentityQuantizer, KvCache, QuantizedKvCache, Quantizer, SinkConfig,
