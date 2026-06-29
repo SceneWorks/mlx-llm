@@ -114,7 +114,7 @@ fn qwen35_thinking_and_nothink() {
 #[ignore = "needs a Qwen3.6 snapshot (27B dense or 35B-A3B MoE) via MLX_LLM_QWEN35_MODEL"]
 fn qwen35_quantize_on_load_q8() {
     let dir = model_dir();
-    let q8 = LlamaProvider::load(&LoadSpec { source: dir, quantize: Some(Quantize::Q8) })
+    let q8 = LlamaProvider::load(&LoadSpec { source: dir, quantize: Some(Quantize::Q8), kv_cache_quant: None })
         .expect("load q8");
     assert!(q8.is_quantized(), "Q8 load must report quantized");
     let (_out, _think, content) =

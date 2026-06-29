@@ -14,10 +14,11 @@ use std::path::Path;
 
 use core_llm::{
     Channel, ChatTemplate, Constraint, ConstraintDecodeTable, Content, Error as CoreError,
-    FinishReason as CoreFinish, ImageRef, JinjaChatTemplate, JsonConstraint, Llama3Template, LoadSpec,
-    Message, Quantize, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    FinishReason as CoreFinish, ImageRef, JinjaChatTemplate, JsonConstraint, KvCacheQuant,
+    KvCacheQuantMethod, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
+    Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
+    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -29,8 +30,9 @@ use crate::image::Qwen35ImageProcessor;
 use crate::models::{
     CausalLm, Qwen35Config, Qwen35Model, Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
-use crate::primitives::kv_cache::KvCache;
+use crate::primitives::kv_cache::{KvCache, QuantizedKvCache};
 use crate::primitives::projection::QuantSpec;
+use crate::primitives::quant_kv::RvqQuantizer;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 use mlx_rs::ops::concatenate_axis;
@@ -45,6 +47,52 @@ pub const PROVIDER_ID: &str = "mlx-llama";
 enum Decoder {
     Causal(CausalLm),
     Qwen35(Qwen35Model),
+}
+
+/// The resolved KV-cache quantizer for a loaded model (sc-8533). `None` ⇒ a dense KV cache (the
+/// default). Only the generic [`Decoder::Causal`] decoder honors it; resolved once at load from the
+/// contract's [`core_llm::LoadSpec::kv_cache_quant`], so [`make_cache`](Decode::make_cache) builds a
+/// `QuantizedKvCache<RvqQuantizer>` per step instead of the dense `ContiguousKvCache`.
+type KvQuant = Option<RvqQuantizer>;
+
+impl Decoder {
+    /// Build this decoder's per-generation cache, applying the resolved KV-cache `quant` when set.
+    /// A `Some(_)` quantizer on the generic Causal decoder yields a `QuantizedKvCache<RvqQuantizer>`;
+    /// the hybrid Qwen3.6 cache cannot be quantized and is rejected at load, so it only ever sees
+    /// `None` here and returns its dense hybrid cache.
+    fn make_cache_with(&self, quant: KvQuant) -> Box<dyn KvCache> {
+        match (self, quant) {
+            (Decoder::Causal(m), Some(q)) => {
+                Box::new(QuantizedKvCache::new(m.config().num_layers, q))
+            }
+            (Decoder::Causal(m), None) => m.make_cache(),
+            // The hybrid Qwen3.6 cache is never quantized (load rejects a kv_cache_quant on it).
+            (Decoder::Qwen35(m), _) => m.make_cache(),
+        }
+    }
+}
+
+/// A [`Decode`] view over a loaded model that builds the KV cache with the resolved quantizer. The
+/// provider drives the text generation loop through this so a quantized cache is used per step
+/// without touching the decode loop.
+struct QuantizingDecoder<'a> {
+    decoder: &'a Decoder,
+    quant: KvQuant,
+}
+
+impl Decode for QuantizingDecoder<'_> {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        self.decoder.make_cache_with(self.quant)
+    }
+
+    fn step(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> crate::error::Result<Array> {
+        self.decoder.step(input_ids, cache, offset)
+    }
 }
 
 impl Decode for Decoder {
@@ -265,6 +313,10 @@ pub struct LlamaProvider {
     /// The Qwen3.6 vision tower + preprocessor, present iff this is a `qwen3_5` checkpoint carrying
     /// `model.visual.*`. Drives the image path in [`LlamaProvider::generate`].
     vision: Option<Qwen35Vision>,
+    /// The resolved KV-cache quantizer (sc-8533), from [`LoadSpec::kv_cache_quant`]. `None` ⇒ a
+    /// dense KV cache. Only set for the generic Causal decoder; a request for it on the hybrid
+    /// Qwen3.6 cache is rejected at load with [`CoreError::Unsupported`].
+    kv_quant: KvQuant,
 }
 
 impl LlamaProvider {
@@ -296,6 +348,14 @@ impl LlamaProvider {
             let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
             (Decoder::Causal(m), descriptor)
         };
+
+        // KV-cache quantization (sc-8533): resolve the contract's optional `kv_cache_quant` into a
+        // concrete RVQ quantizer. Supported only by the generic Causal decoder — the hybrid Qwen3.6
+        // cache cannot swap to a `QuantizedKvCache`, so a request for it there is a clean
+        // `Unsupported` (no silent dense fallback, no crash). When supported, advertise the capability
+        // so a host UI only offers the toggle for this loaded model.
+        let kv_quant = resolve_kv_quant(spec.kv_cache_quant, &model)?;
+        descriptor.capabilities.supports_kv_cache_quant = matches!(model, Decoder::Causal(_));
 
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
         // VLM) and the config exposes a `vision_config`. Covers Qwen3.6 (`qwen3_5`) and Qwen3-VL
@@ -347,6 +407,7 @@ impl LlamaProvider {
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision,
+            kv_quant,
         })
     }
 
@@ -366,6 +427,7 @@ impl LlamaProvider {
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision: None,
+            kv_quant: None,
         }
     }
 
@@ -809,8 +871,14 @@ impl TextLlm for LlamaProvider {
                     )
                     .map_err(to_core)?
                 }
+                // Text-only path: drive the loop through a decoder view that builds the (possibly
+                // RVQ-quantized, sc-8533) KV cache. With `kv_quant == None` this is byte-identical to
+                // driving `self.model` directly (a dense `ContiguousKvCache`).
                 None => generate_with(
-                    &self.model,
+                    &QuantizingDecoder {
+                        decoder: &self.model,
+                        quant: self.kv_quant,
+                    },
                     &prompt_ids,
                     &config,
                     &req.cancel,
@@ -917,6 +985,30 @@ impl TextLlm for LlamaProvider {
     }
 }
 
+/// Resolve the contract's optional [`KvCacheQuant`] into a concrete [`RvqQuantizer`] for the loaded
+/// `model` (sc-8533). `None` request ⇒ `None` (a dense KV cache, the default — unchanged behavior).
+/// A `Some(_)` request is honored only for the generic [`Decoder::Causal`] decoder; on the hybrid
+/// Qwen3.6 cache, or for an unimplemented method/bit-width, it surfaces a clean
+/// [`CoreError::Unsupported`] — never a silent dense fallback and never a crash.
+fn resolve_kv_quant(req: Option<KvCacheQuant>, model: &Decoder) -> CoreResult<KvQuant> {
+    let Some(cfg) = req else {
+        return Ok(None);
+    };
+    if !matches!(model, Decoder::Causal(_)) {
+        return Err(CoreError::Unsupported(
+            "KV-cache quantization is not supported for this model (the hybrid Qwen3.6 cache cannot \
+             be quantized)"
+                .into(),
+        ));
+    }
+    match cfg.method {
+        KvCacheQuantMethod::Rvq => {
+            let q = RvqQuantizer::new(cfg.bits).map_err(to_core)?;
+            Ok(Some(q))
+        }
+    }
+}
+
 /// The descriptor for the `mlx-llama` provider (constructible without loading weights; used for
 /// link-time registration and registry discovery).
 pub fn provider_descriptor() -> TextLlmDescriptor {
@@ -939,6 +1031,11 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Weightless default: conservative. The load path flips this on when the loaded model's
             // chat template renders tool calls (sc-7636).
             supports_tools: false,
+            // Weightless default: conservative. KV-cache quantization (sc-8533, RVQ) is supported only
+            // by the generic softmax-attention decoder ([`Decoder::Causal`]) — the hybrid Qwen3.6
+            // cache cannot swap to a `QuantizedKvCache`. The load path flips this on for a Causal
+            // checkpoint so a host only offers the toggle where it is honored.
+            supports_kv_cache_quant: false,
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![Constraint::Json],
         },
