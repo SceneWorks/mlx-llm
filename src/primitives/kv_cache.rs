@@ -915,7 +915,7 @@ mod tests {
         contig.truncate(1).unwrap();
         let (qk, _) = sinkful.peek(0).unwrap().unwrap();
         let (ck, _) = contig.peek(0).unwrap();
-        assert_eq!(host(&qk), host(&ck));
+        assert_eq!(host(&qk), host(ck));
         assert_eq!(sinkful.offset(), 1);
     }
 
