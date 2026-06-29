@@ -32,7 +32,7 @@ use crate::models::{
 };
 use crate::primitives::kv_cache::{KvCache, QuantizedKvCache};
 use crate::primitives::projection::QuantSpec;
-use crate::primitives::quant_kv::RvqQuantizer;
+use crate::primitives::quant::RvqQuantizer;
 use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 use mlx_rs::ops::concatenate_axis;
@@ -60,10 +60,10 @@ impl Decoder {
     /// A `Some(_)` quantizer on the generic Causal decoder yields a `QuantizedKvCache<RvqQuantizer>`;
     /// the hybrid Qwen3.6 cache cannot be quantized and is rejected at load, so it only ever sees
     /// `None` here and returns its dense hybrid cache.
-    fn make_cache_with(&self, quant: KvQuant) -> Box<dyn KvCache> {
+    fn make_cache_with(&self, quant: &KvQuant) -> Box<dyn KvCache> {
         match (self, quant) {
             (Decoder::Causal(m), Some(q)) => {
-                Box::new(QuantizedKvCache::new(m.config().num_layers, q))
+                Box::new(QuantizedKvCache::new(m.config().num_layers, q.clone()))
             }
             (Decoder::Causal(m), None) => m.make_cache(),
             // The hybrid Qwen3.6 cache is never quantized (load rejects a kv_cache_quant on it).
@@ -82,7 +82,7 @@ struct QuantizingDecoder<'a> {
 
 impl Decode for QuantizingDecoder<'_> {
     fn make_cache(&self) -> Box<dyn KvCache> {
-        self.decoder.make_cache_with(self.quant)
+        self.decoder.make_cache_with(&self.quant)
     }
 
     fn step(
@@ -877,7 +877,7 @@ impl TextLlm for LlamaProvider {
                 None => generate_with(
                     &QuantizingDecoder {
                         decoder: &self.model,
-                        quant: self.kv_quant,
+                        quant: self.kv_quant.clone(),
                     },
                     &prompt_ids,
                     &config,
@@ -994,20 +994,32 @@ fn resolve_kv_quant(req: Option<KvCacheQuant>, model: &Decoder) -> CoreResult<Kv
     let Some(cfg) = req else {
         return Ok(None);
     };
-    if !matches!(model, Decoder::Causal(_)) {
+    // Only the generic softmax-attention decoder can swap its dense cache for a `QuantizedKvCache`;
+    // the hybrid Qwen3.6 cache cannot, so a request there is a clean `Unsupported` (no silent dense
+    // fallback, no crash).
+    let Decoder::Causal(m) = model else {
         return Err(CoreError::Unsupported(
             "KV-cache quantization is not supported for this model (the hybrid Qwen3.6 cache cannot \
              be quantized)"
                 .into(),
         ));
-    }
+    };
     match cfg.method {
         KvCacheQuantMethod::Rvq => {
-            let q = RvqQuantizer::new(cfg.bits).map_err(to_core)?;
+            // Build story-D's TurboQuant-RVQ quantizer fitted for this model's head dimension. The
+            // fixed seed pins the randomized-Hadamard rotation so a given model+bit-width loads an
+            // identical quantizer every time. `RvqQuantizer::new` returns `Unsupported` for a
+            // bit-width outside {1,2,4} or a non-Hadamard-compatible head_dim, surfaced here as a
+            // clean contract error rather than a panic.
+            let q = RvqQuantizer::new(m.config().head_dim, cfg.bits as i32, RVQ_SEED)
+                .map_err(to_core)?;
             Ok(Some(q))
         }
     }
 }
+
+/// Deterministic seed for the RVQ randomized-Hadamard diagonal (sc-8533).
+const RVQ_SEED: u64 = 0x5333_8533;
 
 /// The descriptor for the `mlx-llama` provider (constructible without loading weights; used for
 /// link-time registration and registry discovery).

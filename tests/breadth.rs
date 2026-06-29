@@ -451,7 +451,7 @@ fn deepseek_v2_prefills_and_decodes() {
 #[test]
 fn causal_decoder_prefills_and_decodes_through_rvq_kv_cache() {
     use mlx_llm::primitives::kv_cache::QuantizedKvCache;
-    use mlx_llm::primitives::quant_kv::RvqQuantizer;
+    use mlx_llm::primitives::quant::RvqQuantizer;
 
     // A tiny Phi-3-shaped Llama-family (generic Causal) model.
     let (heads, kv, inter) = (4, 4, 64);
@@ -481,8 +481,9 @@ fn causal_decoder_prefills_and_decodes_through_rvq_kv_cache() {
     let num_layers = cfg.num_layers;
     let model = CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap();
 
-    // The RVQ-quantized cache the provider constructs for a 4-bit KV-quant request.
-    let quantizer = RvqQuantizer::new(4).unwrap();
+    // The RVQ-quantized cache the provider constructs for a 4-bit KV-quant request (story-D's
+    // TurboQuant-RVQ, fitted for this model's head_dim).
+    let quantizer = RvqQuantizer::new(HEAD_DIM, 4, 0x5333_8533).unwrap();
     let mut cache = QuantizedKvCache::new(num_layers, quantizer);
 
     let prompt = [1i32, 2, 3, 4, 5];

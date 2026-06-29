@@ -21,7 +21,6 @@ pub mod nn;
 pub mod paged_kv_cache;
 pub mod projection;
 pub mod quant;
-pub mod quant_kv;
 pub mod rope;
 pub mod sampler;
 pub mod weights;
