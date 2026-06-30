@@ -467,8 +467,6 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_video: false,
             supports_thinking: false,
             supports_tools: false,
-            // JoyCaption uses its own cache path; KV-cache quantization (sc-8533) is not wired here.
-            supports_kv_cache_quant: false,
             supported_constraints: Vec::new(),
         },
     }

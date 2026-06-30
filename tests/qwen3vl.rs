@@ -411,7 +411,7 @@ fn qwen3vl_vision_q4_q8_import_path() {
         (Quantize::Q4, [205u8, 35, 35], "red", "q4"),
         (Quantize::Q8, [35u8, 70, 200], "blue", "q8"),
     ] {
-        let spec = LoadSpec { source: source.clone(), quantize: Some(q), kv_cache_quant: None };
+        let spec = LoadSpec { source: source.clone(), quantize: Some(q) };
 
         // The concrete provider exposes `is_quantized()` — assert the decoder actually quantized
         // (not silently fell back to dense).

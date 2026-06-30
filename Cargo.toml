@@ -35,8 +35,6 @@ mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/ml
 # spec there are distinct git sources, yielding two core-llm copies whose link-time provider registries
 # don't share. The committed Cargo.lock pins the resolved commit, so a stray `cargo update` can't float
 # core-llm to a new HEAD (the sc-8021 "don't float" guard, now enforced by the lockfile, not the pin).
-# core-llm main carries the sc-8533 additions: the OPTIONAL `LoadSpec.kv_cache_quant` +
-# `supports_kv_cache_quant` capability this crate's RVQ KV-cache wiring consumes (epic sc-8528).
 core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
 # inventory so the distributed slice links.
@@ -52,5 +50,5 @@ half = "2"
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
 # tokenizers dep needed.)
 # The contract conformance suite (story 7201): run the registered LlamaProvider through the
-# backend-neutral checks. Same git source AND ref (`branch = "main"`) as the core-llm dep so cargo unifies on one core-llm.
+# backend-neutral checks. Same git source AND ref as the core-llm dep so cargo unifies on one core-llm.
 core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
