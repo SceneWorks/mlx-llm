@@ -30,14 +30,14 @@ mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/ml
 # The backend-neutral contract this crate implements (epic 7153). Git dep on the published repo
 # during development (crates.io publish coordination is a later story); shares its `CancelFlag`,
 # `Tokenizer`, chat templates, and the `TextLlm` trait so there is one contract, not two.
-# Pinned by `rev` (sc-8021) so a stray `cargo update` can't float core-llm to main HEAD and re-break
-# the build org-wide. The pin must match the candle-llm pin and the ChatWorks pin so a shared consumer
-# (ChatWorks) unifies on ONE core-llm source across both backends — a `branch` spec here and a `rev`
+# Pinned by `branch = "main"` (sc-8116/sc-8533) so this crate unifies with candle-llm and the
+# sceneworks gen graph, which also pin core-llm `branch = "main"` — a `rev` spec here and a `branch`
 # spec there are distinct git sources, yielding two core-llm copies whose link-time provider registries
-# don't share. `6e07ae4` (sc-8533) is additive over `3870ed1`: it adds the OPTIONAL
-# `LoadSpec.kv_cache_quant` + `supports_kv_cache_quant` capability this crate's RVQ KV-cache wiring
-# consumes (epic sc-8528). Move ChatWorks + candle-llm to this same rev together.
-core-llm = { git = "https://github.com/SceneWorks/core-llm", rev = "6e07ae4" }
+# don't share. The committed Cargo.lock pins the resolved commit, so a stray `cargo update` can't float
+# core-llm to a new HEAD (the sc-8021 "don't float" guard, now enforced by the lockfile, not the pin).
+# core-llm main carries the sc-8533 additions: the OPTIONAL `LoadSpec.kv_cache_quant` +
+# `supports_kv_cache_quant` capability this crate's RVQ KV-cache wiring consumes (epic sc-8528).
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
 # inventory so the distributed slice links.
 inventory = "0.3"
@@ -52,5 +52,5 @@ half = "2"
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
 # tokenizers dep needed.)
 # The contract conformance suite (story 7201): run the registered LlamaProvider through the
-# backend-neutral checks. Same git source AND rev as the core-llm dep so cargo unifies on one core-llm.
-core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", rev = "6e07ae4" }
+# backend-neutral checks. Same git source AND ref (`branch = "main"`) as the core-llm dep so cargo unifies on one core-llm.
+core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
