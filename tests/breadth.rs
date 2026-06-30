@@ -442,3 +442,61 @@ fn deepseek_v2_prefills_and_decodes() {
     }
     assert_prefills_and_decodes(cfg, m, "deepseek_v2");
 }
+
+/// KV-cache quantization (sc-8533): a generic Causal decoder must prefill + decode through an
+/// RVQ-quantized KV cache (`QuantizedKvCache<RvqQuantizer>` — exactly what the provider builds when
+/// `LoadSpec::kv_cache_quant` is set) producing finite, correctly-shaped logits, with the cache
+/// growing one position per step. This is the in-test stand-in for "selecting RVQ loads and
+/// generates with the quantized cache" without real weights or the tokenizer/provider stack.
+#[test]
+fn causal_decoder_prefills_and_decodes_through_rvq_kv_cache() {
+    use mlx_llm::primitives::kv_cache::QuantizedKvCache;
+    use mlx_llm::primitives::quant::RvqQuantizer;
+
+    // A tiny Phi-3-shaped Llama-family (generic Causal) model.
+    let (heads, kv, inter) = (4, 4, 64);
+    let (qd, kvd) = (heads * HEAD_DIM, kv * HEAD_DIM);
+    let cfg = json!({
+        "architectures": ["Phi3ForCausalLM"], "model_type": "phi3",
+        "hidden_size": HIDDEN, "intermediate_size": inter, "num_hidden_layers": LAYERS,
+        "num_attention_heads": heads, "num_key_value_heads": kv, "vocab_size": VOCAB,
+        "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "tie_word_embeddings": false
+    });
+    let mut rng = SplitMix64::new(0x5333_8533);
+    let mut m = HashMap::new();
+    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    m.insert("model.norm.weight".into(), ones(HIDDEN));
+    m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN], &mut rng));
+    for i in 0..LAYERS {
+        let p = |s: &str| format!("model.layers.{i}.{s}");
+        m.insert(p("input_layernorm.weight"), ones(HIDDEN));
+        m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
+        m.insert(p("self_attn.qkv_proj.weight"), randn(&[qd + 2 * kvd, HIDDEN], &mut rng));
+        m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, qd], &mut rng));
+        m.insert(p("mlp.gate_up_proj.weight"), randn(&[2 * inter, HIDDEN], &mut rng));
+        m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, inter], &mut rng));
+    }
+    let cfg = ModelConfig::from_json(&cfg).unwrap();
+    let vocab = cfg.vocab_size;
+    let num_layers = cfg.num_layers;
+    let model = CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap();
+
+    // The RVQ-quantized cache the provider constructs for a 4-bit KV-quant request (story-D's
+    // TurboQuant-RVQ, fitted for this model's head_dim).
+    let quantizer = RvqQuantizer::new(HEAD_DIM, 4, 0x5333_8533).unwrap();
+    let mut cache = QuantizedKvCache::new(num_layers, quantizer);
+
+    let prompt = [1i32, 2, 3, 4, 5];
+    let logits = model.decode_logits(&input_ids(&prompt), &mut cache, 0).unwrap();
+    assert_eq!(logits.shape(), &[1, vocab], "rvq prefill logits shape");
+    let mut next = assert_finite_argmax(&logits, "rvq");
+    assert_eq!(cache.offset(), prompt.len() as i32, "rvq cache offset after prefill");
+
+    for step in 0..4 {
+        let offset = prompt.len() as i32 + step;
+        let logits = model.decode_logits(&input_ids(&[next]), &mut cache, offset).unwrap();
+        assert_eq!(logits.shape(), &[1, vocab], "rvq decode logits shape");
+        next = assert_finite_argmax(&logits, "rvq");
+    }
+    assert_eq!(cache.offset(), prompt.len() as i32 + 4, "rvq cache grew per step");
+}

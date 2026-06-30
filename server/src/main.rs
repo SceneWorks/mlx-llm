@@ -102,7 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     eprintln!("loading model from {} via provider '{provider_id}' …", args.model);
-    let spec = LoadSpec { source: args.model.clone(), quantize: args.quantize };
+    let spec = LoadSpec { source: args.model.clone(), quantize: args.quantize, kv_cache_quant: None };
     let provider = core_llm::load_textllm(&provider_id, &spec)?;
 
     // A friendly default model name for responses (the snapshot dir's basename).
