@@ -69,7 +69,6 @@ fn llama_quantize_on_load_q8() {
     let q8 = LlamaProvider::load(&LoadSpec {
         source: dir.clone(),
         quantize: Some(Quantize::Q8),
-        kv_cache_quant: None,
     })
     .unwrap();
     assert!(q8.is_quantized());
@@ -86,7 +85,6 @@ fn llama_quantize_on_load_q4() {
     let q4 = LlamaProvider::load(&LoadSpec {
         source: dir,
         quantize: Some(Quantize::Q4),
-        kv_cache_quant: None,
     })
     .unwrap();
     assert!(q4.is_quantized());

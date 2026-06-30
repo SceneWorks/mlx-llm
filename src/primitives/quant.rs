@@ -15,7 +15,7 @@ use crate::error::Result;
 ///
 /// Forward is `quantized_matmul(x, weight, scales, biases, transpose = true, ...)`, which computes
 /// `x @ weight.t()` against the dequantized weight — the quantized analogue of
-/// [`crate::primitives::nn::linear`]. `transpose = true` matches the HF `[out, in]` weight layout.
+/// [`super::nn::linear`]. `transpose = true` matches the HF `[out, in]` weight layout.
 #[derive(Debug, Clone)]
 pub struct QuantizedLinear {
     /// Packed quantized weight.

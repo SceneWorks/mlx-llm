@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#084d3e9919d4c30f8dea74f0e66fb0f6257af65d"
+source = "git+https://github.com/SceneWorks/core-llm?branch=michaeltrefry1818%2Fsc-8528-backout%2Fcore-llm-remove-kv-quant#b6df5151ac2746d40fb7f68488c3d22eb2e9995a"
 dependencies = [
  "inventory",
  "minijinja",
@@ -148,7 +148,7 @@ dependencies = [
 [[package]]
 name = "core-llm-testkit"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#084d3e9919d4c30f8dea74f0e66fb0f6257af65d"
+source = "git+https://github.com/SceneWorks/core-llm?branch=michaeltrefry1818%2Fsc-8528-backout%2Fcore-llm-remove-kv-quant#b6df5151ac2746d40fb7f68488c3d22eb2e9995a"
 dependencies = [
  "core-llm",
  "serde_json",
