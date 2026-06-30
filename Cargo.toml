@@ -35,11 +35,7 @@ mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/ml
 # spec there are distinct git sources, yielding two core-llm copies whose link-time provider registries
 # don't share. The committed Cargo.lock pins the resolved commit, so a stray `cargo update` can't float
 # core-llm to a new HEAD (the sc-8021 "don't float" guard, now enforced by the lockfile, not the pin).
-# DEV-PIN (sc-8528 KV-quant backout): temporarily pointed at the core-llm removal branch
-# `michaeltrefry1818/sc-8528-backout/core-llm-remove-kv-quant` so this crate builds WITHOUT the removed
-# `LoadSpec.kv_cache_quant` / `supports_kv_cache_quant` fields. COORDINATOR: flip back to
-# `branch = "main"` after the core-llm backout PR merges.
-core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "michaeltrefry1818/sc-8528-backout/core-llm-remove-kv-quant" }
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # Link-time provider registration into core-llm's registry. Must be the same major as core-llm's
 # inventory so the distributed slice links.
 inventory = "0.3"
@@ -55,5 +51,4 @@ half = "2"
 # tokenizers dep needed.)
 # The contract conformance suite (story 7201): run the registered LlamaProvider through the
 # backend-neutral checks. Same git source AND ref as the core-llm dep so cargo unifies on one core-llm.
-# DEV-PIN (sc-8528): see the core-llm note above — COORDINATOR flips back to `branch = "main"` post-merge.
-core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "michaeltrefry1818/sc-8528-backout/core-llm-remove-kv-quant" }
+core-llm-testkit = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
